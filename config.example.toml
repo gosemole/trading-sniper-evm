@@ -1,0 +1,53 @@
+# Copy to config.toml and fill in your own RPC endpoints.
+# config.toml is gitignored so the API key never reaches the repo.
+
+# Robinhood chain (OP-stack) JSON-RPC endpoints.
+# Use a ws:// or wss:// endpoint for live swap log subscriptions.
+ws_url = "wss://robinhood-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
+http_url = "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
+
+# Signal when price moves >= threshold % between consecutive blocks (block vs block).
+threshold_pct = 3
+
+# Assumed price move (%) for the depth estimate: "how much can I buy if the
+# price moves this much". In-range liquidity only (no tick walking).
+# Optional, defaults to 1.0. Can also be set per pool.
+max_move_pct = 1.0
+
+# v3 pools: only the pair address is required.
+# token0/token1/decimals are resolved on-chain via eth_call at startup.
+[[pools]]
+name = "PONS/WETH (v3)"
+version = "v3"
+address = "0x10CC6BD38112cAc182db90B6a71d8Bb5939526bA"
+base_token = 1        # optional: 0 = show token1/token0, 1 = show token0/token1
+
+# v4 pools: PoolManager address + pool_id (32-byte hex). That's ALL you need:
+# %-movement detection works on the raw price from sqrtPriceX96.
+# token0/token1/decimals are OPTIONAL (absolute human-readable price only).
+[[pools]]
+name = "POOLS/ETH (v4)"
+version = "v4"
+address = "0x8366a39CC670B4001A1121B8F6A443A643e40951"  # PoolManager
+pool_id = "0x88fbd9768ccf1bf77d6946afa1b2f3ce79e02a4566ca8a3d5ba78ab04e8ef27f"
+base_token = 1
+
+# Per-pool overrides of threshold_pct / max_move_pct are allowed.
+[[pools]]
+name = "Forggy/ETH (v4)"
+version = "v4"
+address = "0x8366a39CC670B4001A1121B8F6A443A643e40951"  # PoolManager
+pool_id = "0x767cdbcdfa957c38af2dcee8fbc4a15a8436b06b2a28855ea738b1d4c6393fc5"
+base_token = 1
+threshold_pct = 7
+
+# Alternative: derive poolId locally from currencies/fee/tickSpacing/hooks.
+# [[pools]]
+# name = "WETH/USDC (v4, derived)"
+# version = "v4"
+# address = "0x8366a39CC670B4001A1121B8F6A443A643e40951"  # PoolManager
+# token0 = "0x0000000000000000000000000000000000000000"   # native ETH
+# token1 = "0x..."
+# fee = 3000          # hundredths of a bip
+# tick_spacing = 60
+# hooks = "0x0000000000000000000000000000000000000000"
