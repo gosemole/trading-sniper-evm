@@ -22,8 +22,17 @@
 //! Standalone on purpose: it shares no code with the bot, so measuring cannot
 //! change what trades.
 //!
+//! `--watch` is a different question with the same purpose: not how fast an
+//! endpoint takes a transaction, but how late we hear about someone else's.
+//! It listens to the Nitro sequencer feed and to the RPC's log subscription at
+//! once and matches them by TRANSACTION HASH - the one key both streams agree
+//! on, needing no assumption about how either numbers its messages. The
+//! difference is how much earlier the feed knows about a swap, which is the
+//! whole of what a faster signal would buy.
+//!
 //! Usage:
 //!   probe [--endpoint URL]... [--read URL] [--rounds 5] [--send] [--config PATH]
+//!   probe --watch [--feed WSS] [--ws WSS] [--address 0x..] [--seconds 60]
 //!
 //! Takes what it needs from the environment, the same names the bot itself
 //! reads over its config file: `SUBMIT_URLS` (comma separated) for what to
@@ -40,12 +49,15 @@
 //! key, and a nonce claimed twice costs the bot a buy.
 
 use anyhow::{Context, Result};
-use ethers::providers::{Http, Middleware, Provider};
+use ethers::providers::{Http, Middleware, Provider, StreamExt, Ws};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::transaction::eip2718::TypedTransaction;
-use ethers::types::{Eip1559TransactionRequest, H256, U256};
+use ethers::types::{Eip1559TransactionRequest, Filter, H256, U256};
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 /// Only the fields this needs, all optional: the file is a last resort behind
 /// the flags and the environment, and every field it might answer can equally
@@ -55,6 +67,10 @@ use std::time::{Duration, Instant};
 struct Cfg {
     #[serde(default)]
     http_url: Option<String>,
+    #[serde(default)]
+    ws_url: Option<String>,
+    #[serde(default)]
+    pool_manager: Option<String>,
     #[serde(default)]
     submit_urls: Vec<String>,
     #[serde(default)]
@@ -133,6 +149,213 @@ fn block_stats(v: &[i64]) -> String {
     format!("{:>6.1}", v.iter().sum::<i64>() as f64 / v.len() as f64)
 }
 
+
+/// A Nitro sequencer feed frame. Only the transactions are wanted; the rest of
+/// the envelope - sequence numbers, L1 header, delayed-message counts - is
+/// deliberately not modelled, because none of it is a key this can match on.
+#[derive(serde::Deserialize)]
+struct Frame {
+    #[serde(default)]
+    messages: Vec<Sequenced>,
+}
+
+#[derive(serde::Deserialize)]
+struct Sequenced {
+    message: Envelope,
+}
+
+#[derive(serde::Deserialize)]
+struct Envelope {
+    message: L2,
+}
+
+#[derive(serde::Deserialize)]
+struct L2 {
+    #[serde(rename = "l2Msg", default)]
+    l2_msg: Option<String>,
+}
+
+/// Nitro's L2 message kinds, the two that carry transactions.
+const L2_BATCH: u8 = 3;
+const L2_SIGNED_TX: u8 = 4;
+
+/// Every transaction hash inside one decoded `l2Msg`.
+///
+/// A signed transaction is its bytes after the kind byte, and its hash is the
+/// keccak of exactly those bytes - the same hash the RPC will report for it,
+/// which is what makes this comparable at all. A batch is a run of
+/// length-prefixed sub-messages, each of which is one of these again.
+///
+/// `depth` exists because the format permits a batch inside a batch and this
+/// reads bytes off the network: two levels is more than the sequencer produces,
+/// and a cycle must not become a stack overflow.
+fn tx_hashes(l2: &[u8], depth: u8, out: &mut Vec<H256>) {
+    if depth > 2 {
+        return;
+    }
+    match l2.first() {
+        Some(&L2_SIGNED_TX) => out.push(H256::from(ethers::utils::keccak256(&l2[1..]))),
+        Some(&L2_BATCH) => {
+            let mut i = 1;
+            while i + 8 <= l2.len() {
+                let len = u64::from_be_bytes(l2[i..i + 8].try_into().unwrap()) as usize;
+                i += 8;
+                let Some(end) = i.checked_add(len).filter(|e| *e <= l2.len()) else {
+                    return;
+                };
+                tx_hashes(&l2[i..end], depth + 1, out);
+                i = end;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// How much earlier the sequencer feed knows about a swap than the RPC does.
+async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
+    let value = |name: &str| -> Option<String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let seconds: u64 = value("--seconds")
+        .map(|v| v.parse())
+        .transpose()
+        .context("--seconds is not a number")?
+        .unwrap_or(60);
+    let feed_url = value("--feed")
+        .or_else(|| env_var("FEED_URL"))
+        .context("no feed to listen to: pass --feed wss://... or set FEED_URL")?;
+    let ws_url = value("--ws")
+        .or_else(|| env_var("WS_URL"))
+        .or_else(|| cfg.ws_url.clone())
+        .context("no rpc websocket: pass --ws wss://... or set WS_URL")?;
+    // Filtered to one contract on purpose. Unfiltered, the RPC would report
+    // every log on the chain and the two streams would be compared on traffic
+    // this bot never looks at; filtered, the matched set IS the set of swaps it
+    // trades on, which is the population the answer is about.
+    let address = value("--address").or_else(|| cfg.pool_manager.clone());
+    let filter = match &address {
+        Some(a) => Filter::new().address(a.parse::<ethers::types::Address>().context("--address")?),
+        None => Filter::new(),
+    };
+
+    let started = Instant::now();
+    let from_feed: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+    let from_rpc: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let feed_seen = Arc::clone(&from_feed);
+    let feed_task = tokio::spawn(async move {
+        let (stream, _) = tokio_tungstenite::connect_async(&feed_url)
+            .await
+            .context("connecting to the feed")?;
+        println!("feed open");
+        let (_w, mut r) = stream.split();
+        let mut frames = 0u64;
+        while let Some(msg) = r.next().await {
+            let msg = msg.context("reading the feed")?;
+            let text = match msg {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t,
+                tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                    String::from_utf8_lossy(&b).into_owned()
+                }
+                _ => continue,
+            };
+            let at = started.elapsed();
+            frames += 1;
+            let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
+            let mut hashes = Vec::new();
+            for m in &frame.messages {
+                let Some(b64) = &m.message.message.l2_msg else { continue };
+                let Ok(raw) = base64_decode(b64) else { continue };
+                tx_hashes(&raw, 0, &mut hashes);
+            }
+            let mut seen = feed_seen.lock().await;
+            for h in hashes {
+                // First sighting only: a transaction reannounced later is not
+                // news, and letting it overwrite would make the feed look slower
+                // than it is.
+                seen.entry(h).or_insert(at);
+            }
+        }
+        Ok::<u64, anyhow::Error>(frames)
+    });
+
+    let rpc_seen = Arc::clone(&from_rpc);
+    let rpc_task = tokio::spawn(async move {
+        let provider = Provider::<Ws>::connect(&ws_url).await.context("connecting to the rpc")?;
+        println!("rpc open");
+        let mut logs = provider.subscribe_logs(&filter).await.context("eth_subscribe(logs)")?;
+        while let Some(log) = logs.next().await {
+            let at = started.elapsed();
+            if let Some(h) = log.transaction_hash {
+                rpc_seen.lock().await.entry(h).or_insert(at);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    println!(
+        "watching for {seconds}s: feed against the rpc log stream{}",
+        address.map(|a| format!(" for {a}")).unwrap_or_default()
+    );
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+    feed_task.abort();
+    rpc_task.abort();
+
+    let feed = from_feed.lock().await;
+    let rpc = from_rpc.lock().await;
+    let mut lead: Vec<i64> = rpc
+        .iter()
+        .filter_map(|(h, t_rpc)| {
+            feed.get(h).map(|t_feed| t_rpc.as_millis() as i64 - t_feed.as_millis() as i64)
+        })
+        .collect();
+    println!(
+        "\nfeed saw {} transactions, the rpc reported {} matching logs, {} in both",
+        feed.len(),
+        rpc.len(),
+        lead.len()
+    );
+    if lead.is_empty() {
+        println!(
+            "nothing to compare: no transaction appeared in both streams. Either the address \
+             filter matches nothing, or the run was too short to catch a swap."
+        );
+        return Ok(());
+    }
+    lead.sort_unstable();
+    let q = |p: f64| lead[((lead.len() as f64 * p) as usize).min(lead.len() - 1)];
+    println!(
+        "rpc behind the feed, ms:  min {}  p25 {}  median {}  p75 {}  max {}",
+        lead[0],
+        q(0.25),
+        q(0.5),
+        q(0.75),
+        lead[lead.len() - 1]
+    );
+    let first = lead.iter().filter(|d| **d <= 0).count();
+    println!(
+        "the feed was first for {} of {} swaps ({:.0}%)",
+        lead.len() - first,
+        lead.len(),
+        (lead.len() - first) as f64 * 100.0 / lead.len() as f64
+    );
+    println!(
+        "\nthe median is the head start a feed-driven signal would have. Only the swaps both \
+         streams saw are counted, so a transaction the rpc never reported cannot flatter it."
+    );
+    Ok(())
+}
+
+/// Standard base64, no padding assumptions beyond the usual. Written out rather
+/// than pulled in because it is fifteen lines and the alternative is a
+/// dependency in the tree for one field of one message.
+fn base64_decode(s: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .context("l2Msg is not base64")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -155,6 +378,10 @@ async fn main() -> Result<()> {
         Err(e) if named.is_none() && e.kind() == std::io::ErrorKind::NotFound => Cfg::default(),
         Err(e) => return Err(e).with_context(|| format!("reading {cfg_path}")),
     };
+
+    if args.iter().any(|a| a == "--watch") {
+        return watch(&args, &cfg).await;
+    }
 
     // Every `--endpoint` given, else what the bot itself broadcasts through -
     // so a bare run measures the status quo rather than nothing.
@@ -375,4 +602,64 @@ fn report(targets: &[Target]) {
          endpoint's head, so a reader that lags the chain is inside it: point --read at the \
          endpoint under test to take that out."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(subs: &[&[u8]]) -> Vec<u8> {
+        let mut v = vec![L2_BATCH];
+        for sub in subs {
+            v.extend_from_slice(&(sub.len() as u64).to_be_bytes());
+            v.extend_from_slice(sub);
+        }
+        v
+    }
+
+    fn signed(tx: &[u8]) -> Vec<u8> {
+        let mut v = vec![L2_SIGNED_TX];
+        v.extend_from_slice(tx);
+        v
+    }
+
+    #[test]
+    fn a_batch_yields_the_hash_of_every_transaction_in_it() {
+        // Both shapes the feed actually carries: a typed 1559 transaction and a
+        // legacy RLP one. The hash is the keccak of the transaction bytes with
+        // the kind byte stripped, which is what the RPC will report it under.
+        let typed: Vec<u8> = vec![0x02, 0xf8, 0x03, 0xaa, 0xbb];
+        let legacy: Vec<u8> = vec![0xf9, 0x01, 0x02, 0x03];
+        let mut out = Vec::new();
+        tx_hashes(&batch(&[&signed(&typed), &signed(&legacy)]), 0, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                H256::from(ethers::utils::keccak256(&typed)),
+                H256::from(ethers::utils::keccak256(&legacy)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_length_that_overruns_the_buffer_stops_rather_than_panicking() {
+        let mut truncated = batch(&[&signed(&[0x02, 0xff])]);
+        truncated.pop();
+        let mut out = Vec::new();
+        tx_hashes(&truncated, 0, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn nesting_cannot_run_away() {
+        // A batch whose only member is itself, which the format permits to
+        // describe and this must not follow forever.
+        let mut deep = signed(&[0x02, 0x01]);
+        for _ in 0..8 {
+            deep = batch(&[&deep]);
+        }
+        let mut out = Vec::new();
+        tx_hashes(&deep, 0, &mut out);
+        assert!(out.is_empty(), "a batch nested past the limit yields nothing");
+    }
 }

@@ -3423,12 +3423,14 @@ name = "trading-mm-fall"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.21.7",
  "ethers",
  "futures-util",
  "hex",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tracing",
  "tracing-subscriber",
