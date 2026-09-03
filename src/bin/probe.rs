@@ -32,7 +32,9 @@
 //!
 //! Usage:
 //!   probe [--endpoint URL]... [--read URL] [--rounds 5] [--send] [--config PATH]
-//!   probe --watch [--feed WSS] [--ws WSS] [--address 0x..] [--seconds 60]
+//!   probe --watch [--feed WSS] [--ws WSS] [--address 0x..] [--seconds 300] [--warmup 100]
+//!   probe --offset [--feed WSS] [--read URL] [--samples 10]
+//!   probe --heads  [--feed WSS] [--ws WSS] [--seconds 300] [--warmup 100]
 //!
 //! Takes what it needs from the environment, the same names the bot itself
 //! reads over its config file: `SUBMIT_URLS` (comma separated) for what to
@@ -161,6 +163,8 @@ struct Frame {
 
 #[derive(serde::Deserialize)]
 struct Sequenced {
+    #[serde(rename = "sequenceNumber", default)]
+    sequence_number: u64,
     message: Envelope,
 }
 
@@ -220,7 +224,17 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
         .map(|v| v.parse())
         .transpose()
         .context("--seconds is not a number")?
-        .unwrap_or(60);
+        .unwrap_or(300);
+    // The feed does not start at the head. A fresh connection is handed a
+    // backlog and streams forward until it catches up, and every frame in that
+    // stretch is read later than it was sent - which reads as the feed being
+    // tens of seconds SLOWER than it is. Nothing before this is counted.
+    let warmup: u64 = value("--warmup")
+        .map(|v| v.parse())
+        .transpose()
+        .context("--warmup is not a number")?
+        .unwrap_or(seconds / 3);
+    anyhow::ensure!(warmup < seconds, "--warmup must be shorter than --seconds");
     let feed_url = value("--feed")
         .or_else(|| env_var("FEED_URL"))
         .context("no feed to listen to: pass --feed wss://... or set FEED_URL")?;
@@ -309,7 +323,8 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     });
 
     println!(
-        "watching for {seconds}s: feed against the rpc log stream{}",
+        "watching for {seconds}s, ignoring the first {warmup}s while the feed catches up: \
+         feed against the rpc log stream{}",
         address.map(|a| format!(" for {a}")).unwrap_or_default()
     );
     tokio::time::sleep(Duration::from_secs(seconds)).await;
@@ -319,8 +334,10 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
 
     let feed = from_feed.lock().await;
     let rpc = from_rpc.lock().await;
+    let after = Duration::from_secs(warmup);
     let mut lead: Vec<i64> = rpc
         .iter()
+        .filter(|(_, t_rpc)| **t_rpc >= after)
         .filter_map(|(h, t_rpc)| {
             feed.get(h).map(|t_feed| t_rpc.as_millis() as i64 - t_feed.as_millis() as i64)
         })
@@ -343,18 +360,24 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     // when each comparison was made rather than at the sorted middle of them.
     let mut over_time: Vec<(Duration, i64)> = rpc
         .iter()
+        .filter(|(_, t_rpc)| **t_rpc >= after)
         .filter_map(|(h, t_rpc)| {
             feed.get(h).map(|t_feed| (*t_rpc, t_rpc.as_millis() as i64 - t_feed.as_millis() as i64))
         })
         .collect();
     over_time.sort_by_key(|(t, _)| *t);
-    let third = over_time.len() / 3;
-    let median_of = |v: &[(Duration, i64)]| -> i64 {
-        let mut d: Vec<i64> = v.iter().map(|(_, x)| *x).collect();
-        d.sort_unstable();
-        d.get(d.len() / 2).copied().unwrap_or(0)
-    };
+    report_lead(&mut lead, &mut over_time, "swaps");
+    println!(
+        "\nthe median is the head start a feed-driven signal would have. Only the swaps both \
+         streams saw are counted, so a transaction the rpc never reported cannot flatter it."
+    );
+    Ok(())
+}
 
+/// The same summary for either comparison: how far behind the rpc was, whether
+/// the feed won, and - the part that decides whether any of it may be believed -
+/// whether the answer had stopped moving by the end of the run.
+fn report_lead(lead: &mut [i64], over_time: &mut [(Duration, i64)], unit: &str) {
     lead.sort_unstable();
     let q = |p: f64| lead[((lead.len() as f64 * p) as usize).min(lead.len() - 1)];
     println!(
@@ -365,35 +388,40 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
         q(0.75),
         lead[lead.len() - 1]
     );
-    let first = lead.iter().filter(|d| **d <= 0).count();
+    let behind = lead.iter().filter(|d| **d <= 0).count();
     println!(
-        "the feed was first for {} of {} swaps ({:.0}%)",
-        lead.len() - first,
+        "the feed was first for {} of {} {unit} ({:.0}%)",
+        lead.len() - behind,
         lead.len(),
-        (lead.len() - first) as f64 * 100.0 / lead.len() as f64
+        (lead.len() - behind) as f64 * 100.0 / lead.len() as f64
     );
-    if third > 0 {
-        let (first_third, last_third) = (median_of(&over_time[..third]), median_of(&over_time[over_time.len() - third..]));
-        println!(
-            "median over the first third of the run {first_third} ms, over the last third \
-             {last_third} ms"
-        );
-        // A stream that cannot be consumed as fast as it arrives stamps every
-        // frame later than the one before, and says so here rather than being
-        // read as a fact about the network.
-        if (last_third - first_third).abs() > 200 {
-            println!(
-                "  ^ these should be the same. They are not, so one side is falling behind and \
-                 is being timed on when it was PROCESSED rather than when it arrived - do not \
-                 read the numbers above as latency."
-            );
-        }
+    over_time.sort_by_key(|(t, _)| *t);
+    let median_of = |v: &[(Duration, i64)]| -> i64 {
+        let mut d: Vec<i64> = v.iter().map(|(_, x)| *x).collect();
+        d.sort_unstable();
+        d.get(d.len() / 2).copied().unwrap_or(0)
+    };
+    // Five slices of the counted window rather than a single before-and-after:
+    // the question is not only whether the number moved but whether it has
+    // stopped moving, and a curve that is still bending says the run was too
+    // short however tidy its median looks.
+    let slice = over_time.len() / 5;
+    if slice == 0 {
+        return;
     }
-    println!(
-        "\nthe median is the head start a feed-driven signal would have. Only the swaps both \
-         streams saw are counted, so a transaction the rpc never reported cannot flatter it."
-    );
-    Ok(())
+    let by_fifth: Vec<i64> =
+        (0..5).map(|i| median_of(&over_time[i * slice..(i + 1) * slice])).collect();
+    let as_text: Vec<String> = by_fifth.iter().map(|d| format!("{d}")).collect();
+    println!("median by fifth of the counted window, ms:  {}", as_text.join("  "));
+    let spread = by_fifth.iter().max().unwrap() - by_fifth.iter().min().unwrap();
+    if spread > 200 {
+        println!(
+            "  ^ these should all be the same. A spread of {spread} ms means one side is still \
+             catching up and is being timed on when it was PROCESSED rather than when it \
+             arrived - run longer, or raise --warmup, and do not read the numbers above as \
+             latency yet."
+        );
+    }
 }
 
 /// Standard base64, no padding assumptions beyond the usual. Written out rather
@@ -404,6 +432,222 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(s.trim())
         .context("l2Msg is not base64")
+}
+
+/// What the feed's `sequenceNumber` is, in block numbers.
+///
+/// Nitro turns each sequencer message into one L2 block, so the two should
+/// differ by a constant - but "should" is not "does", and reading a height off
+/// the feed is only safe once that constant is known rather than assumed. This
+/// establishes it the only way that cannot be fooled: take a transaction out of
+/// a feed message, ask the RPC which block it ended up in, and subtract.
+///
+/// It works while the feed is still catching up, which is most of the first
+/// minute after connecting: the mapping from a message to its block is a fact
+/// about the chain, not about when we happened to read it.
+async fn offset(args: &[String], cfg: &Cfg) -> Result<()> {
+    let value = |name: &str| -> Option<String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let samples: usize = value("--samples")
+        .map(|v| v.parse())
+        .transpose()
+        .context("--samples is not a number")?
+        .unwrap_or(10);
+    let feed_url = value("--feed")
+        .or_else(|| env_var("FEED_URL"))
+        .context("no feed to read: pass --feed wss://... or set FEED_URL")?;
+    let read_url = value("--read")
+        .or_else(|| env_var("HTTP_URL"))
+        .or_else(|| cfg.http_url.clone())
+        .context("nowhere to ask: pass --read URL or set HTTP_URL")?;
+    let read = Provider::<Http>::try_from(read_url.clone()).context("bad read endpoint")?;
+
+    let (stream, _) = tokio_tungstenite::connect_async(&feed_url)
+        .await
+        .context("connecting to the feed")?;
+    println!("feed open, reads via {}\n", label(&read_url));
+    let (_w, mut r) = stream.split();
+
+    println!("{:>14}  {:>14}  {:>10}", "sequenceNumber", "block", "difference");
+    let mut offsets: Vec<i128> = Vec::new();
+    while let Some(msg) = r.next().await {
+        let text = match msg.context("reading the feed")? {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t,
+            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                String::from_utf8_lossy(&b).into_owned()
+            }
+            _ => continue,
+        };
+        let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
+        for m in &frame.messages {
+            if offsets.len() >= samples {
+                break;
+            }
+            let Some(b64) = &m.message.message.l2_msg else { continue };
+            let Ok(raw) = base64_decode(b64) else { continue };
+            let mut hashes = Vec::new();
+            tx_hashes(&raw, 0, &mut hashes);
+            // One transaction is enough, but not any one: a message caught
+            // before its block was executed answers `null`, and that is a
+            // question asked too early rather than a mismatch. Try the ones in
+            // it until the chain knows about one.
+            for h in hashes {
+                match read.get_transaction(h).await {
+                    Ok(Some(tx)) => {
+                        let Some(block) = tx.block_number.map(|b| b.as_u64()) else { continue };
+                        let d = m.sequence_number as i128 - block as i128;
+                        println!("{:>14}  {:>14}  {:>10}", m.sequence_number, block, d);
+                        offsets.push(d);
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        if offsets.len() >= samples {
+            break;
+        }
+    }
+
+    if offsets.is_empty() {
+        println!("\nnothing resolved: no transaction from the feed was known to the rpc");
+        return Ok(());
+    }
+    let first = offsets[0];
+    let steady = offsets.iter().all(|d| *d == first);
+    println!(
+        "\n{} samples, difference {}",
+        offsets.len(),
+        match steady {
+            true => format!("constant at {first} - a feed height is a block height minus {first}"),
+            false => format!(
+                "NOT constant ({} to {}) - the two do not track one another, and a height read \
+                 off the feed cannot be trusted",
+                offsets.iter().min().unwrap(),
+                offsets.iter().max().unwrap()
+            ),
+        }
+    );
+    Ok(())
+}
+
+/// Who says "block N exists" first: the sequencer feed or the RPC's `newHeads`.
+///
+/// Both are pushed, so this costs no requests at all - and needs no decoding
+/// either, because `--offset` established that a feed message's sequence number
+/// IS the block number. Only the number is read out of each frame; the
+/// transactions in it are left alone.
+///
+/// This is the honest version of the question the fee watcher raises implicitly:
+/// a subscription is cheaper than asking, but only worth having if it is not
+/// also later.
+async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
+    let value = |name: &str| -> Option<String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let seconds: u64 = value("--seconds")
+        .map(|v| v.parse())
+        .transpose()
+        .context("--seconds is not a number")?
+        .unwrap_or(300);
+    // The feed opens behind the head and streams forward until it catches up.
+    // Everything before it does is a measurement of the backlog, not of the
+    // network, so none of it is counted.
+    let warmup: u64 = value("--warmup")
+        .map(|v| v.parse())
+        .transpose()
+        .context("--warmup is not a number")?
+        .unwrap_or(seconds / 3);
+    anyhow::ensure!(warmup < seconds, "--warmup must be shorter than --seconds");
+    let feed_url = value("--feed")
+        .or_else(|| env_var("FEED_URL"))
+        .context("no feed to listen to: pass --feed wss://... or set FEED_URL")?;
+    let ws_url = value("--ws")
+        .or_else(|| env_var("WS_URL"))
+        .or_else(|| cfg.ws_url.clone())
+        .context("no rpc websocket: pass --ws wss://... or set WS_URL")?;
+
+    let started = Instant::now();
+    let from_feed: Arc<Mutex<HashMap<u64, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+    let from_rpc: Arc<Mutex<HashMap<u64, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let feed_seen = Arc::clone(&from_feed);
+    let feed_task = tokio::spawn(async move {
+        let (stream, _) = tokio_tungstenite::connect_async(&feed_url)
+            .await
+            .context("connecting to the feed")?;
+        println!("feed open");
+        let (_w, mut r) = stream.split();
+        while let Some(msg) = r.next().await {
+            let at = started.elapsed();
+            let text = match msg.context("reading the feed")? {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t,
+                tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                    String::from_utf8_lossy(&b).into_owned()
+                }
+                _ => continue,
+            };
+            let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
+            let mut seen = feed_seen.lock().await;
+            for m in &frame.messages {
+                seen.entry(m.sequence_number).or_insert(at);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let rpc_seen = Arc::clone(&from_rpc);
+    let rpc_task = tokio::spawn(async move {
+        let provider = Provider::<Ws>::connect(&ws_url).await.context("connecting to the rpc")?;
+        println!("rpc open");
+        let mut heads = provider.subscribe_blocks().await.context("eth_subscribe(newHeads)")?;
+        while let Some(head) = heads.next().await {
+            let at = started.elapsed();
+            if let Some(n) = head.number {
+                rpc_seen.lock().await.entry(n.as_u64()).or_insert(at);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    println!("watching for {seconds}s, ignoring the first {warmup}s while the feed catches up");
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+    feed_task.abort();
+    rpc_task.abort();
+
+    let feed = from_feed.lock().await;
+    let rpc = from_rpc.lock().await;
+    let after = Duration::from_secs(warmup);
+    let mut over_time: Vec<(Duration, i64)> = rpc
+        .iter()
+        .filter(|(_, t)| **t >= after)
+        .filter_map(|(n, t_rpc)| {
+            feed.get(n).map(|t_feed| (*t_rpc, t_rpc.as_millis() as i64 - t_feed.as_millis() as i64))
+        })
+        .collect();
+    let mut lead: Vec<i64> = over_time.iter().map(|(_, d)| *d).collect();
+    println!(
+        "\nfeed announced {} blocks, the rpc {}, {} counted after the warmup",
+        feed.len(),
+        rpc.len(),
+        lead.len()
+    );
+    // The heights each stream ended on. A difference here is the same story the
+    // milliseconds tell, in the unit that matters for trading.
+    if let (Some(f), Some(r)) = (feed.keys().max(), rpc.keys().max()) {
+        println!("last height: feed {f}, rpc {r} (feed ahead by {})", *f as i64 - *r as i64);
+    }
+    if lead.is_empty() {
+        println!("nothing to compare: no block was announced by both within the counted window");
+        return Ok(());
+    }
+    report_lead(&mut lead, &mut over_time, "blocks");
+    println!(
+        "\nboth sides are pushed, so this cost no requests. A positive median is how much \
+         earlier the feed knows a block exists than the rpc admits it."
+    );
+    Ok(())
 }
 
 #[tokio::main]
@@ -431,6 +675,12 @@ async fn main() -> Result<()> {
 
     if args.iter().any(|a| a == "--watch") {
         return watch(&args, &cfg).await;
+    }
+    if args.iter().any(|a| a == "--offset") {
+        return offset(&args, &cfg).await;
+    }
+    if args.iter().any(|a| a == "--heads") {
+        return heads(&args, &cfg).await;
     }
 
     // Every `--endpoint` given, else what the bot itself broadcasts through -
