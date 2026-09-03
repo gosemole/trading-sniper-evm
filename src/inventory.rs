@@ -28,13 +28,26 @@ pub struct Position {
     /// The same in human units, for the average and for logs. Approximate by
     /// nature; nothing is ever sold on the strength of it.
     pub qty: f64,
-    /// What this token actually cost, weighted by quantity across every buy:
-    /// the quote token really spent divided by the token really received. Not
-    /// the pool's mid price - that is what the trade was worth before the LP
-    /// fee, the protocol fee, the hook's cut and the impact of our own size
-    /// took theirs, and none of them are recoverable. A position seeded from
-    /// the wallet has no fill to divide, and falls back to the mid.
+    /// What this token actually cost IN THE POOL'S OWN QUOTE TOKEN, weighted
+    /// by quantity across every buy - read out of the buy's own `Swap` log, so
+    /// the LP fee, the protocol fee, the hook's cut and the impact of our size
+    /// are all already in it. Not the mid: the mid is what the trade was worth
+    /// before any of those took theirs, and none of them are recoverable.
+    ///
+    /// This is the ONLY price compared against a pool price, and it is in that
+    /// pool's units for exactly that reason. A buy whose log could not be read,
+    /// and a position seeded from the wallet, fall back to the mid.
     pub avg_price: f64,
+    /// What the same token cost in the ROUTE'S INPUT token - real money, the
+    /// figure a profit is eventually counted in. Quantity-weighted the same
+    /// way, from what actually left the wallet divided by what actually
+    /// arrived, so it carries both hops' costs rather than just the pool's.
+    ///
+    /// Reporting only. It is denominated differently from every pool price
+    /// here, and comparing the two is what made take-profit unreachable once
+    /// already - so nothing in the trading path may read it.
+    #[serde(default)]
+    pub avg_cost: f64,
     /// The fraction of mid-price value expected to survive the sale that
     /// closes this position, quantity-weighted like `avg_price`. 1.0 means
     /// getting out is free, which is never true and is only the default for
@@ -130,10 +143,10 @@ pub struct Trade {
     pub raw: ethers::types::U256,
     /// Pool price at the moment of the trade; unused for a sale.
     pub price: f64,
-    /// What a buy actually sent, in human units of the token it spent. The
-    /// other half of the effective entry price - `price` says what the pool
-    /// thought the token was worth, this says what we handed over for it.
-    /// `None` for a sale, and for a buy whose input amount could not be read.
+    /// What a buy actually sent, in human units of the token it spent. Divided
+    /// by what arrived, this is the position's cost in real money - the route's
+    /// input token, NOT the pool's quote token. `None` for a sale, and for a
+    /// buy whose input amount could not be read.
     pub spent: Option<f64>,
     /// A sale's proceeds: which token comes back, and how much. Credited to
     /// the tracked cash balance the moment the sale is reserved, and reversed
@@ -326,6 +339,13 @@ impl Inventory {
     /// figure is used, which is the best that can be done and is why it is
     /// kept.
     ///
+    /// `entry_price` is what the pool this trade went through actually filled
+    /// at, in that pool's own quote token, read from the transaction's own
+    /// `Swap` log - see `Pool::fill_price`. This is what a take-profit target
+    /// is built from, so it has to be in the pool's units and not the route's.
+    /// `None` falls back to the mid the trade was reserved at, which is the
+    /// price before any fee and therefore optimistic.
+    ///
     /// `credit_moved` is the same idea for a sale's proceeds - what the
     /// receipt says came back, in the token `reserve` credited on the
     /// optimistic assumption the sale would land. Reconciled here rather than
@@ -337,6 +357,7 @@ impl Inventory {
         hash: ethers::types::H256,
         moved: Option<ethers::types::U256>,
         credit_moved: Option<ethers::types::U256>,
+        entry_price: Option<f64>,
     ) -> Option<Side> {
         let p = self.pending.remove(&format!("{hash:?}").to_lowercase())?;
         if let (Some((ctoken, quoted_str)), Some(actual)) = (&p.credit, credit_moved) {
@@ -365,15 +386,20 @@ impl Inventory {
                 if amount.is_zero() {
                     return Some(p.side);
                 }
-                // What this fill really cost per token: everything handed
-                // over divided by everything that arrived. Both fees, the
-                // hook's cut and the impact of our own size are already inside
-                // those two numbers, so none of them has to be modelled - the
-                // fill measured them. Only a buy that could not report its own
-                // input falls back to the mid, which understates the cost.
-                let paid = match p.spent {
-                    Some(sp) if sp.is_finite() && sp > 0.0 && human > 0.0 => sp / human,
+                // Two prices for the same fill, in two different currencies,
+                // and keeping them apart is the whole point. `paid` is what
+                // the pool charged in ITS quote token, read from the swap's
+                // own log - the only one a pool price may be compared to.
+                // `cost` is what left the wallet in the route's input token,
+                // which carries every hop, means nothing to this pool, and is
+                // never compared to anything here.
+                let paid = match entry_price {
+                    Some(px) if px.is_finite() && px > 0.0 => px,
                     _ => p.price,
+                };
+                let cost = match p.spent {
+                    Some(sp) if sp.is_finite() && sp > 0.0 && human > 0.0 => sp / human,
+                    _ => 0.0,
                 };
                 // And the way back out is assumed to cost what the way in did.
                 // See `Position::exit_ratio` - this is the assumption, and the
@@ -391,6 +417,7 @@ impl Inventory {
                         raw: "0".to_string(),
                         qty: 0.0,
                         avg_price: paid,
+                        avg_cost: cost,
                         exit_ratio: 1.0,
                         buys: 0,
                         updated: 0,
@@ -398,6 +425,7 @@ impl Inventory {
                     });
                 let total = e.qty + human;
                 e.avg_price = (e.avg_price * e.qty + paid * human) / total;
+                e.avg_cost = (e.avg_cost * e.qty + cost * human) / total;
                 e.exit_ratio = (e.exit() * e.qty + ratio * human) / total;
                 e.qty = total;
                 e.raw = (e.held() + amount).to_string();
@@ -462,6 +490,9 @@ impl Inventory {
                 raw: raw.to_string(),
                 qty: raw_to_f64(raw, decimals),
                 avg_price: price,
+                // Never bought, so nothing was spent and there is no cost to
+                // record. Zero says "unknown" here rather than "free".
+                avg_cost: 0.0,
                 // Nothing was paid for this, so nothing was measured. The mid
                 // stands in for the entry and the exit is assumed free, both
                 // of which flatter it - which is what `seeded` is there to say.
@@ -529,7 +560,8 @@ mod tests {
         }
     }
 
-    /// The same buy, but reporting what it actually handed over.
+    /// The same buy, but reporting what it handed over on the ROUTE - the
+    /// input token, which on a multi-hop route is not the pool's quote token.
     fn buy_paying(token: Address, units: f64, price: f64, spent: f64) -> Trade {
         Trade {
             spent: Some(spent),
@@ -537,20 +569,44 @@ mod tests {
         }
     }
 
-    /// The whole point of tracking what a buy spent: 10 tokens off a pool that
-    /// says they are worth 10 each did not cost 100 if 105 left the wallet.
-    /// Everything between those figures - both fees, the hook, our own impact -
-    /// is unrecoverable, and pricing the entry at the mid pretends otherwise.
+    /// The two prices are in two different currencies and must stay apart.
+    ///
+    /// Deliberately given wildly different magnitudes: on the real route that
+    /// broke this, the pool quoted in TTWO at 2.1e-5 while the wallet spent
+    /// USDG at 4.9e-3, and a test where both were the same number could not
+    /// tell which one a target was built from. This one can.
     #[test]
-    fn the_entry_price_is_what_was_paid_not_the_mid() {
+    fn the_pool_price_and_the_route_cost_are_kept_apart() {
         let mut inv = Inventory::default();
-        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 105.0)));
-        inv.settle(hash(1), None, None);
+        // 10 tokens: the pool filled at 10.5 of its own quote token against a
+        // mid of 10, and 300 of the route's input token left the wallet.
+        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 300.0)));
+        inv.settle(hash(1), None, None, Some(10.5));
         let p = inv.get(addr(1)).unwrap();
-        assert!((p.avg_price - 10.5).abs() < 1e-9, "{}", p.avg_price);
-        // And the way back out is assumed to cost the same fraction again.
+
+        assert_eq!(p.avg_price, 10.5, "the entry is what the POOL charged");
+        assert_eq!(p.avg_cost, 30.0, "the cost is what the ROUTE spent");
         let ratio = p.exit_ratio;
         assert!((ratio - 10.0 / 10.5).abs() < 1e-9, "{ratio}");
+    }
+
+    /// The regression that made take-profit unreachable: the target has to be
+    /// a pool price, comparable to the pool prices the feed delivers, and never
+    /// the route's cost - which on a multi-hop route is a different currency
+    /// and, here, three times the number.
+    #[test]
+    fn the_target_is_in_pool_units_not_route_units() {
+        let mut inv = Inventory::default();
+        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 300.0)));
+        inv.settle(hash(1), None, None, Some(10.5));
+        let p = inv.get(addr(1)).unwrap();
+
+        let target = p.target(5.0);
+        // Within reach of the pool's own prices...
+        assert!(target > 10.5 && target < 12.5, "{target}");
+        // ...and nowhere near the route's cost, which is what it became when
+        // the two were confused.
+        assert!(target < p.avg_cost, "{target} should be far below {}", p.avg_cost);
     }
 
     /// A 5% take-profit has to mean 5% kept, so the target sits above the entry
@@ -558,8 +614,8 @@ mod tests {
     #[test]
     fn the_target_covers_getting_back_out() {
         let mut inv = Inventory::default();
-        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 105.0)));
-        inv.settle(hash(1), None, None);
+        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 300.0)));
+        inv.settle(hash(1), None, None, Some(10.5));
         let p = inv.get(addr(1)).unwrap();
 
         let naive = p.avg_price * 1.05;
@@ -571,18 +627,19 @@ mod tests {
         assert!(p.net_pct(naive) < 5.0, "{}", p.net_pct(naive));
     }
 
-    /// A buy that could not say what it spent is priced at the mid and assumed
+    /// A buy whose swap log could not be read is priced at the mid and assumed
     /// free to exit, which is what every position recorded before this existed
     /// looks like. It must still behave, not divide by zero.
     #[test]
-    fn a_buy_that_cannot_report_its_spend_falls_back_to_the_mid() {
+    fn a_buy_with_no_readable_fill_falls_back_to_the_mid() {
         let mut inv = Inventory::default();
         assert!(inv.reserve(hash(1), buy(addr(1), 10.0, 10.0)));
-        inv.settle(hash(1), None, None);
+        inv.settle(hash(1), None, None, None);
         let p = inv.get(addr(1)).unwrap();
         assert_eq!(p.avg_price, 10.0);
         assert_eq!(p.exit_ratio, 1.0);
         assert_eq!(p.target(5.0), 10.5);
+        assert_eq!(p.avg_cost, 0.0, "nothing was reported spent");
     }
 
     /// An inventory written before `exit_ratio` existed loads with 1.0, not the
@@ -605,13 +662,13 @@ mod tests {
     #[test]
     fn averaging_in_weights_the_exit_the_same_way() {
         let mut inv = Inventory::default();
-        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 105.0)));
-        inv.settle(hash(1), None, None);
+        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 300.0)));
+        inv.settle(hash(1), None, None, Some(10.5));
         let first = inv.get(addr(1)).unwrap().exit_ratio;
 
-        // The same size again, but paying twice the spread for it.
-        assert!(inv.reserve(hash(2), buy_paying(addr(1), 10.0, 10.0, 110.0)));
-        inv.settle(hash(2), None, None);
+        // The same size again, but filled a good deal worse.
+        assert!(inv.reserve(hash(2), buy_paying(addr(1), 10.0, 10.0, 300.0)));
+        inv.settle(hash(2), None, None, Some(11.0));
         let p = inv.get(addr(1)).unwrap();
 
         let expect = (10.0 / 10.5 + 10.0 / 11.0) / 2.0;
@@ -629,7 +686,7 @@ mod tests {
 
     fn filled(inv: &mut Inventory, h: u8, token: Address, units: f64, price: f64) {
         inv.reserve(hash(h), buy(token, units, price));
-        inv.settle(hash(h), None, None);
+        inv.settle(hash(h), None, None, None);
     }
 
     #[test]
@@ -653,7 +710,7 @@ mod tests {
         // built on the first would drift, and a sale sized on it would ask for
         // three tokens that are not there.
         inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
-        inv.settle(hash(1), Some(raw(97.0)), None);
+        inv.settle(hash(1), Some(raw(97.0)), None, None);
         let p = inv.get(addr(1)).unwrap();
         assert_eq!(p.held(), raw(97.0));
         assert_eq!(p.qty, 97.0);
@@ -664,7 +721,7 @@ mod tests {
     fn an_unreadable_receipt_falls_back_to_the_quote() {
         let mut inv = Inventory::default();
         inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
-        inv.settle(hash(1), None, None);
+        inv.settle(hash(1), None, None, None);
         assert_eq!(inv.get(addr(1)).unwrap().held(), raw(100.0));
     }
 
@@ -672,7 +729,7 @@ mod tests {
     fn a_buy_that_delivered_nothing_is_not_a_position() {
         let mut inv = Inventory::default();
         inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
-        assert_eq!(inv.settle(hash(1), Some(U256::zero()), None), Some(Side::Buy));
+        assert_eq!(inv.settle(hash(1), Some(U256::zero()), None, None), Some(Side::Buy));
         assert!(inv.get(addr(1)).is_none(), "nothing arrived, so nothing is held");
     }
 
@@ -723,7 +780,7 @@ mod tests {
                 !inv.reserve(hash(n), Trade { raw: size, price, ..buy(addr(1), 1.0, 1.0) }),
                 "{size} at {price} should be refused"
             );
-            assert!(inv.settle(hash(n), None, None).is_none(), "and nothing to settle");
+            assert!(inv.settle(hash(n), None, None, None).is_none(), "and nothing to settle");
         }
         let p = inv.get(addr(1)).unwrap();
         assert_eq!(p.held(), raw(100.0));
@@ -767,7 +824,7 @@ mod tests {
         let mut inv = Inventory::default();
         assert!(inv.reserve(hash(1), buy(addr(1), 100.0, 10.0)));
         assert!(inv.get(addr(1)).is_none(), "a sent transaction is not a fill");
-        assert_eq!(inv.settle(hash(1), None, None), Some(Side::Buy));
+        assert_eq!(inv.settle(hash(1), None, None, None), Some(Side::Buy));
         assert_eq!(inv.get(addr(1)).unwrap().held(), raw(100.0));
     }
 
@@ -796,7 +853,7 @@ mod tests {
         assert_eq!(inv.get(addr(1)).unwrap().avg_price, 10.0);
 
         inv.reserve(hash(4), sale(addr(1), 100.0));
-        assert_eq!(inv.settle(hash(4), None, None), Some(Side::Sell));
+        assert_eq!(inv.settle(hash(4), None, None, None), Some(Side::Sell));
         assert!(inv.get(addr(1)).is_none());
     }
 
@@ -807,7 +864,7 @@ mod tests {
         // Capped by the wallet balance, only 40 went. The remaining 60 are
         // still ours and still carry the price they were bought at.
         inv.reserve(hash(2), sale(addr(1), 40.0));
-        inv.settle(hash(2), None, None);
+        inv.settle(hash(2), None, None, None);
         let p = inv.get(addr(1)).expect("the rest is still held");
         assert_eq!(p.held(), raw(60.0));
         assert_eq!(p.qty, 60.0);
@@ -818,8 +875,8 @@ mod tests {
     fn settling_the_same_transaction_twice_does_nothing() {
         let mut inv = Inventory::default();
         inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
-        assert_eq!(inv.settle(hash(1), None, None), Some(Side::Buy));
-        assert_eq!(inv.settle(hash(1), None, None), None, "the reservation is gone");
+        assert_eq!(inv.settle(hash(1), None, None, None), Some(Side::Buy));
+        assert_eq!(inv.settle(hash(1), None, None, None), None, "the reservation is gone");
         assert_eq!(inv.get(addr(1)).unwrap().held(), raw(100.0), "and was counted once");
     }
 
@@ -839,7 +896,7 @@ mod tests {
             hash(7),
             Trade { symbol: "CAMELTOE".into(), raw: odd, ..buy(addr(7), 1.0, 0.0000123) },
         );
-        inv.settle(hash(7), None, None);
+        inv.settle(hash(7), None, None, None);
         inv.reserve(hash(8), buy(addr(8), 1.0, 5.0));
         inv.save().unwrap();
 
@@ -855,9 +912,9 @@ mod tests {
         let mut inv = Inventory::default();
         filled(&mut inv, 1, addr(1), 100.0, 10.0);
         inv.reserve(hash(2), sale(addr(1), 100.0));
-        inv.settle(hash(2), None, None);
+        inv.settle(hash(2), None, None, None);
         assert!(inv.get(addr(1)).is_none());
-        assert!(inv.settle(hash(2), None, None).is_none(), "and stays forgotten");
+        assert!(inv.settle(hash(2), None, None, None).is_none(), "and stays forgotten");
     }
 
     #[test]
@@ -931,7 +988,7 @@ mod tests {
         filled(&mut inv, 9, addr(1), 5.0, 1.0);
         let trade = Trade { credit: Some((proceeds, raw(40.0))), ..sale(addr(1), 5.0) };
         inv.reserve(hash(1), trade);
-        assert_eq!(inv.settle(hash(1), None, None), Some(Side::Sell));
+        assert_eq!(inv.settle(hash(1), None, None, None), Some(Side::Sell));
         assert_eq!(inv.cash(proceeds), raw(50.0), "the quoted 40 is still all there is to go on");
     }
 
@@ -948,7 +1005,7 @@ mod tests {
         let trade = Trade { credit: Some((proceeds, raw(40.0))), ..sale(addr(1), 5.0) };
         inv.reserve(hash(1), trade);
         assert_eq!(inv.cash(proceeds), raw(50.0), "optimistic, before settling");
-        assert_eq!(inv.settle(hash(1), None, Some(raw(33.0))), Some(Side::Sell));
+        assert_eq!(inv.settle(hash(1), None, Some(raw(33.0)), None), Some(Side::Sell));
         assert_eq!(inv.cash(proceeds), raw(43.0), "10 starting + 33 real, not +40 quoted");
     }
 
@@ -962,7 +1019,7 @@ mod tests {
         filled(&mut inv, 9, addr(1), 5.0, 1.0);
         let trade = Trade { credit: Some((proceeds, raw(40.0))), ..sale(addr(1), 5.0) };
         inv.reserve(hash(1), trade);
-        inv.settle(hash(1), None, Some(raw(45.0)));
+        inv.settle(hash(1), None, Some(raw(45.0)), None);
         assert_eq!(inv.cash(proceeds), raw(55.0), "10 starting + 45 real");
     }
 
@@ -981,7 +1038,7 @@ mod tests {
         inv.reserve(hash(1), trade);
         inv.debit_cash(shared, raw(45.0));
         assert_eq!(inv.cash(shared), raw(5.0));
-        inv.settle(hash(1), None, Some(raw(33.0)));
+        inv.settle(hash(1), None, Some(raw(33.0)), None);
         // 10 - 45 + 33 = -2 -> floored, and never 33.
         assert_eq!(inv.cash(shared), U256::zero());
 
@@ -993,7 +1050,7 @@ mod tests {
         let trade = Trade { credit: Some((shared, raw(40.0))), ..sale(addr(1), 5.0) };
         inv.reserve(hash(1), trade);
         inv.debit_cash(shared, raw(45.0));
-        inv.settle(hash(1), None, Some(raw(47.0)));
+        inv.settle(hash(1), None, Some(raw(47.0)), None);
         assert_eq!(inv.cash(shared), raw(12.0), "5 + (47 - 40)");
     }
 
@@ -1008,7 +1065,7 @@ mod tests {
         filled(&mut inv, 1, addr(1), 5.0, 1.0);
         let trade = Trade { credit: Some((addr(9), raw(1.0))), ..sale(addr(1), 5.0) };
         inv.reserve(hash(2), trade);
-        inv.settle(hash(2), None, Some(raw(3.0)));
+        inv.settle(hash(2), None, Some(raw(3.0)), None);
         assert_eq!(inv.cash(addr(9)), U256::MAX, "and the reconciliation too");
     }
 

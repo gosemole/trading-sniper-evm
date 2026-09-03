@@ -175,6 +175,13 @@ leaves the previous state rather than half of the new one.
   same pools and the same hook. So `5.0` fires later than a naive 5% move in
   the pool price, by roughly the cost of one round trip, and what it clears is
   five percent actually kept.
+- A position records **two** prices, in two currencies, and they are never
+  compared to each other. `entry_in_pool` is what the pool actually charged in
+  its own quote token, read out of the buy's `Swap` log - that is the one a
+  take-profit target is built from, because it is the currency the feed quotes
+  prices in. `cost_in_route_token` is what left the wallet on the whole route,
+  which is the real money but means nothing to a single pool: on a multi-hop
+  route it is a different token entirely.
 - Positions recorded before this existed carry the mid price as their entry and
   assume a free exit. They stay slightly optimistic until the next buy averages
   in a real fill; there is nothing to recompute them from.

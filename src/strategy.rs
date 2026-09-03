@@ -190,6 +190,10 @@ pub enum Report {
         pool: PoolRef,
         ok: bool,
         moved: Option<ethers::types::U256>,
+        /// What the pool actually filled at, in the pool's own quote token,
+        /// read from the transaction's `Swap` log. `None` for a sale, and
+        /// whenever the log could not be read. See `Pool::fill_price`.
+        entry_price: Option<f64>,
         /// A sale's real proceeds, if this settlement has any to reconcile.
         credit_moved: Option<ethers::types::U256>,
     },
@@ -209,6 +213,7 @@ struct Settled {
     pool: PoolRef,
     ok: bool,
     moved: Option<ethers::types::U256>,
+    entry_price: Option<f64>,
     credit_moved: Option<ethers::types::U256>,
 }
 
@@ -252,7 +257,18 @@ impl Strategy {
             let side = if landed.outcome.happened() {
                 let moved = self.moved_in(&landed, p.side, token);
                 let credit_moved = self.received_of(&landed, p.credit_token());
-                self.inventory.settle(hash, moved, credit_moved)
+                // Same reading as `follow` does for a live trade: the pool
+                // that holds this token says what the buy filled at.
+                let entry_price = match p.side {
+                    Side::Buy => self
+                        .watches
+                        .values()
+                        .find(|w| w.pool.base_currency() == Some(token))
+                        .and_then(|w| w.pool.fill_price(&landed.logs)),
+                    Side::Sell => None,
+                };
+                self.inventory
+                    .settle(hash, moved, credit_moved, entry_price)
             } else {
                 self.inventory.rollback(hash)
             };
@@ -381,12 +397,17 @@ impl Strategy {
 
     /// Follow a transaction and bring its outcome back to the one place that
     /// may act on it.
+    /// `price_from` is the pool whose own `Swap` log says what this trade
+    /// actually filled at - `Some` for a buy, whose entry price has to be
+    /// recorded in that pool's units, and `None` for a sale, which has no
+    /// entry to record.
     fn follow(
         &self,
         hash: H256,
         pool: PoolRef,
         token: ethers::types::Address,
         credit_token: Option<ethers::types::Address>,
+        price_from: Option<Pool>,
         label: String,
     ) {
         let http = self.http.clone();
@@ -404,12 +425,16 @@ impl Strategy {
                 (Some(o), Some(ct)) => crate::swap::received(&landed.logs, ct, o),
                 _ => None,
             };
+            // What the pool charged, in the pool's own quote token, straight
+            // out of its own event in this very transaction.
+            let entry_price = price_from.and_then(|p| p.fill_price(&landed.logs));
             let _ = back
                 .send(Report::Settled {
                     hash,
                     pool,
                     ok: landed.outcome.happened(),
                     moved,
+                    entry_price,
                     credit_moved,
                 })
                 .await;
@@ -670,11 +695,18 @@ impl Strategy {
                 if self.inventory.reserve(hash, trade) {
                     self.save();
                     info!(tx = ?hash, token = %symbol, ?side, %raw, price, "reserved");
+                    // A sale has no entry to price; a buy is priced from the
+                    // pool it went through, which is the one being watched.
+                    let price_from = match side {
+                        Side::Buy => self.watches.get(&pool).map(|w| w.pool.clone()),
+                        Side::Sell => None,
+                    };
                     self.follow(
                         hash,
                         pool,
                         token,
                         credit_token,
+                        price_from,
                         format!("{side:?} {symbol}").to_lowercase(),
                     );
                 }
@@ -696,12 +728,24 @@ impl Strategy {
                 }
                 return;
             }
-            Report::Settled { hash, pool, ok, moved, credit_moved } => {
-                Settled { hash, pool, ok, moved, credit_moved }
-            }
+            Report::Settled {
+                hash,
+                pool,
+                ok,
+                moved,
+                entry_price,
+                credit_moved,
+            } => Settled {
+                hash,
+                pool,
+                ok,
+                moved,
+                entry_price,
+                credit_moved,
+            },
         };
         let side = if s.ok {
-            self.inventory.settle(s.hash, s.moved, s.credit_moved)
+            self.inventory.settle(s.hash, s.moved, s.credit_moved, s.entry_price)
         } else {
             self.inventory.rollback(s.hash)
         };
@@ -722,7 +766,14 @@ impl Strategy {
                 if let Some(w) = self.watches.get(&s.pool) {
                     if let Some(p) = w.pool.base_currency().and_then(|t| self.inventory.get(t)) {
                         info!(
-                            token = %p.symbol, qty = p.qty, avg_price = p.avg_price,
+                            token = %p.symbol, qty = p.qty,
+                            // Named for the currency each is in, because the
+                            // two are not comparable and reading one as the
+                            // other is what once put every target out of reach.
+                            entry_in_pool = p.avg_price,
+                            cost_in_route_token = p.avg_cost,
+                            exit_ratio = p.exit_ratio,
+                            target = p.target(w.take_profit_pct.unwrap_or_default()),
                             buys = p.buys, "position"
                         );
                     }
@@ -828,7 +879,7 @@ impl Strategy {
         info!(
             pool = %name,
             token = %position.symbol,
-            entry = position.avg_price,
+            entry_in_pool = position.avg_price,
             now = tick.price,
             gain_pct = format!("{:+.3}%", position.gain_pct(tick.price)),
             // What is left once the sale has paid for itself too. This is the

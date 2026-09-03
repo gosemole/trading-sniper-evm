@@ -1,7 +1,7 @@
 use crate::config::PoolConfig;
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
-use ethers::types::{Address, Bytes, Filter, H256, TransactionRequest, U256, ValueOrArray};
+use ethers::types::{Address, Bytes, Filter, Log, TransactionRequest, H256, U256, ValueOrArray};
 use ethers::utils::keccak256;
 use std::collections::HashMap;
 
@@ -18,6 +18,20 @@ const V4_INIT_SIG: &str =
 /// topic0 of the given event signature.
 pub fn event_topic(sig: &str) -> H256 {
     H256::from_slice(&keccak256(sig.as_bytes()))
+}
+
+/// The magnitude of a two's-complement signed word, as an f64.
+///
+/// Swap events report amounts signed by direction, and only the size matters
+/// here. Both protocols keep the real magnitude far inside 128 bits, so nothing
+/// is lost going through f64 for a ratio.
+fn abs_signed_word(b: &[u8]) -> f64 {
+    let v = U256::from_big_endian(b);
+    let magnitude = match b[0] & 0x80 != 0 {
+        true => (!v).overflowing_add(U256::one()).0,
+        false => v,
+    };
+    crate::route::u256_to_f64(magnitude)
 }
 
 pub fn v3_swap_topic() -> H256 {
@@ -267,6 +281,65 @@ impl Pool {
     /// Addresses to subscribe to. v3: the single pool. v4: PoolManager.
     pub fn filter_addresses(&self) -> Vec<Address> {
         vec![self.address]
+    }
+
+    /// The price this pool actually filled at, read out of a transaction's own
+    /// `Swap` log.
+    ///
+    /// Both amounts come from the same event, so their ratio is the price the
+    /// swap really got: the LP fee, the protocol fee, the hook's cut and the
+    /// impact of the size are all already inside those two numbers, and none of
+    /// them has to be modelled. It is in this pool's own quote token, which is
+    /// the unit every other price here is measured in - notably the one a
+    /// take-profit target is compared against.
+    ///
+    /// Signs are ignored on purpose. Which side is negative depends on the
+    /// direction and on whose balance the event describes, and the ratio of the
+    /// magnitudes is the price either way. More than one swap through the same
+    /// pool in one transaction is summed rather than the first one taken.
+    ///
+    /// `None` when this pool did not swap in this transaction, or when its
+    /// decimals were never resolved - a price scaled by the wrong power of ten
+    /// is worse than no price, because it would be believed.
+    pub fn fill_price(&self, logs: &[Log]) -> Option<f64> {
+        if !self.decimals_known {
+            return None;
+        }
+        let topic = match self.version.as_str() {
+            "v4" => v4_swap_topic(),
+            _ => v3_swap_topic(),
+        };
+        let (mut a0, mut a1) = (0.0f64, 0.0f64);
+        for log in logs {
+            if log.address != self.address || log.topics.first() != Some(&topic) {
+                continue;
+            }
+            // v4 puts the PoolId in the first indexed slot, and one PoolManager
+            // emits for every pool it holds - so without this every other pool
+            // that traded in the same transaction would be counted as ours.
+            if let Some(pid) = self.pool_id {
+                if log.topics.get(1) != Some(&pid) {
+                    continue;
+                }
+            }
+            // Both protocols lay the two amounts out first, one word each.
+            if log.data.0.len() < 64 {
+                continue;
+            }
+            a0 += abs_signed_word(&log.data.0[0..32]);
+            a1 += abs_signed_word(&log.data.0[32..64]);
+        }
+        // Both sides have to be real and positive; a NaN reaching a price a
+        // target is built from would compare false against everything forever.
+        if !a0.is_finite() || !a1.is_finite() || a0 <= 0.0 || a1 <= 0.0 {
+            return None;
+        }
+        let (base, quote, base_dec, quote_dec) = match self.base_token {
+            1 => (a1, a0, self.decimals1, self.decimals0),
+            _ => (a0, a1, self.decimals0, self.decimals1),
+        };
+        let price = (quote / 10f64.powi(quote_dec as i32)) / (base / 10f64.powi(base_dec as i32));
+        (price.is_finite() && price > 0.0).then_some(price)
     }
 
     /// Decimals of the quote side, used to scale `quote_pay` into human units.
@@ -904,6 +977,72 @@ mod tests {
         assert!(p.quote_pay(1, sqrt, 0.0).is_err());
         assert!(p.quote_pay(1, sqrt, -1.0).is_err());
         assert!(p.quote_pay(1, U256::zero(), 1.0).is_err());
+    }
+
+    /// One v4 `Swap` word layout, with the amounts signed the way the chain
+    /// signs them: the side paid in is negative from the swapper's view.
+    fn swap_log(pool: &Pool, amount0: i128, amount1: i128, id: Option<H256>) -> Log {
+        // Sign-extended two's complement, as the ABI encodes a negative int.
+        let signed_word = |v: i128| -> [u8; 32] {
+            let mut w = [if v < 0 { 0xffu8 } else { 0x00 }; 32];
+            w[16..].copy_from_slice(&v.to_be_bytes());
+            w
+        };
+        let mut data = vec![0u8; 192];
+        data[0..32].copy_from_slice(&signed_word(amount0));
+        data[32..64].copy_from_slice(&signed_word(amount1));
+        let mut topics = vec![v4_swap_topic()];
+        if let Some(id) = id {
+            topics.push(id);
+        }
+        Log {
+            address: pool.address,
+            topics,
+            data: data.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The price a fill really got, out of the swap's own event. The ratio has
+    /// to survive the signs - which side is negative depends on the direction,
+    /// and the magnitudes are the price either way.
+    #[test]
+    fn a_fill_price_comes_out_of_the_swap_log() {
+        // base is token1, quote is token0, both 18 decimals: paid 21 of token0
+        // for 10 of token1, so the base cost 2.1 quote each.
+        let p = pool(1, (18, 18));
+        let unit = 1_000_000_000_000_000_000i128;
+        let (paid, got) = (-21 * unit, 10 * unit);
+        let px = p.fill_price(&[swap_log(&p, paid, got, None)]).unwrap();
+        assert!((px - 2.1).abs() < 1e-12, "{px}");
+        // The mirror trade prices the same, because only magnitudes matter.
+        let px = p.fill_price(&[swap_log(&p, -paid, -got, None)]).unwrap();
+        assert!((px - 2.1).abs() < 1e-12, "{px}");
+    }
+
+    /// One PoolManager emits for every pool it holds, so a swap through some
+    /// other pool in the same transaction must not be read as ours.
+    #[test]
+    fn another_pools_swap_in_the_same_tx_is_ignored() {
+        let mut p = pool(1, (18, 18));
+        p.pool_id = Some(H256::from([7u8; 32]));
+        let unit = 1_000_000_000_000_000_000i128;
+        let mine = swap_log(&p, -21 * unit, 10 * unit, p.pool_id);
+        let elsewhere = Some(H256::from([9u8; 32]));
+        let theirs = swap_log(&p, -999 * unit, unit, elsewhere);
+        let px = p.fill_price(&[theirs, mine]).unwrap();
+        assert!((px - 2.1).abs() < 1e-12, "{px}");
+    }
+
+    /// Decimals that were never resolved would scale the price by the wrong
+    /// power of ten, and a wrong price is worse than none because it is used.
+    #[test]
+    fn an_unscaled_pool_reports_no_fill_price() {
+        let mut p = pool(1, (18, 18));
+        p.decimals_known = false;
+        let unit = 1_000_000_000_000_000_000i128;
+        let log = swap_log(&p, -21 * unit, 10 * unit, None);
+        assert!(p.fill_price(&[log]).is_none());
     }
 
     #[test]
