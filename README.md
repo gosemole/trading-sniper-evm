@@ -121,7 +121,7 @@ Per route:
 | `auto_buy` | arm the route |
 | `trigger_pool` | which pool's drop fires it; defaults to the last pool in `pools` |
 | `cooldown_secs` | shortest gap between buys; `0` means every signal buys |
-| `take_profit_pct` | sell the whole position once the pool price is this far above the average entry |
+| `take_profit_pct` | sell the whole position once it is worth this much more than it cost, **net of both fees, the hook and impact** |
 | `exit_after_secs` | sell it anyway once held this long since the last buy |
 
 Per pool: `name`, `version`, `address`, `pool_id`, and optionally `base_token`,
@@ -167,6 +167,17 @@ leaves the previous state rather than half of the new one.
   On `CAMELTOE/LULU` a 5% drop means 5% cheaper in LULU; if LULU itself moved,
   the dollar price may have gone the other way. The same goes for
   `take_profit_pct`.
+- `take_profit_pct` is net. The entry price on the books is what the buy really
+  paid - the quote token that left the wallet divided by the token that
+  arrived - so the LP fee, the protocol fee, the hook's cut and our own impact
+  are all already in it. The target then assumes the sale costs the same
+  fraction again, because it has not happened yet and the way back out is the
+  same pools and the same hook. So `5.0` fires later than a naive 5% move in
+  the pool price, by roughly the cost of one round trip, and what it clears is
+  five percent actually kept.
+- Positions recorded before this existed carry the mid price as their entry and
+  assume a free exit. They stay slightly optimistic until the next buy averages
+  in a real fill; there is nothing to recompute them from.
 - A buy is priced entirely from memory and never asks the router, so nothing
   rehearses it. The pool that dropped is priced from the very log that raised
   the signal - price, liquidity and the fee it actually charged; any other hop

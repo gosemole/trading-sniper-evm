@@ -71,6 +71,13 @@ impl BigSellMeter {
         }
     }
 
+    /// The most recent price this pool reported, which is the running close of
+    /// the block being observed. The best available guess at what a sale
+    /// started right now would get.
+    pub fn last(&self) -> Option<f64> {
+        self.price
+    }
+
     /// Feed a tick. Returns a Signal when a BIG SELL fired.
     pub fn observe(&mut self, t: &Tick) -> Option<Signal> {
         match self.cur_block {
@@ -169,6 +176,10 @@ pub enum Report {
         /// Raw units the trade was quoted at; the receipt overrides it.
         raw: ethers::types::U256,
         price: f64,
+        /// What a buy actually handed over, in human units of the token it
+        /// spent - the other half of the price it really got. `None` for a
+        /// sale. See `inventory::Trade::spent`.
+        spent: Option<f64>,
         /// A sale's proceeds - which token comes back and how much - credited
         /// to tracked cash the moment this is reserved. `None` for a buy.
         credit: Option<(ethers::types::Address, ethers::types::U256)>,
@@ -495,7 +506,7 @@ impl Strategy {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let expired: Vec<(PoolRef, String, u64)> = self
+        let expired: Vec<(PoolRef, String, u64, Option<f64>)> = self
             .watches
             .iter()
             .filter(|(_, w)| !w.halted && !w.selling)
@@ -503,11 +514,31 @@ impl Strategy {
                 let after = w.exit_after?.as_secs();
                 let position = self.inventory.get(w.pool.base_currency()?)?;
                 let held = position.held_for(now);
-                (held >= after).then(|| (*key, position.symbol.clone(), held))
+                // The last price this pool reported, which is the best guess
+                // at what the sale is about to get. Absent before the first
+                // tick, and then the outcome simply is not known yet.
+                let net = w.meter.last().map(|p| position.net_pct(p));
+                (held >= after).then(|| (*key, position.symbol.clone(), held, net))
             })
             .collect();
-        for (key, symbol, held) in expired {
-            info!(token = %symbol, held_secs = held, "HOLD EXPIRED");
+        for (key, symbol, held, net) in expired {
+            // A timed exit sells whatever the price is - that is the whole
+            // point of it, and a position held past its welcome is a position
+            // to be rid of. But a sale that does not cover what it cost is a
+            // loss taken deliberately, and it says so rather than passing for
+            // an ordinary close in the log.
+            match net {
+                Some(n) if n < 0.0 => warn!(
+                    token = %symbol, held_secs = held,
+                    net_pct = format!("{n:+.3}%"),
+                    "HOLD EXPIRED AT A LOSS - selling anyway"
+                ),
+                Some(n) => info!(
+                    token = %symbol, held_secs = held,
+                    net_pct = format!("{n:+.3}%"), "HOLD EXPIRED"
+                ),
+                None => info!(token = %symbol, held_secs = held, "HOLD EXPIRED"),
+            }
             self.start_sale(key);
         }
     }
@@ -570,6 +601,10 @@ impl Strategy {
                     // pool knows about its own tokens, and the route is the one
                     // thing that certainly knows what it just bought.
                     let bought = route.output.clone();
+                    // Needed to turn the raw amount the fill sent into the
+                    // human figure the entry price divides by, and captured
+                    // here for the same reason `bought` is.
+                    let spend_decimals = route.input.decimals;
                     let back = self.reports.clone();
                     let (p, s, key) = (pool.clone(), sig.clone(), tick.pool);
                     tokio::spawn(async move {
@@ -585,6 +620,14 @@ impl Strategy {
                                         decimals: bought.decimals,
                                         raw: fill.amount_out,
                                         price: s.price,
+                                        // What the swap actually sent, against
+                                        // what actually arrived: that division
+                                        // is the entry price, with every fee
+                                        // and the hook already in it.
+                                        spent: Some(crate::inventory::raw_to_f64(
+                                            fill.sold,
+                                            spend_decimals,
+                                        )),
                                         credit: None,
                                     })
                                     .await;
@@ -610,7 +653,9 @@ impl Strategy {
     /// or was never real.
     async fn on_report(&mut self, r: Report) {
         let s = match r {
-            Report::Filled { hash, pool, side, token, symbol, decimals, raw, price, credit } => {
+            Report::Filled {
+                hash, pool, side, token, symbol, decimals, raw, price, spent, credit
+            } => {
                 let credit_token = credit.map(|(t, _)| t);
                 let trade = crate::inventory::Trade {
                     side,
@@ -619,6 +664,7 @@ impl Strategy {
                     decimals,
                     raw,
                     price,
+                    spent,
                     credit,
                 };
                 if self.inventory.reserve(hash, trade) {
@@ -785,6 +831,10 @@ impl Strategy {
             entry = position.avg_price,
             now = tick.price,
             gain_pct = format!("{:+.3}%", position.gain_pct(tick.price)),
+            // What is left once the sale has paid for itself too. This is the
+            // one the `pct` in the config is about; `gain_pct` beside it is
+            // what the same move looked like before the way out was counted.
+            net_pct = format!("{:+.3}%", position.net_pct(tick.price)),
             "TARGET REACHED"
         );
         self.start_sale(tick.pool);
@@ -834,6 +884,7 @@ impl Strategy {
                     // exactly that from the position.
                     raw: fill.sold,
                     price: 0.0,
+                    spent: None,
                     // What it should bring back, credited to tracked cash the
                     // moment this reserves - see `Trade::credit`. The quote,
                     // not the receipt: precise enough for a spend gate, and

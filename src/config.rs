@@ -121,10 +121,17 @@ pub struct RouteConfig {
     /// is bought where the price actually moved.
     #[serde(default)]
     pub trigger_pool: Option<String>,
-    /// Sell the whole position back down this route once the pool price is
-    /// this far above the average price it was bought at. Unset means never:
-    /// the bot buys and holds. Measured against the pool's own price, so it is
-    /// a gain against the pool's quote token, not against the dollar.
+    /// Sell the whole position back down this route once it is worth this much
+    /// more than it cost. Unset means never: the bot buys and holds.
+    ///
+    /// NET of the round trip. What the buy really paid - both fees, the hook's
+    /// cut, the impact of our own size - is inside the recorded entry price,
+    /// and the same costs are expected again on the way out, so the pool price
+    /// this fires at is higher than the entry by this much PLUS the round trip.
+    /// 5 here means five percent kept, not five percent of pool-price movement.
+    ///
+    /// Still measured against the pool's own price, so it is a gain against the
+    /// pool's quote token, not against the dollar.
     #[serde(default)]
     pub take_profit_pct: Option<f64>,
     /// Sell the position regardless of price once it has been held this long,

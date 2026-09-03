@@ -28,8 +28,24 @@ pub struct Position {
     /// The same in human units, for the average and for logs. Approximate by
     /// nature; nothing is ever sold on the strength of it.
     pub qty: f64,
-    /// Pool price of this token, weighted by quantity across every buy.
+    /// What this token actually cost, weighted by quantity across every buy:
+    /// the quote token really spent divided by the token really received. Not
+    /// the pool's mid price - that is what the trade was worth before the LP
+    /// fee, the protocol fee, the hook's cut and the impact of our own size
+    /// took theirs, and none of them are recoverable. A position seeded from
+    /// the wallet has no fill to divide, and falls back to the mid.
     pub avg_price: f64,
+    /// The fraction of mid-price value expected to survive the sale that
+    /// closes this position, quantity-weighted like `avg_price`. 1.0 means
+    /// getting out is free, which is never true and is only the default for
+    /// positions recorded before this was tracked.
+    ///
+    /// It is an ASSUMPTION, and the only honest one available at buying time:
+    /// that the way back out costs what the way in cost. Same pools, same
+    /// hook, comparable size - but the sale has not happened, and a hook is
+    /// free to charge differently by direction.
+    #[serde(default = "one")]
+    pub exit_ratio: f64,
     pub buys: u32,
     /// Unix seconds of the last change.
     pub updated: u64,
@@ -41,15 +57,39 @@ pub struct Position {
     pub seeded: bool,
 }
 
+/// Serde's default for `exit_ratio`. It must be 1.0 and not 0.0: this number
+/// divides, and a position loaded from an inventory written before the field
+/// existed would otherwise put every take-profit target at infinity.
+fn one() -> f64 {
+    1.0
+}
+
 impl Position {
     /// Exactly what is held, for a sale to ask for.
     pub fn held(&self) -> ethers::types::U256 {
         ethers::types::U256::from_dec_str(&self.raw).unwrap_or_default()
     }
 
-    /// How far the price has to rise from here to hit a `pct` take-profit.
+    /// The share of the sale that survives it, guarded against a nonsense
+    /// stored value - a ratio that is not a positive fraction is treated as
+    /// "unknown", which is the 1.0 the field defaults to.
+    fn exit(&self) -> f64 {
+        match self.exit_ratio.is_finite() && self.exit_ratio > 0.0 && self.exit_ratio <= 1.0 {
+            true => self.exit_ratio,
+            false => 1.0,
+        }
+    }
+
+    /// The mid price this has to reach for a `pct` take-profit to be `pct` of
+    /// actual profit.
+    ///
+    /// `pct` is net: what it costs to get in is already inside `avg_price`,
+    /// and dividing by `exit_ratio` covers what it will cost to get back out.
+    /// A mid price merely `pct` above the entry pays the round trip and hands
+    /// what is left of the difference - if any - to us, which is not what
+    /// asking for `pct` profit means.
     pub fn target(&self, pct: f64) -> f64 {
-        self.avg_price * (1.0 + pct / 100.0)
+        self.avg_price * (1.0 + pct / 100.0) / self.exit()
     }
 
     /// How long this has been held, counted from the most recent buy - so
@@ -58,9 +98,17 @@ impl Position {
         now.saturating_sub(self.updated)
     }
 
-    /// Gain against the average entry, in percent.
+    /// Gain of the mid price against what the position cost, in percent.
+    /// Still gross: it counts the buy's fees, which `avg_price` carries, but
+    /// not the sale's, which have not been paid yet.
     pub fn gain_pct(&self, price: f64) -> f64 {
         (price / self.avg_price - 1.0) * 100.0
+    }
+
+    /// What is actually left after selling at `price`, in percent of what the
+    /// position cost. This is the number that says whether a sale makes money.
+    pub fn net_pct(&self, price: f64) -> f64 {
+        (price * self.exit() / self.avg_price - 1.0) * 100.0
     }
 }
 
@@ -82,6 +130,11 @@ pub struct Trade {
     pub raw: ethers::types::U256,
     /// Pool price at the moment of the trade; unused for a sale.
     pub price: f64,
+    /// What a buy actually sent, in human units of the token it spent. The
+    /// other half of the effective entry price - `price` says what the pool
+    /// thought the token was worth, this says what we handed over for it.
+    /// `None` for a sale, and for a buy whose input amount could not be read.
+    pub spent: Option<f64>,
     /// A sale's proceeds: which token comes back, and how much. Credited to
     /// the tracked cash balance the moment the sale is reserved, and reversed
     /// automatically if it turns out never to have happened - see `rollback`.
@@ -107,6 +160,10 @@ pub struct Pending {
     pub raw: String,
     /// Pool price at the moment of the trade.
     pub price: f64,
+    /// See `Trade::spent`. Absent in an inventory written before it was
+    /// tracked, which is exactly the case that falls back to the mid.
+    #[serde(default)]
+    pub spent: Option<f64>,
     pub at: u64,
     /// See `Trade::credit`. Kept here, not just applied and forgotten, so a
     /// rollback - even one recovered from disk after a restart - knows exactly
@@ -148,7 +205,7 @@ pub struct Inventory {
 }
 
 /// Raw units to human units, for display and for the weighted average.
-fn raw_to_f64(raw: ethers::types::U256, decimals: u8) -> f64 {
+pub fn raw_to_f64(raw: ethers::types::U256, decimals: u8) -> f64 {
     raw.to_string().parse::<f64>().unwrap_or(0.0) / 10f64.powi(decimals as i32)
 }
 
@@ -252,6 +309,7 @@ impl Inventory {
                 decimals: t.decimals,
                 raw: t.raw.to_string(),
                 price: t.price,
+                spent: t.spent,
                 at: now_secs(),
                 credit: t.credit.map(|(tok, amt)| (key(tok), amt.to_string())),
             },
@@ -307,6 +365,23 @@ impl Inventory {
                 if amount.is_zero() {
                     return Some(p.side);
                 }
+                // What this fill really cost per token: everything handed
+                // over divided by everything that arrived. Both fees, the
+                // hook's cut and the impact of our own size are already inside
+                // those two numbers, so none of them has to be modelled - the
+                // fill measured them. Only a buy that could not report its own
+                // input falls back to the mid, which understates the cost.
+                let paid = match p.spent {
+                    Some(sp) if sp.is_finite() && sp > 0.0 && human > 0.0 => sp / human,
+                    _ => p.price,
+                };
+                // And the way back out is assumed to cost what the way in did.
+                // See `Position::exit_ratio` - this is the assumption, and the
+                // ratio is where it is kept rather than buried in a target.
+                let ratio = match p.price.is_finite() && p.price > 0.0 && paid > 0.0 {
+                    true => (p.price / paid).clamp(f64::MIN_POSITIVE, 1.0),
+                    false => 1.0,
+                };
                 let e = self
                     .positions
                     .entry(p.token.clone())
@@ -315,13 +390,15 @@ impl Inventory {
                         decimals: p.decimals,
                         raw: "0".to_string(),
                         qty: 0.0,
-                        avg_price: p.price,
+                        avg_price: paid,
+                        exit_ratio: 1.0,
                         buys: 0,
                         updated: 0,
                         seeded: false,
                     });
                 let total = e.qty + human;
-                e.avg_price = (e.avg_price * e.qty + p.price * human) / total;
+                e.avg_price = (e.avg_price * e.qty + paid * human) / total;
+                e.exit_ratio = (e.exit() * e.qty + ratio * human) / total;
                 e.qty = total;
                 e.raw = (e.held() + amount).to_string();
                 e.buys += 1;
@@ -385,6 +462,10 @@ impl Inventory {
                 raw: raw.to_string(),
                 qty: raw_to_f64(raw, decimals),
                 avg_price: price,
+                // Nothing was paid for this, so nothing was measured. The mid
+                // stands in for the entry and the exit is assumed free, both
+                // of which flatter it - which is what `seeded` is there to say.
+                exit_ratio: 1.0,
                 buys: 0,
                 updated: now_secs(),
                 seeded: true,
@@ -432,7 +513,9 @@ mod tests {
         U256::from_dec_str(&format!("{:.0}", units * 1e18)).unwrap()
     }
 
-    /// A buy that reached the chain and delivered exactly what it quoted.
+    /// A buy that reached the chain and delivered exactly what it quoted,
+    /// with no record of what it spent - the pre-`spent` case, which falls
+    /// back to the mid.
     fn buy(token: Address, units: f64, price: f64) -> Trade {
         Trade {
             side: Side::Buy,
@@ -441,8 +524,99 @@ mod tests {
             decimals: 18,
             raw: raw(units),
             price,
+            spent: None,
             credit: None,
         }
+    }
+
+    /// The same buy, but reporting what it actually handed over.
+    fn buy_paying(token: Address, units: f64, price: f64, spent: f64) -> Trade {
+        Trade {
+            spent: Some(spent),
+            ..buy(token, units, price)
+        }
+    }
+
+    /// The whole point of tracking what a buy spent: 10 tokens off a pool that
+    /// says they are worth 10 each did not cost 100 if 105 left the wallet.
+    /// Everything between those figures - both fees, the hook, our own impact -
+    /// is unrecoverable, and pricing the entry at the mid pretends otherwise.
+    #[test]
+    fn the_entry_price_is_what_was_paid_not_the_mid() {
+        let mut inv = Inventory::default();
+        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 105.0)));
+        inv.settle(hash(1), None, None);
+        let p = inv.get(addr(1)).unwrap();
+        assert!((p.avg_price - 10.5).abs() < 1e-9, "{}", p.avg_price);
+        // And the way back out is assumed to cost the same fraction again.
+        let ratio = p.exit_ratio;
+        assert!((ratio - 10.0 / 10.5).abs() < 1e-9, "{ratio}");
+    }
+
+    /// A 5% take-profit has to mean 5% kept, so the target sits above the entry
+    /// by the round trip as well as by the 5%.
+    #[test]
+    fn the_target_covers_getting_back_out() {
+        let mut inv = Inventory::default();
+        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 105.0)));
+        inv.settle(hash(1), None, None);
+        let p = inv.get(addr(1)).unwrap();
+
+        let naive = p.avg_price * 1.05;
+        assert!(p.target(5.0) > naive, "{} <= {naive}", p.target(5.0));
+        // Selling exactly at the target must leave exactly the 5% asked for.
+        let kept = p.net_pct(p.target(5.0));
+        assert!((kept - 5.0).abs() < 1e-9, "{kept}");
+        // And the naive target - mid up 5% from the entry - does not.
+        assert!(p.net_pct(naive) < 5.0, "{}", p.net_pct(naive));
+    }
+
+    /// A buy that could not say what it spent is priced at the mid and assumed
+    /// free to exit, which is what every position recorded before this existed
+    /// looks like. It must still behave, not divide by zero.
+    #[test]
+    fn a_buy_that_cannot_report_its_spend_falls_back_to_the_mid() {
+        let mut inv = Inventory::default();
+        assert!(inv.reserve(hash(1), buy(addr(1), 10.0, 10.0)));
+        inv.settle(hash(1), None, None);
+        let p = inv.get(addr(1)).unwrap();
+        assert_eq!(p.avg_price, 10.0);
+        assert_eq!(p.exit_ratio, 1.0);
+        assert_eq!(p.target(5.0), 10.5);
+    }
+
+    /// An inventory written before `exit_ratio` existed loads with 1.0, not the
+    /// 0.0 a plain `#[serde(default)]` would give it - which divides into every
+    /// target and puts them all at infinity.
+    #[test]
+    fn an_old_position_loads_with_a_usable_exit_ratio() {
+        let json = r#"{
+            "symbol": "TKN", "decimals": 18, "raw": "1000000000000000000",
+            "qty": 1.0, "avg_price": 10.0, "buys": 1, "updated": 0
+        }"#;
+        let p: Position = serde_json::from_str(json).unwrap();
+        assert_eq!(p.exit_ratio, 1.0);
+        assert!(p.target(5.0).is_finite());
+        assert_eq!(p.target(5.0), 10.5);
+    }
+
+    /// Averaging in has to average the exit assumption too, or a second buy on
+    /// worse terms would be sold as if the first buy's terms still applied.
+    #[test]
+    fn averaging_in_weights_the_exit_the_same_way() {
+        let mut inv = Inventory::default();
+        assert!(inv.reserve(hash(1), buy_paying(addr(1), 10.0, 10.0, 105.0)));
+        inv.settle(hash(1), None, None);
+        let first = inv.get(addr(1)).unwrap().exit_ratio;
+
+        // The same size again, but paying twice the spread for it.
+        assert!(inv.reserve(hash(2), buy_paying(addr(1), 10.0, 10.0, 110.0)));
+        inv.settle(hash(2), None, None);
+        let p = inv.get(addr(1)).unwrap();
+
+        let expect = (10.0 / 10.5 + 10.0 / 11.0) / 2.0;
+        assert!((p.exit_ratio - expect).abs() < 1e-9, "{}", p.exit_ratio);
+        assert!(p.exit_ratio < first, "the worse fill has to drag it down");
     }
 
     fn sale(token: Address, units: f64) -> Trade {

@@ -152,9 +152,12 @@ const MAX_MODELLED_IMPACT: f64 = 0.005;
 const YIELD_ALERT_PPM: u64 = 500;
 
 /// The most a route may be measured to take beyond its pools' stated fees
-/// before the bot refuses to price it at all. A hook that suddenly keeps a
-/// quarter of every swap is not a fee to model around; it is a reason to stop.
-const MAX_UNSTATED_FEE_PPM: u64 = 250_000;
+/// before the bot refuses to price it at all. A hook keeping more than a
+/// twentieth of every swap is not a fee to model around; it is a reason to
+/// stop. Now that the measurement is a term in the price as well as a guard,
+/// this is also the point past which paying it stops being worth it: a 5% cut
+/// each way is 10% of a round trip, which no take-profit here is set to clear.
+const MAX_UNSTATED_FEE_PPM: u64 = 50_000;
 
 /// What to sign with when the route has never been measured - enough for a
 /// two-leg swap, and unused gas is refunded either way.
