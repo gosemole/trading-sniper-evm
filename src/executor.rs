@@ -1,4 +1,8 @@
-//! Buying a dip the moment the monitor sees it.
+//! Turning a decision into a transaction.
+//!
+//! Everything here is about *how* to trade, never *whether*: what a route is
+//! worth right now, what to sign, which nonce, what gas. The decision arrives
+//! from the strategy and this module carries it out.
 //!
 //! A route marked `auto_buy` is armed against one pool - by default the last
 //! pool it swaps through, so the buy happens in the very pool the drop was
@@ -33,7 +37,7 @@
 
 use crate::config::Config;
 use crate::execute;
-use crate::monitor::Signal;
+use crate::strategy::Signal;
 use crate::pool::Pool;
 use crate::route::{format_units, parse_pool_ref, PoolRef, Route};
 use crate::swap;
@@ -79,10 +83,21 @@ struct HopState {
     lp_fee: u32,
 }
 
+/// A transaction that actually went out, and what it was expected to produce.
+pub struct Fill {
+    pub hash: ethers::types::H256,
+    /// Quoted output in raw units. What lands can differ by less than the
+    /// slippage tolerance, and never by more - `amountOutMinimum` sees to that.
+    pub amount_out: U256,
+}
+
 /// What one buy had to go and find out, gathered in one place so the send does
 /// not have to reach back for any of it.
 struct Quoted {
     amount_out: U256,
+    /// How long the asking took, so the log separates the network from
+    /// everything else - which is otherwise invisible and dominates.
+    took: Duration,
     /// Where the number came from, for the log: the model or the router.
     by: &'static str,
     /// Deferred: a gas price that could not be read only matters if we send.
@@ -114,10 +129,11 @@ const YIELD_ALERT_PPM: u64 = 500;
 /// two-leg swap, and unused gas is refunded either way.
 const GAS_FALLBACK: u64 = 1_200_000;
 
-pub struct AutoBuy {
+pub struct Executor {
     http: Provider<Http>,
     router: Address,
     manager: Address,
+    permit2: Address,
     /// Seconds between yield measurements; 0 turns them off.
     calibrate_secs: u64,
     wallet: LocalWallet,
@@ -140,7 +156,7 @@ pub struct AutoBuy {
     next_nonce: Mutex<Option<u64>>,
 }
 
-impl AutoBuy {
+impl Executor {
     /// Resolve every armed route, or `None` when none is armed.
     ///
     /// Failing here rather than at the first drop is deliberate: a bad route,
@@ -200,6 +216,13 @@ impl AutoBuy {
             }
 
             preflight(http, &route, owner, permit2, router).await?;
+            if rc.cooldown_secs == 0 {
+                warn!(
+                    route = %rc.name,
+                    "cooldown_secs = 0: every signal buys, and a dip lasting ten blocks buys \
+                     ten times"
+                );
+            }
             info!(
                 route = %rc.name,
                 trigger = %trigger,
@@ -240,11 +263,13 @@ impl AutoBuy {
         // header rather than off a lookup.
         let fees = Arc::new(swap::FeeWatch::default());
         fees.watch(cfg.ws_url.clone(), http.clone());
+        swap::keep_warm(http.clone());
 
         let me = Arc::new(Self {
             http: http.clone(),
             router,
             manager,
+            permit2,
             calibrate_secs: cfg.calibrate_secs,
             model_pricing: cfg.fast_quote,
             wallet,
@@ -363,12 +388,18 @@ impl AutoBuy {
 
     /// React to one big-sell signal.
     /// React to one big-sell signal: decide, price, sign, send.
-    pub async fn on_drop(self: &Arc<Self>, pool: &Pool, sig: &Signal) -> Result<()> {
+    /// The route armed against this pool, for a caller that needs to trade it
+    /// in the other direction.
+    pub fn route_for(&self, key: PoolRef) -> Option<&Route> {
+        self.plans.get(&key).map(|p| &p.route)
+    }
+
+    pub async fn on_drop(self: &Arc<Self>, pool: &Pool, sig: &Signal) -> Result<Option<Fill>> {
         let Some((key, plan)) = self.armed_for(pool) else {
-            return Ok(());
+            return Ok(None);
         };
         if !self.claim_turn(key, plan, pool).await {
-            return Ok(());
+            return Ok(None);
         }
 
         let route = &plan.route;
@@ -394,6 +425,7 @@ impl AutoBuy {
             spend = amount(route.amount_in, &route.input),
             quoted = amount(quoted.amount_out, &route.output),
             priced_by = quoted.by,
+            quote_ms = quoted.took.as_millis(),
             min_out = amount(min_out, &route.output),
             slippage_pct = route.max_slippage_pct,
             took_ms = started.elapsed().as_millis(),
@@ -402,9 +434,80 @@ impl AutoBuy {
 
         if !self.execute {
             info!(route = %route.name, "dry run - not sent; start with --execute to buy for real");
-            return Ok(());
+            return Ok(None);
         }
-        self.broadcast(key, plan, &tx, quoted).await
+        let amount_out = quoted.amount_out;
+        let hash = self.broadcast(key, plan, &tx, quoted).await?;
+        Ok(Some(Fill { hash, amount_out }))
+    }
+
+    /// Sell everything held of what a route buys, back down that same route.
+    ///
+    /// The size is the wallet's actual balance rather than anything remembered:
+    /// what is there is what can be sold, and a position built by several buys
+    /// or topped up by hand is still one balance. Unlike a buy, this is not
+    /// racing anyone, so it is priced by asking the router even when that costs
+    /// a bisection.
+    pub async fn sell_all(self: &Arc<Self>, route: &Route, slippage_pct: f64) -> Result<Option<Fill>> {
+        let token = route.output.address;
+        let held = swap::balance_of(&self.http, token, self.owner).await?;
+        if held.is_zero() {
+            info!(token = %route.output.symbol, "nothing held; not selling");
+            return Ok(None);
+        }
+        let sell = route.reversed(held);
+        if sell.input.address != Address::zero() {
+            let (erc20, p2) =
+                swap::check_approvals(&self.http, sell.input.address, self.owner, self.permit2, self.router)
+                    .await?;
+            anyhow::ensure!(
+                erc20 >= held && p2 >= held,
+                "{} is not approved for the router (erc20->permit2 {erc20}, permit2->router {p2}); \
+                 run --approve {} --execute first",
+                sell.input.symbol,
+                sell.input.symbol
+            );
+        }
+
+        let deadline = execute::deadline_in(300);
+        let quote = execute::verify(
+            &self.http, self.router, self.owner, &sell, U256::zero(), deadline, None,
+        )
+        .await
+        .context("quoting the sale")?;
+        let min_out = execute::apply_slippage(quote.amount_out, slippage_pct);
+        anyhow::ensure!(!min_out.is_zero(), "the sale's amountOutMinimum rounds to zero");
+        let tx = execute::pending_swap(self.router, &sell, min_out, deadline)?;
+
+        info!(
+            route = %sell.name,
+            sell = format!("{} {}", format_units(held, sell.input.decimals), sell.input.symbol),
+            quoted = format!("{} {}", format_units(quote.amount_out, sell.output.decimals), sell.output.symbol),
+            min_out = format!("{} {}", format_units(min_out, sell.output.decimals), sell.output.symbol),
+            slippage_pct,
+            "TAKE PROFIT"
+        );
+        if !self.execute {
+            info!(route = %sell.name, "dry run - not sent; start with --execute to sell for real");
+            return Ok(None);
+        }
+
+        let fees = self.fees.params(&self.http).await.context("reading the gas price")?;
+        let gas = swap::measure_gas(&self.http, self.owner, &tx)
+            .await
+            .unwrap_or_else(|_| U256::from(GAS_FALLBACK));
+        let seen = swap::pending_nonce(&self.http, self.owner).await.ok();
+        let nonce = self.claim_nonce(seen).await?;
+        match swap::send_nowait(&self.http, &self.wallet, &tx, nonce.into(), fees, gas).await {
+            Ok(hash) => {
+                info!(route = %sell.name, ?hash, nonce, "sold");
+                Ok(Some(Fill { hash, amount_out: quote.amount_out }))
+            }
+            Err(e) => {
+                *self.next_nonce.lock().await = None;
+                Err(e)
+            }
+        }
     }
 
     /// The route armed against this pool, if it is one this signal should act
@@ -472,6 +575,7 @@ impl AutoBuy {
         sig: &Signal,
         deadline: U256,
     ) -> Result<Quoted> {
+        let started = Instant::now();
         let modelled = match self.model_pricing {
             true => self.model_quote(plan, key, sig).await,
             false => None,
@@ -501,6 +605,7 @@ impl AutoBuy {
         let (amount_out, by) = amount.context("quoting the route")?;
         Ok(Quoted {
             amount_out,
+            took: started.elapsed(),
             by,
             fees,
             nonce_seen,
@@ -515,17 +620,18 @@ impl AutoBuy {
         plan: &Plan,
         tx: &crate::swap::PendingTx,
         quoted: Quoted,
-    ) -> Result<()> {
+    ) -> Result<ethers::types::H256> {
         let name = plan.route.name.clone();
         let fees = quoted.fees.context("reading the gas price")?;
         let gas_limit = U256::from(plan.gas_limit.load(Ordering::Relaxed));
         let nonce = self.claim_nonce(quoted.nonce_seen).await?;
+        let started = Instant::now();
         match swap::send_nowait(&self.http, &self.wallet, tx, nonce.into(), fees, gas_limit).await {
             Ok(hash) => {
-                info!(route = %name, ?hash, nonce, %gas_limit, "sent");
-                tokio::spawn(swap::report_receipt(self.http.clone(), hash, name));
+                info!(route = %name, ?hash, nonce, %gas_limit,
+                      send_ms = started.elapsed().as_millis(), "sent");
                 self.remeasure_gas(key);
-                Ok(())
+                Ok(hash)
             }
             Err(e) => {
                 // The number was taken but never used, and every later

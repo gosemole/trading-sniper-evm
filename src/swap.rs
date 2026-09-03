@@ -325,6 +325,23 @@ pub async fn measure_gas(http: &Provider<Http>, from: Address, tx: &PendingTx) -
     Ok(gas * 2)
 }
 
+/// Keep the HTTP connection pool warm.
+///
+/// A reused connection answers in about 50ms; one that has to be established
+/// first pays a TLS handshake and takes 350-400ms - seven times worse, and it
+/// lands on exactly the request a buy is waiting for. The pool drops idle
+/// connections after about ninety seconds, and buys are minutes apart, so
+/// something has to touch it in between. This is that something: it costs one
+/// trivial request a minute and cannot be skipped by anything else failing.
+pub fn keep_warm(http: Provider<Http>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let _ = http.get_chainid().await;
+        }
+    });
+}
+
 /// The next nonce to use, counting transactions already broadcast but not yet
 /// mined - `latest` would hand out one that is already spoken for.
 pub async fn pending_nonce(http: &Provider<Http>, owner: Address) -> Result<u64> {
@@ -335,17 +352,46 @@ pub async fn pending_nonce(http: &Provider<Http>, owner: Address) -> Result<u64>
     Ok(n.as_u64())
 }
 
-/// Follow a broadcast transaction to its receipt and say how it ended. Meant to
-/// be spawned: nothing waits on it.
-pub async fn report_receipt(http: Provider<Http>, hash: H256, label: String) {
-    match ethers::providers::PendingTransaction::new(hash, &http).await {
-        Ok(Some(r)) if r.status == Some(1u64.into()) => tracing::info!(
-            tx = ?hash, block = ?r.block_number, gas_used = ?r.gas_used, label,
-            "confirmed"
-        ),
-        Ok(Some(r)) => tracing::error!(tx = ?hash, block = ?r.block_number, label, "REVERTED"),
-        Ok(None) => tracing::warn!(tx = ?hash, label, "dropped from the mempool"),
-        Err(e) => tracing::warn!(tx = ?hash, err = %e, label, "lost track of the transaction"),
+/// How a broadcast transaction ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Confirmed,
+    Reverted,
+    Dropped,
+    /// We stopped being able to tell. Treated as "did not happen" everywhere it
+    /// matters, because acting on a trade that may not exist is worse than
+    /// missing one that does.
+    Unknown,
+}
+
+impl Outcome {
+    pub fn happened(self) -> bool {
+        self == Outcome::Confirmed
+    }
+}
+
+/// Follow a broadcast transaction to its receipt, saying how it ended.
+pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> Outcome {
+    match ethers::providers::PendingTransaction::new(hash, http).await {
+        Ok(Some(r)) if r.status == Some(1u64.into()) => {
+            tracing::info!(
+                tx = ?hash, block = ?r.block_number, gas_used = ?r.gas_used, label,
+                "confirmed"
+            );
+            Outcome::Confirmed
+        }
+        Ok(Some(r)) => {
+            tracing::error!(tx = ?hash, block = ?r.block_number, label, "REVERTED");
+            Outcome::Reverted
+        }
+        Ok(None) => {
+            tracing::warn!(tx = ?hash, label, "dropped from the mempool");
+            Outcome::Dropped
+        }
+        Err(e) => {
+            tracing::warn!(tx = ?hash, err = %e, label, "lost track of the transaction");
+            Outcome::Unknown
+        }
     }
 }
 

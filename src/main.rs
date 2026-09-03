@@ -1,8 +1,11 @@
-mod autobuy;
+mod cache;
 mod config;
+mod executor;
+mod feed;
+mod inventory;
 mod depth;
 mod execute;
-mod monitor;
+mod strategy;
 mod pool;
 mod price;
 mod route;
@@ -59,6 +62,14 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("config.toml"));
     let cfg = config::Config::load(&path)?;
 
+    // Opened before anything resolves a pool, so the first lookup already has
+    // somewhere to look.
+    match cache::open(std::path::Path::new(&cfg.pool_cache_path)) {
+        Ok(0) => tracing::info!(file = %cfg.pool_cache_path, "pool cache empty"),
+        Ok(n) => tracing::info!(file = %cfg.pool_cache_path, pools = n, "pool cache loaded"),
+        Err(e) => tracing::warn!(err = %format!("{e:#}"), "pool cache unusable, ignoring it"),
+    }
+
     // Sanity check via HTTP JSON-RPC before opening WS subscriptions.
     let http = ethers::providers::Provider::<ethers::providers::Http>::try_from(
         cfg.http_url.clone(),
@@ -87,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     // Armed routes are resolved and checked before the first log arrives: a
     // broken route should stop the process here, not at the one moment it was
     // meant to fire.
-    let auto = match autobuy::AutoBuy::build(
+    let auto = match executor::Executor::build(
         &http,
         &cfg,
         pool_manager(&cfg)?,
@@ -101,7 +112,20 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => return Err(e.context("arming auto-buy")),
     };
 
-    let mut tasks = Vec::new();
+    // Every pool feeds one channel, and the strategy reads it. The two sides
+    // never call each other: a pool reports what happened, the strategy decides
+    // what it means, and a slow decision cannot hold up the next report.
+    let (ticks, rx) = tokio::sync::mpsc::channel(1024);
+    // A second, small channel carries receipts back: what the chain decided
+    // about a trade belongs in the same place that decided to make it.
+    let (settled_tx, settled_rx) = tokio::sync::mpsc::channel(64);
+    let inv = inventory::Inventory::load(std::path::Path::new(&cfg.inventory_path))
+        .context("loading the inventory")?;
+    if !inv.is_empty() {
+        tracing::info!("inventory restored from {}", cfg.inventory_path);
+    }
+    let mut strategy = strategy::Strategy::new(http.clone(), auto, inv, settled_tx);
+    let mut feeds = Vec::new();
     let tokens = cfg.tokens.clone();
     for pool_cfg in cfg.pools {
         let pool = match pool::Pool::resolve(&http, &pool_cfg, &tokens).await {
@@ -111,32 +135,38 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
+        // A take-profit belongs to the route that bought the position, and the
+        // route is armed against this pool, so the two meet here.
+        let take_profit = cfg
+            .routes
+            .iter()
+            .find(|r| {
+                r.auto_buy
+                    && r.trigger_pool
+                        .clone()
+                        .or_else(|| r.pools.last().cloned())
+                        .and_then(|p| route::parse_pool_ref(&p).ok())
+                        == Some(pool.pool_ref())
+            })
+            .and_then(|r| r.take_profit_pct);
+        strategy.watch(
+            pool.clone(),
+            pool_cfg.threshold_pct.unwrap_or(cfg.threshold_pct),
+            pool_cfg.max_move_pct.unwrap_or(cfg.max_move_pct),
+            take_profit,
+        );
         let ws = cfg.ws_url.clone();
-        let http = http.clone();
-        let thresh = pool_cfg.threshold_pct.unwrap_or(cfg.threshold_pct);
-        let max_move = pool_cfg.max_move_pct.unwrap_or(cfg.max_move_pct);
-        // Every watched pool is handed the auto-buy, armed or not: a drop with
-        // no route behind it has to be reported, not silently dropped.
-        let auto = auto.clone();
-        tasks.push(tokio::spawn(async move {
+        let out = ticks.clone();
+        feeds.push(tokio::spawn(async move {
             // Exponential backoff so a persistently failing endpoint is not
             // hammered; reset once a subscription has run for a while.
             let mut backoff = std::time::Duration::from_secs(3);
             loop {
                 let started = std::time::Instant::now();
-                match monitor::run_pool(
-                    pool.clone(),
-                    http.clone(),
-                    thresh,
-                    max_move,
-                    ws.clone(),
-                    auto.clone(),
-                )
-                .await
-                {
+                match feed::run_pool(pool.clone(), ws.clone(), out.clone()).await {
                     Ok(()) => tracing::warn!(pool = %pool.name, "stream closed, reconnecting"),
                     Err(e) => {
-                        tracing::error!(pool = %pool.name, err = %e, "monitor error, reconnecting")
+                        tracing::error!(pool = %pool.name, err = %e, "feed error, reconnecting")
                     }
                 }
                 if started.elapsed() >= std::time::Duration::from_secs(60) {
@@ -148,17 +178,25 @@ async fn main() -> anyhow::Result<()> {
             }
         }));
     }
+    // The last sender in this scope has to go, or the strategy would wait on a
+    // channel nobody can ever write to again.
+    drop(ticks);
 
-    // Every pool failing to resolve used to leave `tasks` empty, which made
-    // join_all complete immediately and the process exit 0 in silence.
+    // Every pool failing to resolve used to leave this empty, which made the
+    // process exit 0 in silence.
     anyhow::ensure!(
-        !tasks.is_empty(),
-        "no pools could be resolved; nothing to monitor"
+        strategy.watching() > 0,
+        "no pools could be resolved; nothing to watch"
     );
-    tracing::info!(pools = tasks.len(), "monitoring");
+    tracing::info!(pools = strategy.watching(), "watching");
+    // Everything that had to be looked up has been; keep it for next time.
+    cache::flush();
+    strategy.resolve_pending().await;
+    let decisions = tokio::spawn(strategy.run(rx, settled_rx));
 
     tokio::select! {
-        _ = futures_util::future::join_all(tasks) => {}
+        _ = futures_util::future::join_all(feeds) => {}
+        _ = decisions => {}
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("ctrl-c received, shutting down");
         }
@@ -209,6 +247,7 @@ async fn check_all_routes(
             }
         }
     }
+    cache::flush();
     anyhow::ensure!(failed == 0, "{failed} route(s) failed to resolve");
     Ok(())
 }
@@ -276,6 +315,7 @@ async fn quote_route_cmd(
         "\n  NOTE: in-range + tick-walk simulation, hooks not simulated. Treat as an\n  \
          estimate; amountOutMinimum is what actually protects the trade."
     );
+    cache::flush();
     Ok(())
 }
 
@@ -447,9 +487,11 @@ async fn swap_cmd(
 
     if !execute {
         println!("\ndry run - nothing sent. Re-run with --execute to submit.");
+        cache::flush();
         return Ok(());
     }
     println!("\nsubmitting from {owner:?}");
+    cache::flush();
     swap::send_all(http, wallet, std::slice::from_ref(&tx)).await
 }
 

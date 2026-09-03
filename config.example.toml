@@ -75,3 +75,12 @@ CAMELTOE = "0xc32b91fe216af1b834db02f33326e983ad8cf201"
 #   "0xd4fa4c9859b69466b3e35d7907789e6d22d5200f3d7634532d825a4469cec863",  # v4 USDG/LULU
 #   "0x10CC6BD38112cAc182db90B6a71d8Bb5939526bA",                          # v3 WETH/PONS
 # ]
+
+# Sell the whole position back down the route once the pool price is this far
+# above what it was bought at, averaged over every buy. Unset means buy and
+# hold. NOTE: this is a gain against the pool's quote token, not against the
+# dollar - on a pair whose quote side is itself volatile the two can disagree.
+#   take_profit_pct = 5.0
+#
+# What is held and what it cost, kept across restarts. Written after every fill.
+# inventory_path = "inventory.json"

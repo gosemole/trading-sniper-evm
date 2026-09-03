@@ -61,6 +61,15 @@ pub struct Config {
     /// measured, and only in the background.
     #[serde(default = "default_calibrate")]
     pub calibrate_secs: u64,
+    /// Where to keep what the chain has already told us about pools and
+    /// tokens - PoolKeys, decimals, symbols. All of it immutable, so the file
+    /// only ever saves time; delete it and the next start is merely slow.
+    #[serde(default = "default_pool_cache")]
+    pub pool_cache_path: String,
+    /// Where to keep what we hold and what it cost. Read at startup and
+    /// written after every fill, so a restart does not forget an entry price.
+    #[serde(default = "default_inventory")]
+    pub inventory_path: String,
     /// Price an armed buy from the measured model instead of asking the router,
     /// which takes the last round trip out of the path between a drop and a
     /// signed transaction. Off by default: the router's answer is exact and
@@ -116,8 +125,15 @@ pub struct RouteConfig {
     /// is bought where the price actually moved.
     #[serde(default)]
     pub trigger_pool: Option<String>,
+    /// Sell the whole position back down this route once the pool price is
+    /// this far above the average price it was bought at. Unset means never:
+    /// the bot buys and holds. Measured against the pool's own price, so it is
+    /// a gain against the pool's quote token, not against the dollar.
+    #[serde(default)]
+    pub take_profit_pct: Option<f64>,
     /// Shortest gap between two automatic buys of this route. A drop usually
-    /// arrives as a run of blocks, and without this each one would buy again.
+    /// arrives as a run of blocks, and without a gap each of those blocks buys
+    /// again. Zero is allowed and means exactly that: every signal buys.
     #[serde(default = "default_cooldown")]
     pub cooldown_secs: u64,
 }
@@ -128,6 +144,14 @@ fn default_cooldown() -> u64 {
 
 fn default_calibrate() -> u64 {
     300
+}
+
+fn default_pool_cache() -> String {
+    "pools.json".to_string()
+}
+
+fn default_inventory() -> String {
+    "inventory.json".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,11 +269,13 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
         }
         // Without a gap a single dip fires one buy per block for as long as it
         // lasts, which is never what "buy the dip" is meant to mean.
-        anyhow::ensure!(
-            !r.auto_buy || r.cooldown_secs > 0,
-            "route '{}': auto_buy needs cooldown_secs > 0",
-            r.name
-        );
+        if let Some(tp) = r.take_profit_pct {
+            anyhow::ensure!(
+                tp.is_finite() && tp > 0.0,
+                "route '{}': take_profit_pct must be > 0",
+                r.name
+            );
+        }
         anyhow::ensure!(
             r.max_slippage_pct.is_finite() && r.max_slippage_pct > 0.0 && r.max_slippage_pct < 100.0,
             "route '{}': max_slippage_pct must be in (0, 100)",

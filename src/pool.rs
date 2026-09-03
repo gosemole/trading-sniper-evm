@@ -436,11 +436,34 @@ async fn find_init_block(http: &Provider<Http>, manager: Address, pool_id: H256)
 /// Full PoolKey from the pool's Initialize log: (currency0, currency1, fee,
 /// tickSpacing, hooks). The log is fetched from the single block the binary
 /// search identified, so the range stays within any provider's limit.
+/// Recover a v4 PoolKey: the five fields the pool id is the hash of.
+///
+/// A pool id cannot be reversed, but the key was published once in the pool's
+/// `Initialize` log. Finding that log costs a bisection over archive reads, so
+/// the answer is cached - and a cached one is only used when it still hashes to
+/// the id it was filed under, which makes a wrong cache impossible to act on.
 pub async fn v4_pool_key(
     http: &Provider<Http>,
     manager: Address,
     pool_id: H256,
 ) -> Result<(Address, Address, u32, i32, Address)> {
+    if let Some(k) = crate::cache::v4_pool(pool_id, |k| {
+        pool_id_from_key(
+            k.currency0,
+            k.currency1,
+            k.fee,
+            k.tick_spacing,
+            k.hooks.unwrap_or_default(),
+        )
+    }) {
+        return Ok((
+            k.currency0,
+            k.currency1,
+            k.fee,
+            k.tick_spacing,
+            k.hooks.unwrap_or_default(),
+        ));
+    }
     let block = find_init_block(http, manager, pool_id).await?;
     let filter = Filter::new()
         .address(manager)
@@ -471,6 +494,16 @@ pub async fn v4_pool_key(
     tracing::info!(
         block, ?c0, ?c1, fee, tick_spacing, ?hooks,
         "recovered v4 PoolKey from Initialize log"
+    );
+    crate::cache::put_v4_pool(
+        pool_id,
+        crate::cache::PoolKey {
+            currency0: c0,
+            currency1: c1,
+            fee,
+            tick_spacing,
+            hooks: Some(hooks),
+        },
     );
     Ok((c0, c1, fee, tick_spacing, hooks))
 }
@@ -546,6 +579,9 @@ pub async fn v3_pool_key(
     http: &Provider<Http>,
     pool: Address,
 ) -> Result<(Address, Address, u32, i32)> {
+    if let Some(k) = crate::cache::v3_pool(pool) {
+        return Ok((k.currency0, k.currency1, k.fee, k.tick_spacing));
+    }
     let code = http.get_code(pool, None).await.context("eth_getCode")?;
     anyhow::ensure!(!code.0.is_empty(), "{pool:?} has no code; not a v3 pool");
     let t0 = call_address(http, pool, &selector("token0()"))
@@ -560,6 +596,16 @@ pub async fn v3_pool_key(
     let spacing = call_uint(http, pool, &selector("tickSpacing()"))
         .await
         .with_context(|| format!("{pool:?}: tickSpacing()"))? as i32;
+    crate::cache::put_v3_pool(
+        pool,
+        crate::cache::PoolKey {
+            currency0: t0,
+            currency1: t1,
+            fee,
+            tick_spacing: spacing,
+            hooks: None,
+        },
+    );
     Ok((t0, t1, fee, spacing))
 }
 
@@ -567,7 +613,18 @@ pub async fn decimals_of(http: &Provider<Http>, currency: Address) -> Result<u8>
     if currency == Address::zero() {
         return Ok(18);
     }
-    call_u8(http, currency, &selector("decimals()")).await
+    if let Some(t) = crate::cache::token(currency) {
+        return Ok(t.decimals);
+    }
+    let decimals = call_u8(http, currency, &selector("decimals()")).await?;
+    crate::cache::put_token(
+        currency,
+        crate::cache::TokenInfo {
+            decimals,
+            symbol: None,
+        },
+    );
+    Ok(decimals)
 }
 
 /// `symbol()` of a currency. Native ETH (zero address) is "ETH". Handles both
@@ -575,6 +632,9 @@ pub async fn decimals_of(http: &Provider<Http>, currency: Address) -> Result<u8>
 pub async fn symbol_of(http: &Provider<Http>, currency: Address) -> Result<String> {
     if currency == Address::zero() {
         return Ok("ETH".to_string());
+    }
+    if let Some(s) = crate::cache::token(currency).and_then(|t| t.symbol) {
+        return Ok(s);
     }
     let tx = TransactionRequest::new()
         .to(currency)
@@ -587,14 +647,36 @@ pub async fn symbol_of(http: &Provider<Http>, currency: Address) -> Result<Strin
         if off == 32 && res.len() >= 64 {
             let len = U256::from_big_endian(&res[32..64]).as_usize();
             if len > 0 && len <= 64 && res.len() >= 64 + len {
-                return Ok(String::from_utf8_lossy(&res[64..64 + len]).into_owned());
+                let sym = String::from_utf8_lossy(&res[64..64 + len]).into_owned();
+                remember_symbol(http, currency, &sym).await;
+                return Ok(sym);
             }
         }
     }
     // legacy bytes32: right-padded with zeros
     let trimmed: Vec<u8> = res[0..32].iter().copied().take_while(|b| *b != 0).collect();
     anyhow::ensure!(!trimmed.is_empty(), "empty symbol()");
-    Ok(String::from_utf8_lossy(&trimmed).into_owned())
+    let sym = String::from_utf8_lossy(&trimmed).into_owned();
+    remember_symbol(http, currency, &sym).await;
+    Ok(sym)
+}
+
+/// File a symbol against the decimals we know, or go and learn them.
+async fn remember_symbol(http: &Provider<Http>, currency: Address, symbol: &str) {
+    let decimals = match crate::cache::token(currency) {
+        Some(t) => t.decimals,
+        None => match decimals_of(http, currency).await {
+            Ok(d) => d,
+            Err(_) => return,
+        },
+    };
+    crate::cache::put_token(
+        currency,
+        crate::cache::TokenInfo {
+            decimals,
+            symbol: Some(symbol.to_string()),
+        },
+    );
 }
 
 /// Read a small unsigned integer return value (uint24/int24/uint8...).

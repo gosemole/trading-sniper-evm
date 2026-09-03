@@ -3,3 +3,5 @@ config.toml
 .env
 *.env
 .claude/settings.local.json
+inventory.json
+pools.json
