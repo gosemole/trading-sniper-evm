@@ -1,53 +1,77 @@
-# Copy to config.toml and fill in your own RPC endpoints.
-# config.toml is gitignored so the API key never reaches the repo.
+# Copy to config.toml, uncomment the blocks you want, run.
+# At least one pool block is required.
+#
+# Secrets come from the environment, not from here:
+#   WS_URL       wss:// endpoint (live swap logs)
+#   HTTP_URL     https:// endpoint (calls)
+#   PRIVATE_KEY  32-byte hex signing key, needed only to buy
+#
+#   chmod 600 ~/.config/mm-fall.env
+#   set -a; source ~/.config/mm-fall.env; set +a
 
-# Robinhood chain (OP-stack) JSON-RPC endpoints.
-# Use a ws:// or wss:// endpoint for live swap log subscriptions.
-ws_url = "wss://robinhood-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
-http_url = "https://robinhood-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
+threshold_pct = 3     # signal on a drop this big (%) inside one block
+max_move_pct = 1.0    # depth line: what it costs to move the price this much (%)
 
-# Signal when price moves >= threshold % between consecutive blocks (block vs block).
-threshold_pct = 3
+# Needed for --approve, --swap and auto_buy. Not for the monitor.
+# universal_router = "0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99"
+# pool_manager     = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
 
-# Assumed price move (%) for the depth estimate: "how much can I buy if the
-# price moves this much". In-range liquidity only (no tick walking).
-# Optional, defaults to 1.0. Can also be set per pool.
-max_move_pct = 1.0
+[tokens]
+ETH      = "0x0000000000000000000000000000000000000000"
+WETH     = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+USDG     = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+PONS     = "0x39dbed3a2bd333467115de45665cc57f813c4571"
+POOLS    = "0x385b36ff682ab4c76e7c37a66b96aabc466471d5"
+LULU     = "0x4e62068525ab11fe768e29dfd00ef909b9803016"
+CAMELTOE = "0xc32b91fe216af1b834db02f33326e983ad8cf201"
 
-# v3 pools: only the pair address is required.
-# token0/token1/decimals are resolved on-chain via eth_call at startup.
-[[pools]]
-name = "PONS/WETH (v3)"
-version = "v3"
-address = "0x10CC6BD38112cAc182db90B6a71d8Bb5939526bA"
-base_token = 1        # optional: 0 = show token1/token0, 1 = show token0/token1
-
-# v4 pools: PoolManager address + pool_id (32-byte hex). That's ALL you need:
-# %-movement detection works on the raw price from sqrtPriceX96.
-# token0/token1/decimals are OPTIONAL (absolute human-readable price only).
-[[pools]]
-name = "POOLS/ETH (v4)"
-version = "v4"
-address = "0x8366a39CC670B4001A1121B8F6A443A643e40951"  # PoolManager
-pool_id = "0x88fbd9768ccf1bf77d6946afa1b2f3ce79e02a4566ca8a3d5ba78ab04e8ef27f"
-base_token = 1
-
-# Per-pool overrides of threshold_pct / max_move_pct are allowed.
-[[pools]]
-name = "Forggy/ETH (v4)"
-version = "v4"
-address = "0x8366a39CC670B4001A1121B8F6A443A643e40951"  # PoolManager
-pool_id = "0x767cdbcdfa957c38af2dcee8fbc4a15a8436b06b2a28855ea738b1d4c6393fc5"
-base_token = 1
-threshold_pct = 7
-
-# Alternative: derive poolId locally from currencies/fee/tickSpacing/hooks.
+# v4 pool: PoolManager address + pool_id is all it takes.
 # [[pools]]
-# name = "WETH/USDC (v4, derived)"
+# name = "CAMELTOE/LULU (v4)"
 # version = "v4"
-# address = "0x8366a39CC670B4001A1121B8F6A443A643e40951"  # PoolManager
-# token0 = "0x0000000000000000000000000000000000000000"   # native ETH
-# token1 = "0x..."
-# fee = 3000          # hundredths of a bip
-# tick_spacing = 60
-# hooks = "0x0000000000000000000000000000000000000000"
+# address = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+# pool_id = "0x1e75aa57c6f96fd805296b4fa4969741060407f62c94a7f88c3fdfccc6cc2d35"
+# base_token = 1        # the side that "fell"; indexes the SORTED PoolKey
+# threshold_pct = 5     # optional, overrides the global
+
+# v3 pool: the pair address is all it takes.
+# [[pools]]
+# name = "PONS/WETH (v3)"
+# version = "v3"
+# address = "0x10CC6BD38112cAc182db90B6a71d8Bb5939526bA"
+# base_token = 1
+
+# Route: input token + pools in swap order. USDG -> LULU -> CAMELTOE.
+# A pool is written as a 32-byte v4 pool id or a 20-byte v3 pool address, and
+# the two may be mixed in one route - consecutive pools on the same protocol
+# become a single router command, and only a v3/v4 boundary costs a hand-off.
+# A route ending on v3 is quoted by bisection (~25 calls) instead of one, so
+# prefer ending on v4 for an auto_buy route.
+# Check it with:  cargo run -- --check-routes
+#                 cargo run -- --quote "buy CAMELTOE"
+# auto_buy fires on the LAST pool listed, so the buy goes through the pool the
+# drop was seen in. That pool must also be in [[pools]]. Override with
+# trigger_pool = "0x...".
+# [[routes]]
+# name = "buy CAMELTOE"
+# input = "USDG"
+# amount_in = "0.1"          # in USDG, which has 6 decimals: ten cents
+# max_slippage_pct = 1.0     # percent, not basis points
+# auto_buy = true            # buy when the trigger pool signals a drop
+# cooldown_secs = 60
+# pools = [
+#   "0xd4fa4c9859b69466b3e35d7907789e6d22d5200f3d7634532d825a4469cec863",  # v4 USDG/LULU
+#   "0x1e75aa57c6f96fd805296b4fa4969741060407f62c94a7f88c3fdfccc6cc2d35",  # v4 LULU/CAMELTOE
+# ]
+
+# Mixing protocols: a v3 pool is named by address, and needs nothing else -
+# token0/token1/fee/tickSpacing are read off the pool contract.
+# [[routes]]
+# name = "buy PONS"
+# input = "USDG"
+# amount_in = "0.1"
+# max_slippage_pct = 1.0
+# pools = [
+#   "0xd4fa4c9859b69466b3e35d7907789e6d22d5200f3d7634532d825a4469cec863",  # v4 USDG/LULU
+#   "0x10CC6BD38112cAc182db90B6a71d8Bb5939526bA",                          # v3 WETH/PONS
+# ]

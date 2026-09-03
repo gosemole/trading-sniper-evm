@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./config.toml)",
+      "Read(./.env)",
+      "Read(./*.env)",
+      "Read(//Users/semgose/.config/mm-fall.env)"
+    ]
+  }
+}

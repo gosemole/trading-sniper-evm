@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::{Address, Bytes, Filter, H256, TransactionRequest, U256, ValueOrArray};
 use ethers::utils::keccak256;
+use std::collections::HashMap;
 
 /// Canonical V3 Swap signature (no `indexed`, no names) -> keccak for topic0.
 const V3_SWAP_SIG: &str = "Swap(address,address,int256,int256,uint160,uint128,int24)";
@@ -31,16 +32,38 @@ pub fn v4_init_topic() -> H256 {
     event_topic(V4_INIT_SIG)
 }
 
+/// Resolve a token reference: a ticker from the `[tokens]` registry (matched
+/// case-insensitively) or a raw `0x…` address.
+pub fn resolve_token(tokens: &HashMap<String, String>, s: &str) -> Result<Address> {
+    let listed = tokens.get(s).or_else(|| {
+        tokens
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(s))
+            .map(|(_, v)| v)
+    });
+    match listed {
+        Some(addr) => addr
+            .parse()
+            .with_context(|| format!("ticker '{s}' maps to invalid address '{addr}'")),
+        None => s.parse().with_context(|| {
+            format!("'{s}' is neither a ticker in [tokens] nor a 0x address")
+        }),
+    }
+}
+
+/// v4 PoolKey currencies are always stored sorted by address, so a pair given
+/// in any order is normalised here and the caller cannot get it backwards.
+fn sorted(a: Address, b: Address) -> (Address, Address) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 fn selector(sig: &str) -> Bytes {
     let h = keccak256(sig.as_bytes());
     Bytes::from(h[..4].to_vec())
-}
-
-/// 32-byte big-endian word of a U256.
-fn word32(v: U256) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    v.to_big_endian(&mut b);
-    b
 }
 
 /// A watched pool with resolved on-chain metadata.
@@ -50,18 +73,37 @@ pub struct Pool {
     pub version: String,
     pub decimals0: u8,
     pub decimals1: u8,
+    /// False when decimals could not be resolved and 0/0 is being used as a
+    /// stand-in. Relative moves are unaffected; absolute prices are not shown.
+    pub decimals_known: bool,
     pub base_token: u8,
+    /// Symbol of the quote side, for log output. None when the quote token
+    /// address could not be resolved.
+    pub quote_symbol: Option<String>,
+    /// Symbol of the base side - the token a drop here is a drop *of*.
+    pub base_symbol: Option<String>,
+    /// PoolKey currencies in sorted order. None when they could not be
+    /// resolved, which leaves relative price moves usable and everything that
+    /// names a token unusable.
+    pub currencies: Option<(Address, Address)>,
     /// For v3: the pool contract address. For v4: the PoolManager address.
     pub address: Address,
     /// v4 only: 32-byte PoolId.
     pub pool_id: Option<H256>,
-    /// v4 only: absolute storage slot of `_pools[poolId].liquidity`.
-    pub liquidity_slot: Option<U256>,
+    /// PoolKey tick spacing. Required to walk the tick bitmap; v4 does not
+    /// store it, so it comes from config or the Initialize log.
+    pub tick_spacing: Option<i32>,
+    /// Pool fee in hundredths of a bip (3000 = 0.3%), charged on the swap input.
+    pub lp_fee: Option<u32>,
 }
 
 impl Pool {
     /// Build a pool, resolving token/decimals on-chain when not given in config.
-    pub async fn resolve(http: &Provider<Http>, cfg: &PoolConfig) -> Result<Self> {
+    pub async fn resolve(
+        http: &Provider<Http>,
+        cfg: &PoolConfig,
+        tokens: &HashMap<String, String>,
+    ) -> Result<Self> {
         let address: Address = cfg
             .address
             .parse()
@@ -73,7 +115,7 @@ impl Pool {
                 pid.parse::<H256>()
                     .with_context(|| format!("invalid pool_id for '{}'", cfg.name))?
             } else {
-                derive_pool_id(cfg)?
+                derive_pool_id(cfg, tokens)?
             };
             tracing::info!(pool = %cfg.name, pool_id = ?pid, "v4 pool_id");
             Some(pid)
@@ -81,95 +123,145 @@ impl Pool {
             None
         };
 
-        // 2. Determine decimals (config -> on-chain). Optional: only needed for
-        // human-readable absolute price; %-movement works on raw price without them.
-        let (decimals0, decimals1) = match (cfg.decimals0, cfg.decimals1) {
-            (Some(d0), Some(d1)) => (d0, d1),
-            _ if cfg.version == "v4" => {
-                let pid = pool_id.expect("v4 pool_id set");
-                // Try: currencies from the Initialize log (native ETH pairs work:
-                // currency0 == 0x0, decimals 18). Fall back to config tokens, else
-                // raw price with decimals 0/0.
-                match currencies_from_init_log(http, address, pid).await {
-                    Ok((c0, c1)) => {
-                        let d0 = decimals_of(http, c0).await?;
-                        let d1 = decimals_of(http, c1).await?;
-                        tracing::info!(
-                            pool = %cfg.name, token0 = ?c0, token1 = ?c1,
-                            decimals0 = d0, decimals1 = d1,
-                            "resolved v4 metadata from Initialize log"
-                        );
-                        (d0, d1)
-                    }
-                    Err(e) => match (&cfg.token0, &cfg.token1) {
-                        (Some(s0), Some(s1)) => {
-                            let t0: Address = s0.parse()?;
-                            let t1: Address = s1.parse()?;
-                            let d0 = call_u8(http, t0, &selector("decimals()")).await?;
-                            let d1 = call_u8(http, t1, &selector("decimals()")).await?;
-                            (d0, d1)
-                        }
-                        _ => {
-                            tracing::info!(
-                                pool = %cfg.name, err = %e,
-                                "no decimals available; using raw price (movement % unaffected)"
-                            );
-                            (0, 0)
-                        }
-                    },
-                }
-            }
-            _ => {
-                // v3: read token0()/token1() from the pool contract.
-                let t0: Address = match &cfg.token0 {
-                    Some(s) => s.parse()?,
-                    None => call_address(http, address, &selector("token0()")).await?,
-                };
-                let t1: Address = match &cfg.token1 {
-                    Some(s) => s.parse()?,
-                    None => call_address(http, address, &selector("token1()")).await?,
-                };
-                let d0 = decimals_of(http, t0).await?;
-                let d1 = decimals_of(http, t1).await?;
-                tracing::info!(
-                    pool = %cfg.name, token0 = ?t0, token1 = ?t1,
-                    decimals0 = d0, decimals1 = d1,
-                    "resolved v3 pool metadata on-chain"
-                );
-                (d0, d1)
-            }
+        // 2. PoolKey metadata. `fee` and `tickSpacing` are needed to walk the
+        // tick bitmap; v4 keeps them only in the PoolKey, never in storage.
+        let mut tick_spacing = cfg.tick_spacing;
+        let mut lp_fee = cfg.fee;
+        // Config tokens win: they cost no requests and let the operator override.
+        let mut currencies: Option<(Address, Address)> = match (&cfg.token0, &cfg.token1) {
+            (Some(s0), Some(s1)) => Some(sorted(
+                resolve_token(tokens, s0)?,
+                resolve_token(tokens, s1)?,
+            )),
+            _ => None,
         };
+        let mut key_source = "config";
 
-        // 3. For v4, locate the storage slot of `_pools[poolId].liquidity` by
-        // scanning for the base slot of the State struct (slot0 = its first word).
-        let liquidity_slot = if cfg.version == "v4" {
-            let pid = pool_id.expect("v4 pool_id set");
-            match find_state_base_slot(http, address, pid).await {
-                Ok(base) => {
-                    let mut key = pid.as_bytes().to_vec();
-                    key.extend_from_slice(&word32(U256::from(base)));
-                    let abs = U256::from_big_endian(&keccak256(&key)) + U256::from(3);
-                    Some(abs)
-                }
-                Err(e) => {
-                    tracing::warn!(pool = %cfg.name, err = %e, "could not locate v4 liquidity slot");
-                    None
+        if cfg.version == "v4" {
+            if currencies.is_none() || tick_spacing.is_none() || lp_fee.is_none() {
+                let pid = pool_id.expect("v4 pool_id set");
+                match v4_pool_key(http, address, pid).await {
+                    Ok((c0, c1, fee, ts, _hooks)) => {
+                        if currencies.is_none() {
+                            key_source = "Initialize log";
+                            currencies = Some((c0, c1));
+                        }
+                        tick_spacing.get_or_insert(ts);
+                        lp_fee.get_or_insert(fee);
+                    }
+                    Err(e) => tracing::warn!(
+                        pool = %cfg.name, err = %e,
+                        "could not recover v4 PoolKey; set token0/token1/fee/tick_spacing \
+                         in config or depth stays in-range only"
+                    ),
                 }
             }
         } else {
-            None
+            // v3 publishes all of it as plain views on the pool contract.
+            if currencies.is_none() {
+                key_source = "pool contract";
+                currencies = Some((
+                    call_address(http, address, &selector("token0()")).await?,
+                    call_address(http, address, &selector("token1()")).await?,
+                ));
+            }
+            if tick_spacing.is_none() {
+                tick_spacing = call_uint(http, address, &selector("tickSpacing()"))
+                    .await
+                    .ok()
+                    .map(|v| v as i32);
+            }
+            if lp_fee.is_none() {
+                lp_fee = call_uint(http, address, &selector("fee()")).await.ok();
+            }
+        }
+
+        // 3. Decimals: only needed for human-readable absolute prices; the
+        // %-movement detector works on the raw price without them.
+        let (decimals0, decimals1, decimals_known) = match (cfg.decimals0, cfg.decimals1) {
+            (Some(d0), Some(d1)) => (d0, d1, true),
+            _ => match currencies {
+                // decimals_of, not a bare decimals() call: native ETH is the
+                // zero address and has no contract to ask.
+                Some((c0, c1)) => (
+                    decimals_of(http, c0).await?,
+                    decimals_of(http, c1).await?,
+                    true,
+                ),
+                None => (0, 0, false),
+            },
         };
+
+        // 4. Symbols of both sides. They name the token that fell when a signal
+        // fires, and they are what decides which side is the base.
+        let (sym0, sym1) = match currencies {
+            Some((t0, t1)) => (
+                symbol_of(http, t0).await.ok(),
+                symbol_of(http, t1).await.ok(),
+            ),
+            None => (None, None),
+        };
+        let base_token = resolve_base_token(
+            &cfg.name,
+            cfg.base_token,
+            sym0.as_deref(),
+            sym1.as_deref(),
+        )
+        .with_context(|| format!("pool '{}'", cfg.name))?;
+        let (base_symbol, quote_symbol) = if base_token == 1 {
+            (sym1.clone(), sym0.clone())
+        } else {
+            (sym0.clone(), sym1.clone())
+        };
+
+        match currencies {
+            Some((c0, c1)) => tracing::info!(
+                pool = %cfg.name, currency0 = ?c0, currency1 = ?c1,
+                decimals0, decimals1, tick_spacing = ?tick_spacing, lp_fee = ?lp_fee,
+                base_token,
+                base = base_symbol.as_deref().unwrap_or("?"),
+                quote = quote_symbol.as_deref().unwrap_or("?"),
+                from = if cfg.base_token.is_some() { "config" } else { "name" },
+                source = key_source,
+                "resolved pool metadata (sorted PoolKey order)"
+            ),
+            None => tracing::info!(
+                pool = %cfg.name,
+                "no currencies resolved; raw price only (movement % unaffected)"
+            ),
+        }
+
 
         Ok(Self {
             name: cfg.name.clone(),
             version: cfg.version.clone(),
             decimals0,
             decimals1,
-            base_token: cfg.base_token,
+            decimals_known,
+            base_token,
+            quote_symbol,
+            base_symbol,
+            currencies,
             address,
             pool_id,
-            liquidity_slot,
+            tick_spacing,
+            lp_fee,
         })
+    }
+
+    /// How this pool is named where routes and triggers refer to it.
+    pub fn pool_ref(&self) -> crate::route::PoolRef {
+        match self.pool_id {
+            Some(id) => crate::route::PoolRef::V4(id),
+            None => crate::route::PoolRef::V3(self.address),
+        }
+    }
+
+    /// The token this pool's price is quoted *for*: a drop in the reported
+    /// price is a drop of this token against the other one.
+    pub fn base_currency(&self) -> Option<Address> {
+        self.currencies
+            .map(|(c0, c1)| if self.base_token == 1 { c1 } else { c0 })
     }
 
     /// Addresses to subscribe to. v3: the single pool. v4: PoolManager.
@@ -177,58 +269,58 @@ impl Pool {
         vec![self.address]
     }
 
-    /// In-range liquidity currently active at the pool's price.
-    pub async fn in_range_liquidity(&self, http: &Provider<Http>) -> Result<u128> {
-        match self.version.as_str() {
-            "v4" => {
-                let slot = self.liquidity_slot.context("v4 liquidity slot not resolved")?;
-                let word = storage_at(http, self.address, slot).await?;
-                // liquidity occupies the low 128 bits of the big-endian word
-                Ok(u128::from_be_bytes(word.0[16..32].try_into().unwrap()))
-            }
-            _ => {
-                // v3: pool.liquidity() view
-                let tx = TransactionRequest::new()
-                    .to(self.address)
-                    .data(selector("liquidity()"));
-                let res: Bytes = http
-                    .call(&tx.into(), None)
-                    .await
-                    .context("eth_call liquidity()")?;
-                anyhow::ensure!(res.len() >= 32, "short return for liquidity()");
-                // low 128 bits: ethers U256 is little-endian limb order
-                let u = U256::from_big_endian(&res[16..32]);
-                Ok(u.as_u128())
-            }
+    /// Decimals of the quote side, used to scale `quote_pay` into human units.
+    /// base_token=1 => quote is token0; base_token=0 => quote is token1.
+    /// Falls back to 18 (ETH/WETH) when decimals could not be resolved.
+    pub fn quote_decimals(&self) -> u8 {
+        if !self.decimals_known {
+            return 18;
+        }
+        if self.base_token == 1 {
+            self.decimals0
+        } else {
+            self.decimals1
         }
     }
 
-    /// Estimate how much QUOTE token (ETH/WETH, 18 decimals) is needed to move
-    /// the price by `move_pct` (in-range liquidity only).
-    /// Quote side is derived from base_token: base_token=1 => quote is token0,
-    /// base_token=0 => quote is token1.
-    pub async fn quote_pay(
-        &self,
-        http: &Provider<Http>,
-        sqrt_input: U256,
-        move_pct: f64,
-    ) -> Result<f64> {
-        let l = self.in_range_liquidity(http).await? as f64;
+    /// Where tick state for this pool lives, for the tick-walking estimate.
+    pub fn tick_source(&self) -> Option<crate::depth::Source> {
+        match (self.version.as_str(), self.pool_id) {
+            ("v4", Some(pool_id)) => Some(crate::depth::Source::V4 {
+                manager: self.address,
+                pool_id,
+            }),
+            ("v4", None) => None,
+            _ => Some(crate::depth::Source::V3 { pool: self.address }),
+        }
+    }
+
+    /// Estimate how much QUOTE token (raw units) must be paid in to move the
+    /// price of the base token UP by `move_pct`.
+    ///
+    /// `liquidity` and `sqrt_input` must come from the same Swap log, so both
+    /// describe the same instant. In-range liquidity only (no tick walking):
+    /// the true cost is higher once the move crosses an initialized tick.
+    pub fn quote_pay(&self, liquidity: u128, sqrt_input: U256, move_pct: f64) -> Result<f64> {
+        anyhow::ensure!(move_pct > 0.0, "move_pct must be > 0, got {move_pct}");
+        let l = liquidity as f64;
         let sqrt_p = sqrt_to_f64(sqrt_input);
+        anyhow::ensure!(sqrt_p > 0.0, "sqrtPriceX96 is zero");
         let k = (1.0 + move_pct / 100.0).sqrt();
-        // amount of QUOTE token for a `move_pct` price move (magnitude)
-        let pay_raw = if self.base_token == 1 {
-            // quote = token0 (x): Δx = L·(1/√P)·(1 − 1/√(1+m))
-            l * (1.0 / sqrt_p) * (1.0 - 1.0 / k)
+        Ok(if self.base_token == 1 {
+            // Base is token1: buying it with token0 (x) pushes P = y/x DOWN,
+            // so sqrt(P') = sqrt(P)/k and dx_in = L*(1/sqrt(P))*(k - 1).
+            l * (1.0 / sqrt_p) * (k - 1.0)
         } else {
-            // quote = token1 (y): Δy = L·√P·(√(1+m) − 1)
+            // Base is token0: buying it with token1 (y) pushes P UP,
+            // so sqrt(P') = sqrt(P)*k and dy_in = L*sqrt(P)*(k - 1).
             l * sqrt_p * (k - 1.0)
-        };
-        Ok(pay_raw)
+        })
     }
 }
 
-fn sqrt_to_f64(sqrt: U256) -> f64 {
+/// sqrtPriceX96 as a plain f64 sqrt(price).
+pub fn sqrt_to_f64(sqrt: U256) -> f64 {
     let f = if let Ok(x) = u128::try_from(sqrt) {
         x as f64
     } else {
@@ -240,73 +332,24 @@ fn sqrt_to_f64(sqrt: U256) -> f64 {
     f / 2f64.powi(96)
 }
 
-/// Find the base storage slot of the v4 `_pools` State struct: the smallest slot
-/// `s` (0..48) whose `keccak(poolId || s)` word is non-zero.
-async fn find_state_base_slot(
-    http: &Provider<Http>,
-    manager: Address,
-    pool_id: H256,
-) -> Result<u64> {
-    // absolute slot for mapping member s: keccak256(poolId, s) where s is a 32-byte word
-    for s in 0..48u64 {
-        let mut key = pool_id.as_bytes().to_vec();
-        key.extend_from_slice(&word32(U256::from(s)));
-        let abs = U256::from_big_endian(&keccak256(&key));
-        let word = storage_at(http, manager, abs).await?;
-        if !word.is_zero() {
-            return Ok(s);
-        }
-    }
-    anyhow::bail!("no non-zero storage slot found for pool")
-}
-
-/// Raw `eth_getStorageAt` returning the 32-byte word.
-async fn storage_at(
-    http: &Provider<Http>,
-    address: Address,
-    slot: U256,
-) -> Result<H256> {
-    let word: H256 = http
-        .request(
-            "eth_getStorageAt",
-            (
-                format!("{address:?}"),
-                format!("0x{slot:064x}"),
-                "latest".to_string(),
-            ),
-        )
-        .await
-        .context("eth_getStorageAt")?;
-    Ok(word)
-}
-
 /// Derive poolId = keccak256(abi.encode(currency0, currency1, fee, tickSpacing, hooks)),
 /// i.e. five 32-byte words (addresses/fee left-padded, tickSpacing sign-extended).
-fn derive_pool_id(cfg: &PoolConfig) -> Result<H256> {
-    let t0: Address = cfg.token0.as_deref().context("v4 missing token0")?.parse()?;
-    let t1: Address = cfg.token1.as_deref().context("v4 missing token1")?.parse()?;
-    let (c0, c1) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-    let fee = cfg.fee.context("v4 missing fee")?;
-    let tick_spacing = cfg.tick_spacing.context("v4 missing tick_spacing")?;
-    let hooks: Address = cfg
-        .hooks
-        .as_deref()
-        .unwrap_or("0x0000000000000000000000000000000000000000")
-        .parse()?;
-
+pub fn pool_id_from_key(
+    c0: Address,
+    c1: Address,
+    fee: u32,
+    tick_spacing: i32,
+    hooks: Address,
+) -> H256 {
+    let (c0, c1) = sorted(c0, c1);
     let word = |b: &[u8]| {
         let mut w = [0u8; 32];
         w[32 - b.len()..].copy_from_slice(b);
         w
     };
     let signed_word = |v: i32| {
-        // int24 sign-extended to a 32-byte big-endian word
-        let mut w = [0xffu8; 32];
-        if v >= 0 {
-            w = [0u8; 32];
-        }
-        let b = v.to_be_bytes(); // [sign, b1, b2, b3]
-        w[29..].copy_from_slice(&b[1..]);
+        let mut w = if v >= 0 { [0u8; 32] } else { [0xffu8; 32] };
+        w[29..].copy_from_slice(&v.to_be_bytes()[1..]);
         w
     };
     let mut buf = Vec::with_capacity(160);
@@ -315,39 +358,251 @@ fn derive_pool_id(cfg: &PoolConfig) -> Result<H256> {
     buf.extend_from_slice(&word(&fee.to_be_bytes()[1..]));
     buf.extend_from_slice(&signed_word(tick_spacing));
     buf.extend_from_slice(&word(hooks.as_bytes()));
-    Ok(H256::from_slice(&keccak256(&buf)))
+    H256::from_slice(&keccak256(&buf))
 }
 
-/// Find the Initialize log for `pool_id` (id is indexed), return (currency0, currency1).
-async fn currencies_from_init_log(
+fn derive_pool_id(cfg: &PoolConfig, tokens: &HashMap<String, String>) -> Result<H256> {
+    let t0 = resolve_token(tokens, cfg.token0.as_deref().context("v4 missing token0")?)?;
+    let t1 = resolve_token(tokens, cfg.token1.as_deref().context("v4 missing token1")?)?;
+    let hooks: Address = cfg
+        .hooks
+        .as_deref()
+        .unwrap_or("0x0000000000000000000000000000000000000000")
+        .parse()?;
+    Ok(pool_id_from_key(
+        t0,
+        t1,
+        cfg.fee.context("v4 missing fee")?,
+        cfg.tick_spacing.context("v4 missing tick_spacing")?,
+        hooks,
+    ))
+}
+
+/// One 32-byte storage word, optionally at a historical block.
+async fn storage_at(
+    http: &Provider<Http>,
+    address: Address,
+    slot: U256,
+    block: Option<u64>,
+) -> Result<H256> {
+    let at = match block {
+        Some(b) => format!("0x{b:x}"),
+        None => "latest".to_string(),
+    };
+    let word: H256 = http
+        .request(
+            "eth_getStorageAt",
+            (format!("0x{address:x}"), format!("0x{slot:064x}"), at),
+        )
+        .await
+        .context("eth_getStorageAt")?;
+    Ok(word)
+}
+
+/// Absolute slot of `_pools[poolId].slot0` (member 0 of the State struct).
+fn v4_slot0(pool_id: H256) -> U256 {
+    let mut key = pool_id.as_bytes().to_vec();
+    let mut w = [0u8; 32];
+    U256::from(6u64).to_big_endian(&mut w); // _pools is storage slot 6
+    key.extend_from_slice(&w);
+    U256::from_big_endian(&keccak256(&key))
+}
+
+/// Block at which the pool was initialized, found by binary search on the
+/// first block where slot0 stops being zero.
+///
+/// This exists because the Initialize log is the only place a v4 PoolKey is
+/// published, and finding it otherwise needs an unbounded `eth_getLogs` range
+/// that most RPC tiers refuse. ~26 archive reads, once, at startup.
+async fn find_init_block(http: &Provider<Http>, manager: Address, pool_id: H256) -> Result<u64> {
+    let slot = v4_slot0(pool_id);
+    let head = http.get_block_number().await?.as_u64();
+    anyhow::ensure!(
+        !storage_at(http, manager, slot, Some(head)).await?.is_zero(),
+        "pool is not initialized at head"
+    );
+    let (mut lo, mut hi) = (1u64, head);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if storage_at(http, manager, slot, Some(mid)).await?.is_zero() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// Full PoolKey from the pool's Initialize log: (currency0, currency1, fee,
+/// tickSpacing, hooks). The log is fetched from the single block the binary
+/// search identified, so the range stays within any provider's limit.
+pub async fn v4_pool_key(
     http: &Provider<Http>,
     manager: Address,
     pool_id: H256,
-) -> Result<(Address, Address)> {
+) -> Result<(Address, Address, u32, i32, Address)> {
+    let block = find_init_block(http, manager, pool_id).await?;
     let filter = Filter::new()
         .address(manager)
         .topic0(ValueOrArray::Value(v4_init_topic()))
-        .topic1(ValueOrArray::Value(pool_id));
-    let logs = http
+        .topic1(ValueOrArray::Value(pool_id))
+        .from_block(block)
+        .to_block(block);
+    let log = http
         .get_logs(&filter)
         .await
-        .context("eth_getLogs Initialize")?;
-    let log = logs
+        .context("eth_getLogs Initialize")?
         .into_iter()
         .next()
-        .context("no Initialize log for pool_id")?;
+        .with_context(|| format!("no Initialize log at block {block}"))?;
     anyhow::ensure!(log.topics.len() >= 4, "Initialize log missing currency topics");
     let c0 = Address::from_slice(&log.topics[2].as_bytes()[12..]);
     let c1 = Address::from_slice(&log.topics[3].as_bytes()[12..]);
-    Ok((c0, c1))
+    let d = &log.data.0;
+    anyhow::ensure!(d.len() >= 96, "Initialize log data too short");
+    let fee = U256::from_big_endian(&d[0..32]).low_u32() & 0xff_ffff;
+    let ts_raw = U256::from_big_endian(&d[32..64]).low_u32() & 0xff_ffff;
+    let tick_spacing = if ts_raw & 0x80_0000 != 0 {
+        ts_raw as i32 - 0x100_0000
+    } else {
+        ts_raw as i32
+    };
+    let hooks = Address::from_slice(&d[76..96]);
+    tracing::info!(
+        block, ?c0, ?c1, fee, tick_spacing, ?hooks,
+        "recovered v4 PoolKey from Initialize log"
+    );
+    Ok((c0, c1, fee, tick_spacing, hooks))
 }
 
 /// Decimals of a currency. Native ETH is the zero address -> 18.
-async fn decimals_of(http: &Provider<Http>, currency: Address) -> Result<u8> {
+/// The `BASE/QUOTE` pair a pool's name claims, if it is written that way.
+///
+/// Anything after a space is dropped, so "ROBLOXIANS/RBLX (v4)" reads as
+/// ("ROBLOXIANS", "RBLX"). A name that is not one slash between two non-empty
+/// words is not a claim about anything and is left alone.
+fn named_pair(name: &str) -> Option<(&str, &str)> {
+    let head = name.split_whitespace().next()?;
+    let (base, quote) = head.split_once('/')?;
+    if base.is_empty() || quote.is_empty() || quote.contains('/') {
+        return None;
+    }
+    Some((base.trim(), quote.trim()))
+}
+
+/// Which side of the pair the price is quoted FOR, as an index into the sorted
+/// PoolKey.
+///
+/// A name written `BASE/QUOTE` is a statement a human made about a pool whose
+/// currency order they did not choose, so where both symbols are known it
+/// decides - and `base_token` stops being something to get right. An explicit
+/// `base_token` still wins, but it has to agree with the name, because one of
+/// the two being wrong is silent: the monitor would report the other token's
+/// moves and an armed route would refuse to buy on its own dip.
+fn resolve_base_token(
+    name: &str,
+    configured: Option<u8>,
+    sym0: Option<&str>,
+    sym1: Option<&str>,
+) -> Result<u8> {
+    let from_name = match (named_pair(name), sym0, sym1) {
+        (Some((b, q)), Some(s0), Some(s1)) => {
+            if b.eq_ignore_ascii_case(s0) && q.eq_ignore_ascii_case(s1) {
+                Some(0)
+            } else if b.eq_ignore_ascii_case(s1) && q.eq_ignore_ascii_case(s0) {
+                Some(1)
+            } else {
+                // Neither way round fits, so the name is about a different
+                // pool than the id or address points at.
+                anyhow::bail!(
+                    "is named {b}/{q} but holds {s0}/{s1}; the name and the pool do not match"
+                );
+            }
+        }
+        _ => None,
+    };
+    match (configured, from_name) {
+        (Some(c), Some(n)) => {
+            anyhow::ensure!(
+                c == n,
+                "is named {}/{}, which makes base_token {n}, but base_token = {c} was set; \
+                 base_token indexes the SORTED PoolKey, not the order in the name",
+                named_pair(name).map(|p| p.0).unwrap_or("?"),
+                named_pair(name).map(|p| p.1).unwrap_or("?")
+            );
+            Ok(c)
+        }
+        (Some(c), None) => Ok(c),
+        (None, Some(n)) => Ok(n),
+        // Nothing said anything: token0 is the base, as it always was.
+        (None, None) => Ok(0),
+    }
+}
+
+/// token0/token1/fee/tickSpacing straight off a v3 pool contract. Unlike v4,
+/// where the PoolKey has to be recovered from a log and re-hashed, v3 publishes
+/// all of it as plain views on the pool itself.
+pub async fn v3_pool_key(
+    http: &Provider<Http>,
+    pool: Address,
+) -> Result<(Address, Address, u32, i32)> {
+    let code = http.get_code(pool, None).await.context("eth_getCode")?;
+    anyhow::ensure!(!code.0.is_empty(), "{pool:?} has no code; not a v3 pool");
+    let t0 = call_address(http, pool, &selector("token0()"))
+        .await
+        .with_context(|| format!("{pool:?}: token0()"))?;
+    let t1 = call_address(http, pool, &selector("token1()"))
+        .await
+        .with_context(|| format!("{pool:?}: token1()"))?;
+    let fee = call_uint(http, pool, &selector("fee()"))
+        .await
+        .with_context(|| format!("{pool:?}: fee()"))?;
+    let spacing = call_uint(http, pool, &selector("tickSpacing()"))
+        .await
+        .with_context(|| format!("{pool:?}: tickSpacing()"))? as i32;
+    Ok((t0, t1, fee, spacing))
+}
+
+pub async fn decimals_of(http: &Provider<Http>, currency: Address) -> Result<u8> {
     if currency == Address::zero() {
         return Ok(18);
     }
     call_u8(http, currency, &selector("decimals()")).await
+}
+
+/// `symbol()` of a currency. Native ETH (zero address) is "ETH". Handles both
+/// the modern `string` return and the legacy `bytes32` one.
+pub async fn symbol_of(http: &Provider<Http>, currency: Address) -> Result<String> {
+    if currency == Address::zero() {
+        return Ok("ETH".to_string());
+    }
+    let tx = TransactionRequest::new()
+        .to(currency)
+        .data(selector("symbol()"));
+    let res: Bytes = http.call(&tx.into(), None).await.context("eth_call symbol()")?;
+    anyhow::ensure!(res.len() >= 32, "short return for symbol()");
+    // ABI string: [offset][len][bytes...]
+    if res.len() >= 64 {
+        let off = U256::from_big_endian(&res[0..32]).as_usize();
+        if off == 32 && res.len() >= 64 {
+            let len = U256::from_big_endian(&res[32..64]).as_usize();
+            if len > 0 && len <= 64 && res.len() >= 64 + len {
+                return Ok(String::from_utf8_lossy(&res[64..64 + len]).into_owned());
+            }
+        }
+    }
+    // legacy bytes32: right-padded with zeros
+    let trimmed: Vec<u8> = res[0..32].iter().copied().take_while(|b| *b != 0).collect();
+    anyhow::ensure!(!trimmed.is_empty(), "empty symbol()");
+    Ok(String::from_utf8_lossy(&trimmed).into_owned())
+}
+
+/// Read a small unsigned integer return value (uint24/int24/uint8...).
+async fn call_uint(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<u32> {
+    let tx = TransactionRequest::new().to(to).data(data.clone());
+    let res: Bytes = provider.call(&tx.into(), None).await.context("eth_call uint")?;
+    anyhow::ensure!(res.len() >= 32, "short return for uint call");
+    Ok(U256::from_big_endian(&res[0..32]).low_u32())
 }
 
 async fn call_address(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<Address> {
@@ -368,14 +623,217 @@ async fn call_u8(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result
 mod tests {
     use super::*;
 
+    fn pool(base_token: u8, decimals: (u8, u8)) -> Pool {
+        Pool {
+            name: "t".into(),
+            version: "v4".into(),
+            decimals0: decimals.0,
+            decimals1: decimals.1,
+            decimals_known: true,
+            base_token,
+            quote_symbol: None,
+            base_symbol: None,
+            currencies: None,
+            address: Address::zero(),
+            pool_id: None,
+            tick_spacing: Some(60),
+            lp_fee: Some(3000),
+        }
+    }
+
+    #[test]
+    fn a_name_written_as_a_pair_is_read_base_first() {
+        assert_eq!(named_pair("ROBLOXIANS/RBLX (v4)"), Some(("ROBLOXIANS", "RBLX")));
+        assert_eq!(named_pair("PONS/WETH (v3)"), Some(("PONS", "WETH")));
+        assert_eq!(named_pair("CAMELTOE/LULU"), Some(("CAMELTOE", "LULU")));
+        // Not a pair, so not a claim: these must not be checked against.
+        assert_eq!(named_pair("the deep pool"), None);
+        assert_eq!(named_pair("A/B/C"), None);
+        assert_eq!(named_pair("/RBLX"), None);
+        assert_eq!(named_pair("RBLX/"), None);
+        assert_eq!(named_pair(""), None);
+    }
+
+    #[test]
+    fn the_name_decides_which_side_is_the_base() {
+        // Sorted order is (RBLX, ROBLOXIANS), and the name says ROBLOXIANS is
+        // the base - so base_token is 1, and nobody had to work that out.
+        let t = |n, c| resolve_base_token(n, c, Some("RBLX"), Some("ROBLOXIANS"));
+        assert_eq!(t("ROBLOXIANS/RBLX (v4)", None).unwrap(), 1);
+        assert_eq!(t("RBLX/ROBLOXIANS (v4)", None).unwrap(), 0);
+        // Case is not the point.
+        assert_eq!(t("robloxians/rblx", None).unwrap(), 1);
+        // An explicit index that agrees is redundant but fine.
+        assert_eq!(t("ROBLOXIANS/RBLX", Some(1)).unwrap(), 1);
+        // One that disagrees is the mistake this exists to catch.
+        assert!(t("ROBLOXIANS/RBLX", Some(0)).is_err());
+        // A name about tokens this pool does not hold points at the wrong pool.
+        assert!(t("PONS/WETH", None).is_err());
+    }
+
+    #[test]
+    fn without_a_pair_name_nothing_is_inferred() {
+        // No claim, no symbols, or only one symbol: fall back to what was
+        // configured, and to token0 when that is absent too.
+        assert_eq!(resolve_base_token("the deep pool", None, Some("A"), Some("B")).unwrap(), 0);
+        assert_eq!(resolve_base_token("the deep pool", Some(1), Some("A"), Some("B")).unwrap(), 1);
+        assert_eq!(resolve_base_token("A/B", None, None, Some("B")).unwrap(), 0);
+        assert_eq!(resolve_base_token("A/B", Some(1), None, None).unwrap(), 1);
+    }
+
+    #[test]
+    fn the_base_side_is_the_token_a_drop_is_a_drop_of() {
+        let c0 = Address::from([1u8; 20]);
+        let c1 = Address::from([2u8; 20]);
+        let mut p = pool(0, (18, 18));
+        p.currencies = Some((c0, c1));
+        assert_eq!(p.base_currency(), Some(c0));
+        p.base_token = 1;
+        assert_eq!(p.base_currency(), Some(c1));
+        // Unresolved currencies must not guess: relative moves still work,
+        // but nothing that names a token may act on them.
+        p.currencies = None;
+        assert_eq!(p.base_currency(), None);
+    }
+
+    fn registry() -> HashMap<String, String> {
+        [
+            ("POOLS", "0x385b36ff682ab4c76e7c37a66b96aabc466471d5"),
+            ("LULU", "0x4e62068525ab11fe768e29dfd00ef909b9803016"),
+            ("CAMELTOE", "0xc32b91fe216af1b834db02f33326e983ad8cf201"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn resolves_tickers_and_raw_addresses() {
+        let t = registry();
+        let pools: Address = "0x385b36ff682ab4c76e7c37a66b96aabc466471d5".parse().unwrap();
+        assert_eq!(resolve_token(&t, "POOLS").unwrap(), pools);
+        // tickers are matched case-insensitively
+        assert_eq!(resolve_token(&t, "pools").unwrap(), pools);
+        // a raw address still works, registry or not
+        assert_eq!(
+            resolve_token(&t, "0x385b36ff682ab4c76e7c37a66b96aabc466471d5").unwrap(),
+            pools
+        );
+        assert_eq!(
+            resolve_token(&HashMap::new(), "0x0000000000000000000000000000000000000000").unwrap(),
+            Address::zero()
+        );
+        // an unknown ticker is an error, not a silent zero address
+        assert!(resolve_token(&t, "NOPE").is_err());
+    }
+
+    /// The pair must land in canonical PoolKey order however it was written,
+    /// otherwise decimals and the quote side get swapped.
+    #[test]
+    fn pair_order_is_normalised() {
+        let t = registry();
+        let lulu = resolve_token(&t, "LULU").unwrap();
+        let cameltoe = resolve_token(&t, "CAMELTOE").unwrap();
+        // on chain: currency0 = LULU (0x4e62…), currency1 = CAMELTOE (0xc32b…)
+        assert_eq!(sorted(lulu, cameltoe), (lulu, cameltoe));
+        assert_eq!(sorted(cameltoe, lulu), (lulu, cameltoe));
+    }
+
+    #[test]
+    fn derived_pool_id_is_order_independent() {
+        let t = registry();
+        let mut a = PoolConfig {
+            name: "t".into(),
+            address: "0x0000000000000000000000000000000000000000".into(),
+            version: "v4".into(),
+            token0: Some("LULU".into()),
+            token1: Some("CAMELTOE".into()),
+            decimals0: None,
+            decimals1: None,
+            base_token: None,
+            threshold_pct: None,
+            max_move_pct: None,
+            pool_id: None,
+            fee: Some(2500),
+            tick_spacing: Some(60),
+            hooks: None,
+        };
+        let forward = derive_pool_id(&a, &t).unwrap();
+        std::mem::swap(&mut a.token0, &mut a.token1);
+        assert_eq!(derive_pool_id(&a, &t).unwrap(), forward);
+    }
+
     #[test]
     fn known_topics() {
+        // All three verified against logs emitted on chain 4663.
         assert_eq!(
             v3_swap_topic(),
             "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
                 .parse::<H256>()
                 .unwrap()
         );
+        assert_eq!(
+            v4_swap_topic(),
+            "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
+                .parse::<H256>()
+                .unwrap()
+        );
+        assert_eq!(
+            v4_init_topic(),
+            "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
+                .parse::<H256>()
+                .unwrap()
+        );
+    }
+
+    /// Anchored on the live POOLS/ETH pool: L and sqrtPriceX96 read from chain
+    /// 4663, quote side is native ETH (token0, 18 decimals).
+    #[test]
+    fn quote_pay_matches_hand_computation() {
+        let p = pool(1, (18, 18));
+        let sqrt = U256::from_dec_str("86182064487810775758807691739729").unwrap();
+        let l: u128 = 85_149_968_048_777_632_622_077;
+        let eth = p.quote_pay(l, sqrt, 1.0).unwrap() / 1e18;
+        // dx_in = L*(1/sqrt(P))*(sqrt(1.01) - 1)
+        assert!((eth - 0.390_423_092).abs() < 1e-8, "got {eth}");
+        // The direction matters: the amount RECEIVED when selling the same
+        // distance is smaller by a factor of sqrt(1.01), and is not what we want.
+        let wrong_direction = eth / 1.01f64.sqrt();
+        assert!((wrong_direction - 0.388_485_496).abs() < 1e-8);
+    }
+
+    /// The two branches are the same formula viewed from either side, so for a
+    /// shared (L, sqrtP) their ratio must be exactly the raw price P = y/x.
+    #[test]
+    fn quote_pay_branches_are_symmetric() {
+        let sqrt = U256::from_dec_str("86182064487810775758807691739729").unwrap();
+        let l: u128 = 85_149_968_048_777_632_622_077;
+        let pay_token0 = pool(1, (18, 18)).quote_pay(l, sqrt, 2.5).unwrap();
+        let pay_token1 = pool(0, (18, 18)).quote_pay(l, sqrt, 2.5).unwrap();
+        let raw_p = crate::price::raw_price(sqrt);
+        let rel = ((pay_token1 / pay_token0) - raw_p).abs() / raw_p;
+        assert!(rel < 1e-9, "ratio {} vs P {raw_p}", pay_token1 / pay_token0);
+    }
+
+    #[test]
+    fn quote_pay_rejects_degenerate_inputs() {
+        let p = pool(1, (18, 18));
+        let sqrt = U256::from_dec_str("86182064487810775758807691739729").unwrap();
+        assert!(p.quote_pay(1, sqrt, 0.0).is_err());
+        assert!(p.quote_pay(1, sqrt, -1.0).is_err());
+        assert!(p.quote_pay(1, U256::zero(), 1.0).is_err());
+    }
+
+    #[test]
+    fn quote_decimals_follows_the_base_side() {
+        // base_token=1 -> quote is token0
+        assert_eq!(pool(1, (6, 18)).quote_decimals(), 6);
+        // base_token=0 -> quote is token1
+        assert_eq!(pool(0, (6, 18)).quote_decimals(), 18);
+        // unresolved decimals fall back to 18 rather than scaling by 10^0
+        let mut p = pool(1, (0, 0));
+        p.decimals_known = false;
+        assert_eq!(p.quote_decimals(), 18);
     }
 
     #[test]
@@ -390,7 +848,7 @@ mod tests {
             token1: Some("0xb427c36931e23b607cfafbcb5a93786117bad597".into()),
             decimals0: None,
             decimals1: None,
-            base_token: 0,
+            base_token: None,
             threshold_pct: None,
             max_move_pct: None,
             pool_id: None,
@@ -399,7 +857,7 @@ mod tests {
             hooks: None,
         };
         assert_eq!(
-            derive_pool_id(&cfg).unwrap(),
+            derive_pool_id(&cfg, &HashMap::new()).unwrap(),
             "0x0277354251edc469597038bae48c9f6b7b80003999b511a7c5eba9a2de764f09"
                 .parse::<H256>()
                 .unwrap()

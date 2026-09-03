@@ -1,2 +1,5 @@
 /target
 config.toml
+.env
+*.env
+.claude/settings.local.json
