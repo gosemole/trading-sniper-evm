@@ -57,6 +57,7 @@ use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Eip1559TransactionRequest, Filter, H256, U256};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -129,6 +130,9 @@ struct Target {
     accept_ms: Vec<u128>,
     wait_ms: Vec<u128>,
     blocks: Vec<i64>,
+    /// The same distance, counted from the height the SEQUENCER had reached
+    /// rather than the one the rpc admitted to. Empty unless a feed was given.
+    blocks_from_feed: Vec<i64>,
     refused: usize,
     /// Why `ping` is empty, when it is. Kept rather than printed on the spot so
     /// one unreadable endpoint does not repeat itself once per round.
@@ -743,6 +747,7 @@ async fn main() -> Result<()> {
             accept_ms: Vec::new(),
             wait_ms: Vec::new(),
             blocks: Vec::new(),
+            blocks_from_feed: Vec::new(),
             refused: 0,
             ping_err: None,
         });
@@ -750,6 +755,43 @@ async fn main() -> Result<()> {
 
     println!("chain {chain_id}, {} endpoint(s), {rounds} round(s)", targets.len());
     println!("reads via {}", label(&read_url));
+
+    // The height the sequencer has actually reached, if a feed was given.
+    //
+    // This exists because every `blocks` figure here is counted from a head,
+    // and which head decides what the number means: the rpc's head is a block
+    // that has been executed and indexed, while the sequencer may already be
+    // several blocks past it. Counted from the rpc, a transaction can look four
+    // blocks late when it was in fact next in line. `--offset` established that
+    // a feed message's sequence number IS the block number, so this is a
+    // reference the sequencer itself would recognise.
+    let feed_head = Arc::new(AtomicU64::new(0));
+    if let Some(feed_url) = value("--feed").or_else(|| env_var("FEED_URL")) {
+        let head = Arc::clone(&feed_head);
+        tokio::spawn(async move {
+            let stream = match connect_feed(&feed_url).await {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("feed unavailable, counting from the rpc head only: {e:#}");
+                    return;
+                }
+            };
+            let (_w, mut r) = stream.split();
+            while let Some(Ok(msg)) = r.next().await {
+                let text = match msg {
+                    tokio_tungstenite::tungstenite::Message::Text(t) => t,
+                    tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                        String::from_utf8_lossy(&b).into_owned()
+                    }
+                    _ => continue,
+                };
+                let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
+                if let Some(top) = frame.messages.iter().map(|m| m.sequence_number).max() {
+                    head.fetch_max(top, Ordering::Relaxed);
+                }
+            }
+        });
+    }
 
     // One uncounted call each: the first request to a cold endpoint pays a TLS
     // handshake, and measuring that would say more about this process's age
@@ -835,6 +877,7 @@ async fn main() -> Result<()> {
             // Read the head BEFORE the clock starts, so neither this call nor
             // its round trip is charged to the endpoint under test.
             let head = read.get_block_number().await.context("eth_blockNumber")?.as_u64();
+            let sequenced = feed_head.load(Ordering::Relaxed);
 
             let started = Instant::now();
             // Reduced to a plain outcome at once: the `PendingTransaction` this
@@ -885,10 +928,19 @@ async fn main() -> Result<()> {
             let wait_ms = waited.elapsed().as_millis();
             targets[i].wait_ms.push(wait_ms);
             targets[i].blocks.push(delta);
+            // Only when the feed had said something before the send. A zero
+            // here is "not known", not "the head was block zero".
+            let from_feed = (sequenced != 0).then(|| landed as i64 - sequenced as i64);
+            if let Some(d) = from_feed {
+                targets[i].blocks_from_feed.push(d);
+            }
             println!(
-                "round {round} {:>44}  accept {accept_ms:>4} ms   landed +{delta} block(s) \
-                 (head {head} -> {landed}), seen after {wait_ms:>4} ms",
-                targets[i].label
+                "round {round} {:>44}  accept {accept_ms:>4} ms   landed +{delta} from the rpc \
+                 head{}  ({head} -> {landed}), seen after {wait_ms:>4} ms",
+                targets[i].label,
+                from_feed
+                    .map(|d| format!(", +{d} from the sequencer at {sequenced}"))
+                    .unwrap_or_default()
             );
             nonce += U256::one();
         }
@@ -900,26 +952,28 @@ async fn main() -> Result<()> {
 
 fn report(targets: &[Target]) {
     println!(
-        "\n{:>44}  {:^17}  {:^17}  {:^17}  {:>6}  refused",
-        "endpoint", "ping min/med/max", "accept min/med/max", "seen min/med/max", "blocks"
+        "\n{:>44}  {:^17}  {:^17}  {:^17}  {:>6}  {:>6}  refused",
+        "endpoint", "ping min/med/max", "accept min/med/max", "seen min/med/max", "vs rpc",
+        "vs seq"
     );
     for t in targets {
         println!(
-            "{:>44}  {}  {}  {}  {}  {:>7}",
+            "{:>44}  {}  {}  {}  {}  {}  {:>7}",
             t.label,
             stats(&t.ping_ms),
             stats(&t.accept_ms),
             stats(&t.wait_ms),
             block_stats(&t.blocks),
+            block_stats(&t.blocks_from_feed),
             t.refused
         );
     }
     println!(
-        "\nall times in ms. `blocks` is the mean distance from the head at send to the block it \
-         landed in - the figure that decides whether a dip is still there, and the only one not \
-         limited by how fast a receipt can be polled for. It is counted from the READING \
-         endpoint's head, so a reader that lags the chain is inside it: point --read at the \
-         endpoint under test to take that out."
+        "\nall times in ms. The two block columns are the same distance measured from two \
+         different heads: `vs rpc` from the block the reading endpoint had executed, `vs seq` \
+         from the height the sequencer had reached. The gap between them is how far behind the \
+         chain the rpc's idea of \"now\" is - and `vs seq` is the one that says whether a \
+         transaction was actually next in line."
     );
 }
 
