@@ -76,8 +76,9 @@ pub async fn run_pool(pool: Pool, ws_url: String, out: mpsc::Sender<Tick>) -> Re
                 continue;
             }
         };
-        // A full channel means the consumer has fallen behind; dropping the
-        // tick keeps the feed honest about being a feed rather than a queue.
+        // Waits when the channel is full, which is backpressure rather than a
+        // stall: the strategy hands its slow work to other tasks, so a full
+        // channel means something is badly wrong rather than merely busy.
         if out.send(tick).await.is_err() {
             info!(pool = %pool.name, "nobody is listening any more");
             return Ok(());

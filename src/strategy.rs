@@ -149,11 +149,36 @@ struct Watch {
     halted: bool,
 }
 
-/// How a broadcast trade ended, on its way back to the strategy.
-pub struct Settled {
-    pub hash: H256,
-    pub pool: PoolRef,
-    pub ok: bool,
+/// Everything the strategy is told about trades it started.
+///
+/// The work of trading happens in tasks of its own so the tick loop never
+/// waits on a network call - but the inventory has one owner, and this is how
+/// news gets back to it.
+pub enum Report {
+    /// A transaction went out. Nothing is counted yet.
+    Filled {
+        hash: H256,
+        pool: PoolRef,
+        side: Side,
+        token: ethers::types::Address,
+        symbol: String,
+        qty: f64,
+        price: f64,
+    },
+    /// The chain answered.
+    Settled { hash: H256, pool: PoolRef, ok: bool },
+    /// A sale could not even be broadcast.
+    SellFailed { pool: PoolRef },
+    /// A sale was not attempted after all - a dry run, or nothing held.
+    /// Not a failure, and not worth counting as one.
+    SellSkipped { pool: PoolRef },
+}
+
+/// One settled trade, unpacked from its report.
+struct Settled {
+    hash: H256,
+    pool: PoolRef,
+    ok: bool,
 }
 
 /// How many times a sale is retried before the pair is left alone. A sale that
@@ -165,7 +190,7 @@ pub struct Strategy {
     watches: HashMap<PoolRef, Watch>,
     exec: Option<Arc<Executor>>,
     inventory: Inventory,
-    settled_tx: mpsc::Sender<Settled>,
+    reports: mpsc::Sender<Report>,
 }
 
 impl Strategy {
@@ -173,14 +198,14 @@ impl Strategy {
         http: Provider<Http>,
         exec: Option<Arc<Executor>>,
         inventory: Inventory,
-        settled_tx: mpsc::Sender<Settled>,
+        reports: mpsc::Sender<Report>,
     ) -> Self {
         Self {
             http,
             watches: HashMap::new(),
             exec,
             inventory,
-            settled_tx,
+            reports,
         }
     }
 
@@ -211,11 +236,11 @@ impl Strategy {
     /// may act on it.
     fn follow(&self, hash: H256, pool: PoolRef, label: String) {
         let http = self.http.clone();
-        let back = self.settled_tx.clone();
+        let back = self.reports.clone();
         tokio::spawn(async move {
             let outcome = crate::swap::await_receipt(&http, hash, &label).await;
             let _ = back
-                .send(Settled {
+                .send(Report::Settled {
                     hash,
                     pool,
                     ok: outcome.happened(),
@@ -259,19 +284,19 @@ impl Strategy {
     }
 
     /// Read the feed until it ends, and act on what comes back from the chain.
-    pub async fn run(mut self, mut ticks: mpsc::Receiver<Tick>, mut settled: mpsc::Receiver<Settled>) {
+    pub async fn run(mut self, mut ticks: mpsc::Receiver<Tick>, mut reports: mpsc::Receiver<Report>) {
         loop {
             tokio::select! {
-                Some(tick) = ticks.recv() => self.on_tick(tick).await,
-                Some(s) = settled.recv() => self.on_settled(s).await,
+                Some(tick) = ticks.recv() => self.on_tick(tick),
+                Some(r) = reports.recv() => self.on_report(r).await,
                 else => break,
             }
         }
         warn!("feed ended");
     }
 
-    async fn on_tick(&mut self, tick: Tick) {
-        self.take_profit(&tick).await;
+    fn on_tick(&mut self, tick: Tick) {
+        self.take_profit(&tick);
 
         // The meter is the only thing here that needs to mutate, so the borrow
         // ends with it.
@@ -296,40 +321,73 @@ impl Strategy {
         // the log. Everything in this line came out of the tick itself.
         emit_signal(&pool, &sig);
 
+        // Both of these go to tasks of their own. Awaiting either here would
+        // stall every other pool behind one trade or one tick walk, and would
+        // let the next signal be judged on a backlog rather than on the state
+        // it was raised from.
         if let Some(exec) = self.exec.clone() {
-            match exec.on_drop(&pool, &sig).await {
-                // A transaction went out. Nothing is counted yet: it is set
-                // aside until the chain says whether it happened.
-                Ok(Some(fill)) => {
-                    if let Some(token) = pool.base_currency() {
-                        let (qty, symbol) = match exec.route_for(tick.pool) {
+            let back = self.reports.clone();
+            let (p, s, key) = (pool.clone(), sig.clone(), tick.pool);
+            tokio::spawn(async move {
+                match exec.on_drop(&p, &s).await {
+                    Ok(Some(fill)) => {
+                        let Some(token) = p.base_currency() else { return };
+                        let (qty, symbol) = match exec.route_for(key) {
                             Some(r) => (
                                 crate::route::u256_to_f64(fill.amount_out)
                                     / 10f64.powi(r.output.decimals as i32),
                                 r.output.symbol.clone(),
                             ),
-                            None => (0.0, "?".to_string()),
+                            None => return,
                         };
-                        self.inventory
-                            .reserve(fill.hash, Side::Buy, token, &symbol, qty, sig.price);
-                        self.save();
-                        info!(tx = ?fill.hash, token = %symbol, qty, price = sig.price, "reserved");
-                        self.follow(fill.hash, tick.pool, format!("buy {symbol}"));
+                        let _ = back
+                            .send(Report::Filled {
+                                hash: fill.hash,
+                                pool: key,
+                                side: Side::Buy,
+                                token,
+                                symbol,
+                                qty,
+                                price: s.price,
+                            })
+                            .await;
                     }
+                    Ok(None) => {}
+                    Err(e) => warn!(pool = %p.name, err = %format!("{e:#}"), "auto-buy failed"),
                 }
-                Ok(None) => {}
-                Err(e) => warn!(pool = %pool.name, err = %format!("{e:#}"), "auto-buy failed"),
-            }
+            });
         }
 
-        // This one costs a walk over the tick data, which is why it comes last
-        // and on its own line rather than holding up the two above it.
-        report_depth(&pool, &self.http, &sig, max_move).await;
+        let http = self.http.clone();
+        tokio::spawn(async move { report_depth(&pool, &http, &sig, max_move).await });
     }
 
     /// The chain has answered. Everything that was set aside is now either real
     /// or was never real.
-    async fn on_settled(&mut self, s: Settled) {
+    async fn on_report(&mut self, r: Report) {
+        let s = match r {
+            Report::Filled { hash, pool, side, token, symbol, qty, price } => {
+                if self.inventory.reserve(hash, side, token, &symbol, qty, price) {
+                    self.save();
+                    info!(tx = ?hash, token = %symbol, ?side, qty, price, "reserved");
+                    self.follow(hash, pool, format!("{side:?} {symbol}").to_lowercase());
+                }
+                return;
+            }
+            Report::SellSkipped { pool } => {
+                if let Some(w) = self.watches.get_mut(&pool) {
+                    w.selling = false;
+                }
+                return;
+            }
+            Report::SellFailed { pool } => {
+                if self.count_failure(pool) {
+                    self.start_sale(pool);
+                }
+                return;
+            }
+            Report::Settled { hash, pool, ok } => Settled { hash, pool, ok },
+        };
         let side = if s.ok {
             self.inventory.settle(s.hash)
         } else {
@@ -367,7 +425,7 @@ impl Strategy {
                 // Straight away rather than on the next tick: the price that
                 // justified the sale is the one we still want.
                 if self.count_failure(s.pool) {
-                    self.sell_now(s.pool).await;
+                    self.start_sale(s.pool);
                 }
             }
         }
@@ -417,7 +475,7 @@ impl Strategy {
     /// ones: a rise is as much a signal as a fall, and the same stream serves
     /// both. The gain is measured against the average entry, so buying further
     /// into a dip lowers the bar rather than raising it.
-    async fn take_profit(&mut self, tick: &Tick) {
+    fn take_profit(&mut self, tick: &Tick) {
         let Some(w) = self.watches.get(&tick.pool) else {
             return;
         };
@@ -444,61 +502,55 @@ impl Strategy {
             gain_pct = format!("{:+.3}%", position.gain_pct(tick.price)),
             "TARGET REACHED"
         );
-        self.sell_now(tick.pool).await;
+        self.start_sale(tick.pool);
     }
 
-    /// Put the whole position up for sale, retrying a broadcast that never got
-    /// off the ground. A sale that *was* broadcast is judged by its receipt
-    /// instead, which arrives later.
-    async fn sell_now(&mut self, pool: PoolRef) {
+    /// Put the whole position up for sale, in a task of its own.
+    ///
+    /// The sale is claimed here rather than when it lands, because the price
+    /// keeps arriving while it is in flight and every tick would otherwise
+    /// start another sale of the same position.
+    fn start_sale(&mut self, pool: PoolRef) {
         let Some(exec) = self.exec.clone() else {
             return;
         };
         let Some(route) = exec.route_for(pool).cloned() else {
             return;
         };
-        let token = match self.watches.get(&pool).and_then(|w| w.pool.base_currency()) {
-            Some(t) => t,
-            None => return,
+        let Some(w) = self.watches.get_mut(&pool) else {
+            return;
+        };
+        if w.halted {
+            return;
+        }
+        w.selling = true;
+        let Some(token) = w.pool.base_currency() else {
+            w.selling = false;
+            return;
         };
         let symbol = route.output.symbol.clone();
-
-        loop {
-            // Claimed before the sale so the ticks that keep arriving while it
-            // is in flight do not each start one of their own.
-            if let Some(w) = self.watches.get_mut(&pool) {
-                if w.halted {
-                    return;
-                }
-                w.selling = true;
-            }
-            match exec.sell_all(&route, route.max_slippage_pct).await {
-                Ok(Some(fill)) => {
-                    // Held, not closed: the position stays on the books until
-                    // the chain confirms it is gone.
-                    self.inventory
-                        .reserve(fill.hash, Side::Sell, token, &symbol, 0.0, 0.0);
-                    self.save();
-                    info!(tx = ?fill.hash, token = %symbol, "sale reserved");
-                    self.follow(fill.hash, pool, format!("sell {symbol}"));
-                    return;
-                }
-                // Nothing was sent - a dry run, or nothing held. Neither is a
-                // failure and neither is worth retrying.
-                Ok(None) => {
-                    if let Some(w) = self.watches.get_mut(&pool) {
-                        w.selling = false;
-                    }
-                    return;
-                }
+        let back = self.reports.clone();
+        tokio::spawn(async move {
+            let report = match exec.sell_all(&route, route.max_slippage_pct).await {
+                // Held, not closed: the position stays on the books until the
+                // chain confirms it is gone.
+                Ok(Some(fill)) => Report::Filled {
+                    hash: fill.hash,
+                    pool,
+                    side: Side::Sell,
+                    token,
+                    symbol,
+                    qty: 0.0,
+                    price: 0.0,
+                },
+                Ok(None) => Report::SellSkipped { pool },
                 Err(e) => {
                     warn!(token = %symbol, err = %format!("{e:#}"), "sale could not be sent");
-                    if !self.count_failure(pool) {
-                        return;
-                    }
+                    Report::SellFailed { pool }
                 }
-            }
-        }
+            };
+            let _ = back.send(report).await;
+        });
     }
 }
 

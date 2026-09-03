@@ -118,13 +118,13 @@ async fn main() -> anyhow::Result<()> {
     let (ticks, rx) = tokio::sync::mpsc::channel(1024);
     // A second, small channel carries receipts back: what the chain decided
     // about a trade belongs in the same place that decided to make it.
-    let (settled_tx, settled_rx) = tokio::sync::mpsc::channel(64);
+    let (reports_tx, reports_rx) = tokio::sync::mpsc::channel(64);
     let inv = inventory::Inventory::load(std::path::Path::new(&cfg.inventory_path))
         .context("loading the inventory")?;
     if !inv.is_empty() {
         tracing::info!("inventory restored from {}", cfg.inventory_path);
     }
-    let mut strategy = strategy::Strategy::new(http.clone(), auto, inv, settled_tx);
+    let mut strategy = strategy::Strategy::new(http.clone(), auto, inv, reports_tx);
     let mut feeds = Vec::new();
     let tokens = cfg.tokens.clone();
     for pool_cfg in cfg.pools {
@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
     // Everything that had to be looked up has been; keep it for next time.
     cache::flush();
     strategy.resolve_pending().await;
-    let decisions = tokio::spawn(strategy.run(rx, settled_rx));
+    let decisions = tokio::spawn(strategy.run(rx, reports_rx));
 
     tokio::select! {
         _ = futures_util::future::join_all(feeds) => {}

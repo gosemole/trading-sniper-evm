@@ -144,18 +144,18 @@ pub fn token(token: Address) -> Option<TokenInfo> {
 
 pub fn put_token(addr: Address, info: TokenInfo) {
     with(|c| {
-        let e = c.store.tokens.entry(token_key(addr)).or_insert_with(|| info.clone());
-        // A later lookup may know the symbol where an earlier one did not.
-        if e.symbol.is_none() && info.symbol.is_some() {
-            e.symbol = info.symbol.clone();
-            c.dirty = true;
-        } else if *e != info && e.symbol.is_some() {
-            // Leave what is there; decimals and symbols do not change, so a
-            // disagreement is a reason to trust neither silently.
-            tracing::debug!(?addr, "cached token info differs from what was just read");
-        }
-        if !c.store.tokens.contains_key(&token_key(addr)) {
-            c.dirty = true;
+        let k = token_key(addr);
+        match c.store.tokens.get_mut(&k) {
+            // A later lookup may know the symbol where an earlier one did not.
+            Some(e) if e.symbol.is_none() && info.symbol.is_some() => {
+                e.symbol = info.symbol;
+                c.dirty = true;
+            }
+            Some(_) => {}
+            None => {
+                c.store.tokens.insert(k, info);
+                c.dirty = true;
+            }
         }
     });
 }
