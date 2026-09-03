@@ -111,6 +111,21 @@ impl HopState {
     }
 }
 
+/// What the feed last saw of a pool, for pricing a trade against it right now.
+///
+/// A buy gets this from the log that raised its signal. A sale has no signal,
+/// so it carries the same thing forward from the last tick - which matters more
+/// there than on a buy, because a sale has no other fresh input at all and
+/// would otherwise be priced entirely from a snapshot written on a timer.
+#[derive(Clone, Copy)]
+pub struct LiveState {
+    pub sqrt: U256,
+    pub liquidity: u128,
+    /// The fee the last swap was charged, when the log said. Already the
+    /// combined swap fee on v4 - see `quote`.
+    pub lp_fee: Option<u32>,
+}
+
 /// A transaction that actually went out, and what it was expected to produce.
 pub struct Fill {
     pub hash: ethers::types::H256,
@@ -200,6 +215,9 @@ pub struct Executor {
     /// The gas price, kept current from the block stream instead of asked for
     /// on every buy.
     fees: Arc<swap::FeeWatch>,
+    /// Where signed transactions go. One endpoint or several, written to at
+    /// once - see `swap::Broadcaster`.
+    submit: Arc<swap::Broadcaster>,
     /// Next nonce to hand out. Held only long enough to take a number, never
     /// across a network call: two buys may be in flight at once, and asking the
     /// node for a nonce while the first is unmined would return the same one.
@@ -318,6 +336,21 @@ impl Executor {
         fees.watch(cfg.ws_url.clone(), http.clone());
         swap::keep_warm(http.clone());
 
+        // Broadcasting fans out; everything else stays on the one endpoint the
+        // rest of the process reads through. An empty list means the two are
+        // the same thing, which is what this did before there was a list.
+        let submit_urls = match cfg.submit_urls.is_empty() {
+            true => std::slice::from_ref(&cfg.http_url),
+            false => cfg.submit_urls.as_slice(),
+        };
+        let submit = Arc::new(swap::Broadcaster::new(submit_urls)?);
+        submit.keep_warm();
+        info!(
+            endpoints = ?submit.labels(),
+            "transactions will be broadcast through {} endpoint(s) at once",
+            submit.width()
+        );
+
         let me = Arc::new(Self {
             http: http.clone(),
             router,
@@ -329,6 +362,7 @@ impl Executor {
             execute,
             plans,
             fees,
+            submit,
             last_fire: Mutex::new(HashMap::new()),
             next_nonce: Mutex::new(None),
         });
@@ -514,12 +548,26 @@ impl Executor {
     /// is armed and calibrated; unlike a buy, this is not racing anyone, so a
     /// model that cannot answer falls back to asking the router even when that
     /// costs a bisection, rather than skipping the sale.
+    ///
+    /// `live` is what the feed last saw of the pool being sold into, and the
+    /// model is not trusted without it. A sale carries no signal of its own, so
+    /// without this every hop would come from the calibration snapshot - and a
+    /// snapshot written on a timer prices a falling market at the price it used
+    /// to have, which is how a sale comes to sign an `amountOutMinimum` the
+    /// pool can no longer pay and reverts.
+    ///
+    /// `retry` says this sale has already reverted once. The model does not get
+    /// a second go at it: the chain has just disagreed with whatever it
+    /// believed, and the router prices the next attempt at whatever is true
+    /// now, however long that takes.
     pub async fn sell_all(
         self: &Arc<Self>,
         key: PoolRef,
         route: &Route,
         slippage_pct: f64,
         limit: Option<U256>,
+        live: Option<LiveState>,
+        retry: bool,
     ) -> Result<Option<Fill>> {
         let token = route.output.address;
         let balance = swap::balance_of(&self.http, token, self.owner).await?;
@@ -567,7 +615,37 @@ impl Executor {
         // buy: a reversed route that ends on v3 is quoted by bisection, which
         // is twenty-odd calls rather than one, and unlike a buy a sale is not
         // racing anyone, so the fallback stays.
-        let modelled = match self.plans.get(&key) {
+        // The pool being sold into, as the feed last saw it. The fee comes from
+        // the log when it carried one, else from the route's own configured
+        // fee - the same order a buy uses.
+        let fresh = live.and_then(|l| {
+            let fee = l.lp_fee.or_else(|| {
+                route
+                    .hops
+                    .iter()
+                    .find(|h| h.pool_ref() == key)
+                    .map(|h| h.fee)
+                    .filter(|f| u64::from(*f) < PPM)
+            })?;
+            Some((
+                key,
+                HopState {
+                    sqrt_p: crate::pool::sqrt_to_f64(l.sqrt),
+                    liquidity: l.liquidity,
+                    lp_fee: fee,
+                    protocol_fee_0for1: 0,
+                    protocol_fee_1for0: 0,
+                },
+            ))
+        });
+        if fresh.is_none() && !retry {
+            info!(
+                route = %sell.name,
+                "no live state for this pool - asking the router rather than pricing \
+                 this sale from a snapshot"
+            );
+        }
+        let modelled = match self.plans.get(&key).filter(|_| !retry && fresh.is_some()) {
             Some(plan) => {
                 // The fee check uses the figure measured in this direction when
                 // the token was held long enough to measure it; otherwise the
@@ -579,7 +657,7 @@ impl Executor {
                     m => m,
                 };
                 match self.unstated_fee_acceptable(plan, ppm) {
-                    true => self.model_quote(plan, &sell, None, ppm).await,
+                    true => self.model_quote(plan, &sell, fresh, ppm).await,
                     false => None,
                 }
             }
@@ -606,6 +684,12 @@ impl Executor {
             sell = format!("{} {}", format_units(size, sell.input.decimals), sell.input.symbol),
             quoted = format!("{} {}", format_units(amount_out, sell.output.decimals), sell.output.symbol),
             priced_by,
+            // Whether this was priced against the pool as the feed last saw it
+            // or against a snapshot. A sale priced from a snapshot in a falling
+            // market is how an amountOutMinimum gets signed that the pool can
+            // no longer pay, so it belongs in the line that records the sale.
+            from_live_state = fresh.is_some(),
+            retry,
             min_out = format!("{} {}", format_units(min_out, sell.output.decimals), sell.output.symbol),
             slippage_pct,
             "TAKE PROFIT"
@@ -621,7 +705,7 @@ impl Executor {
             .unwrap_or_else(|_| U256::from(GAS_FALLBACK));
         let seen = swap::pending_nonce(&self.http, self.owner).await.ok();
         let nonce = self.claim_nonce(seen).await?;
-        match swap::send_nowait(&self.http, &self.wallet, &tx, nonce.into(), fees, gas).await {
+        match swap::send_nowait(&self.submit, &self.wallet, &tx, nonce.into(), fees, gas).await {
             Ok(hash) => {
                 info!(route = %sell.name, ?hash, nonce, "sold");
                 Ok(Some(Fill { hash, sold: size, amount_out }))
@@ -840,7 +924,16 @@ impl Executor {
         let gas_limit = U256::from(plan.gas_limit.load(Ordering::Relaxed));
         let nonce = self.claim_nonce(quoted.nonce_seen).await?;
         let started = Instant::now();
-        match swap::send_nowait(&self.http, &self.wallet, tx, nonce.into(), fees, gas_limit).await {
+        match swap::send_nowait(
+            &self.submit,
+            &self.wallet,
+            tx,
+            nonce.into(),
+            fees,
+            gas_limit,
+        )
+        .await
+        {
             Ok(hash) => {
                 info!(route = %name, ?hash, nonce, %gas_limit,
                       send_ms = started.elapsed().as_millis(), "sent");

@@ -78,6 +78,18 @@ impl BigSellMeter {
         self.price
     }
 
+    /// Everything the last swap said about this pool, for pricing a trade
+    /// against it right now. This is the same information a buy gets from the
+    /// log that raised its signal - a sale has no signal, but the feed has been
+    /// delivering it all along.
+    pub fn last_state(&self) -> Option<crate::executor::LiveState> {
+        Some(crate::executor::LiveState {
+            sqrt: self.sqrt?,
+            liquidity: self.liquidity,
+            lp_fee: self.lp_fee,
+        })
+    }
+
     /// Feed a tick. Returns a Signal when a BIG SELL fired.
     pub fn observe(&mut self, t: &Tick) -> Option<Signal> {
         match self.cur_block {
@@ -919,9 +931,19 @@ impl Strategy {
         // Never more than this bot bought. The wallet may hold more, and what
         // it holds beyond our own fills is not ours to sell.
         let limit = self.inventory.get(token).map(|p| p.held());
+        // What the pool looks like NOW, straight off the feed. Without this a
+        // sale is priced entirely from the calibration snapshot, which is
+        // refreshed on a timer and can be minutes behind - and a sale is
+        // exactly the moment the price is moving.
+        let live = w.meter.last_state();
+        // A sale that already reverted is not re-quoted by the model. Whatever
+        // the model believed, the chain has just disagreed with it, and the
+        // router prices the retry honestly at whatever the price now is.
+        let retry = w.sell_attempts > 0;
         let back = self.reports.clone();
         tokio::spawn(async move {
-            let report = match exec.sell_all(pool, &route, route.max_slippage_pct, limit).await {
+            let priced = exec.sell_all(pool, &route, route.max_slippage_pct, limit, live, retry);
+            let report = match priced.await {
                 // Held, not closed: the position stays on the books until the
                 // chain confirms it is gone.
                 Ok(Some(fill)) => Report::Filled {

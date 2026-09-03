@@ -45,6 +45,20 @@ pub struct Config {
     /// HTTP_URL environment variable for the same reason as `ws_url`.
     #[serde(default)]
     pub http_url: String,
+    /// Endpoints to broadcast signed transactions through, all at once.
+    ///
+    /// Submission is the only round trip a buy waits on and the one that
+    /// decides whether the trade exists, so it is worth not depending on a
+    /// single node's queue or a single node's uptime. Every endpoint here is
+    /// handed the identical signed transaction and the first to take it wins;
+    /// the rest keep going, because being in more than one mempool is the
+    /// point. Reads are unaffected - they still go to `http_url`.
+    ///
+    /// Empty means "just use `http_url`", which is what this did before. Set
+    /// via SUBMIT_URLS (comma-separated) for the same reason as `ws_url`: these
+    /// carry API keys.
+    #[serde(default)]
+    pub submit_urls: Vec<String>,
     /// Signal when price moves >= threshold % between consecutive blocks.
     pub threshold_pct: f64,
     /// Assumed price move (%) for the depth estimate: "how much can I buy if the
@@ -230,6 +244,13 @@ impl Config {
         if let Some(v) = env_var("HTTP_URL") {
             cfg.http_url = v;
         }
+        if let Some(v) = env_var("SUBMIT_URLS") {
+            cfg.submit_urls = v
+                .split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect();
+        }
         if let Some(v) = env_var("PRIVATE_KEY") {
             cfg.private_key = Secret(v);
         }
@@ -256,6 +277,12 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
         !cfg.http_url.trim().is_empty(),
         "no http endpoint: set the HTTP_URL environment variable, or http_url in config"
     );
+    for (i, u) in cfg.submit_urls.iter().enumerate() {
+        anyhow::ensure!(
+            !u.trim().is_empty(),
+            "submit_urls[{i}] is empty - remove the entry rather than leaving a blank one"
+        );
+    }
     for (ticker, addr) in &cfg.tokens {
         anyhow::ensure!(!ticker.is_empty(), "[tokens] has an empty ticker");
         addr.parse::<ethers::types::Address>().map_err(|e| {

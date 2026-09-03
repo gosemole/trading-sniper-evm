@@ -276,7 +276,7 @@ pub async fn fee_params(http: &Provider<Http>) -> Result<(U256, U256)> {
 /// receipt either - the transaction is on its way regardless, and waiting is
 /// the part that would hold everything else up.
 pub async fn send_nowait(
-    http: &Provider<Http>,
+    to: &Broadcaster,
     wallet: &LocalWallet,
     tx: &PendingTx,
     nonce: U256,
@@ -299,11 +299,164 @@ pub async fn send_nowait(
         .sign_transaction(&typed)
         .await
         .context("signing transaction")?;
-    let pending = http
-        .send_raw_transaction(typed.rlp_signed(&sig))
-        .await
-        .context("broadcasting transaction")?;
-    Ok(pending.tx_hash())
+    // The hash is a property of the signed bytes, not of whoever accepted
+    // them: every endpoint is handed the identical transaction and would
+    // report the identical hash. Computing it here means the hash is known
+    // even when the endpoint that accepted it answers slowly, or answers
+    // oddly, and it is the same hash the receipt will be found under.
+    let raw = typed.rlp_signed(&sig);
+    let hash = H256::from(ethers::utils::keccak256(&raw));
+    to.send(raw, hash).await
+}
+
+/// Somewhere to submit a signed transaction - one endpoint or several.
+///
+/// Submission is the only round trip a buy actually waits on, and it is the one
+/// that decides whether the trade exists at all. A single endpoint makes that a
+/// single point of failure and a single queue to sit in; several, written to at
+/// once, mean the transaction is in the fastest mempool that answered rather
+/// than in whichever one happened to be configured.
+///
+/// Everything else - calls, gas, receipts - still goes to the one HTTP endpoint
+/// this is built alongside. Only the broadcast fans out, because only the
+/// broadcast benefits: a read answered twice is the same answer.
+pub struct Broadcaster {
+    endpoints: Vec<Endpoint>,
+}
+
+struct Endpoint {
+    http: Provider<Http>,
+    /// Scheme and host only. Endpoint URLs carry API keys in their path or
+    /// query, and a log line is exactly the place one should not appear.
+    label: String,
+}
+
+/// Scheme and host of a URL, with any credential-bearing path, query or
+/// userinfo dropped. Falls back to a fixed placeholder rather than to the URL
+/// itself, so a URL this cannot parse still cannot leak a key into a log.
+fn endpoint_label(url: &str) -> String {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let scheme = url.split("://").next().unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Anything before an `@` is userinfo, which is a credential.
+    let host = authority.rsplit('@').next().unwrap_or("");
+    match (scheme.is_empty() || scheme == url, host.is_empty()) {
+        (_, true) => "endpoint".to_string(),
+        (true, false) => host.to_string(),
+        (false, false) => format!("{scheme}://{host}"),
+    }
+}
+
+impl Broadcaster {
+    /// Build from a list of endpoint URLs, in the order they are preferred for
+    /// reporting. An empty list is a configuration error rather than a silent
+    /// no-op: nothing could ever be sent.
+    pub fn new(urls: &[String]) -> Result<Self> {
+        anyhow::ensure!(!urls.is_empty(), "no endpoint to broadcast through");
+        let mut endpoints = Vec::with_capacity(urls.len());
+        for url in urls {
+            let http = Provider::<Http>::try_from(url.clone())
+                .with_context(|| format!("bad submit endpoint '{}'", endpoint_label(url)))?;
+            let label = endpoint_label(url);
+            endpoints.push(Endpoint { http, label });
+        }
+        Ok(Self { endpoints })
+    }
+
+    /// How many endpoints a broadcast reaches.
+    pub fn width(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    /// The endpoints this will submit through, for logging at startup.
+    pub fn labels(&self) -> Vec<&str> {
+        self.endpoints.iter().map(|e| e.label.as_str()).collect()
+    }
+
+    /// Keep every submission connection warm, for the reason `keep_warm`
+    /// explains: a cold connection pays a TLS handshake on exactly the request
+    /// a buy is waiting for, and these are the requests a buy waits for.
+    pub fn keep_warm(self: &Arc<Self>) {
+        for (i, _) in self.endpoints.iter().enumerate() {
+            let me = Arc::clone(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    let _ = me.endpoints[i].http.get_chainid().await;
+                }
+            });
+        }
+    }
+
+    /// Submit the same signed transaction to every endpoint at once, and return
+    /// as soon as one of them has taken it.
+    ///
+    /// Each send runs in a task of its own rather than as a future this selects
+    /// over, because returning early from a select DROPS the futures it did not
+    /// pick - which would cancel the very requests this exists to make. Here
+    /// the slower endpoints finish on their own; having the transaction in more
+    /// than one mempool is the point, not a side effect to be tidied away.
+    ///
+    /// An endpoint answering "already known" is counted as success: it means
+    /// the transaction is in that mempool, which is all this was asking for.
+    /// The whole call fails only when no endpoint took it, and then the caller
+    /// treats the nonce as unspent - which is why a false success here would be
+    /// far worse than a false failure.
+    async fn send(&self, raw: ethers::types::Bytes, hash: H256) -> Result<H256> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(self.endpoints.len().max(1));
+        for endpoint in &self.endpoints {
+            // Cloning the provider clones a handle to the same connection
+            // pool, so the warm connection is the one that gets used.
+            let http = endpoint.http.clone();
+            let label = endpoint.label.clone();
+            let raw = raw.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let outcome = http.send_raw_transaction(raw).await;
+                let took = started.elapsed().as_millis();
+                let ok = match &outcome {
+                    Ok(_) => true,
+                    Err(e) => already_in_a_mempool(&e.to_string()),
+                };
+                match ok {
+                    true => tracing::debug!(endpoint = %label, took_ms = took, "submitted"),
+                    false => tracing::warn!(
+                        endpoint = %label, took_ms = took,
+                        err = %outcome.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
+                        "submit endpoint refused the transaction"
+                    ),
+                }
+                let _ = tx.send((label, ok, took)).await;
+            });
+        }
+        drop(tx);
+
+        let mut refused = 0usize;
+        while let Some((label, ok, took)) = rx.recv().await {
+            if ok {
+                tracing::info!(endpoint = %label, took_ms = took, ?hash, "broadcast");
+                return Ok(hash);
+            }
+            refused += 1;
+        }
+        anyhow::bail!("every submit endpoint refused the transaction ({refused} tried)")
+    }
+}
+
+/// Whether an error from `eth_sendRawTransaction` means the node already holds
+/// this transaction, which is the outcome asked for rather than a failure.
+///
+/// Deliberately narrow. "nonce too low" is NOT here: it can equally mean the
+/// nonce is genuinely spent, and reading that as success would leave a buy
+/// believing in a transaction that will never exist. Being wrong in that
+/// direction costs a position; being wrong the other way costs one retry.
+fn already_in_a_mempool(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("already known")
+        || e.contains("known transaction")
+        || e.contains("alreadyknown")
+        || e.contains("transaction already exists")
 }
 
 /// What this transaction would cost to run right now, with headroom.
@@ -651,6 +804,59 @@ mod tests {
             Address::zero(),
         );
         assert!(e.is_err());
+    }
+
+    /// Endpoint URLs carry API keys in their path or query, and these labels
+    /// go straight into log lines. Nothing after the host may survive.
+    #[test]
+    fn an_endpoint_label_cannot_carry_a_key() {
+        let host = "https://rpc.example.com";
+        let cases = [
+            ("https://rpc.example.com/v2/SECRETKEY", host),
+            ("https://rpc.example.com/?apikey=SECRET", host),
+            ("https://user:PASSWORD@rpc.example.com/x", host),
+            ("http://127.0.0.1:8545", "http://127.0.0.1:8545"),
+            ("rpc.example.com/SECRET", "rpc.example.com"),
+        ];
+        for (url, want) in cases {
+            let got = endpoint_label(url);
+            assert_eq!(got, want, "from {url}");
+            assert!(!got.contains("SECRET"), "{got} still carries the key");
+            assert!(!got.contains("PASSWORD"), "{got} carries the password");
+        }
+        // Anything unparseable becomes a placeholder rather than the URL, so
+        // the fallback cannot leak either.
+        assert_eq!(endpoint_label(""), "endpoint");
+    }
+
+    /// A node saying it already holds the transaction has done what was asked.
+    /// Anything ambiguous must not be read that way: treating a real refusal as
+    /// a send leaves a buy waiting on a receipt that will never come, and the
+    /// nonce counter believing a number was spent.
+    #[test]
+    fn only_an_unambiguous_duplicate_counts_as_sent() {
+        assert!(already_in_a_mempool("already known"));
+        assert!(already_in_a_mempool("known transaction: 0xabc"));
+        assert!(already_in_a_mempool("ALREADY KNOWN"));
+        assert!(already_in_a_mempool("transaction already exists"));
+
+        // "nonce too low" can equally mean genuinely spent, so it stays out.
+        assert!(!already_in_a_mempool("nonce too low"));
+        assert!(!already_in_a_mempool("replacement transaction underpriced"));
+        assert!(!already_in_a_mempool("insufficient funds for gas"));
+        assert!(!already_in_a_mempool("intrinsic gas too low"));
+        assert!(!already_in_a_mempool("connection reset by peer"));
+        assert!(!already_in_a_mempool(""));
+    }
+
+    /// An empty endpoint list is a configuration error, not a broadcaster that
+    /// silently sends nothing.
+    #[test]
+    fn a_broadcaster_needs_somewhere_to_send() {
+        assert!(Broadcaster::new(&[]).is_err());
+        let one = Broadcaster::new(&["http://127.0.0.1:8545".to_string()]).unwrap();
+        assert_eq!(one.width(), 1);
+        assert_eq!(one.labels(), vec!["http://127.0.0.1:8545"]);
     }
 
     #[test]

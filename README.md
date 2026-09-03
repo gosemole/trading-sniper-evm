@@ -19,6 +19,8 @@ set -a; source ~/.config/mm-fall.env; set +a
 ```
 WS_URL       wss:// endpoint, for live swap logs
 HTTP_URL     https:// endpoint, for calls
+SUBMIT_URLS  comma-separated https:// endpoints to broadcast through, all at
+             once. Optional; empty means just HTTP_URL
 PRIVATE_KEY  32-byte hex signing key, needed only to trade
 ```
 
@@ -185,6 +187,22 @@ leaves the previous state rather than half of the new one.
 - Positions recorded before this existed carry the mid price as their entry and
   assume a free exit. They stay slightly optimistic until the next buy averages
   in a real fill; there is nothing to recompute them from.
+- Broadcasting fans out and nothing else does. Every endpoint in `submit_urls`
+  is handed the identical signed transaction at the same moment, and the first
+  one to take it decides the answer; the others keep going, because having the
+  transaction in more than one mempool is the point rather than a leftover. The
+  hash is computed from the signed bytes rather than taken from a reply, so it
+  is the same hash whoever accepts. Reads - calls, gas, receipts - still go to
+  `http_url` alone: an answer fetched twice is the same answer.
+- Every submission connection is kept warm on its own timer. A reused
+  connection answers in about 50ms and a cold one pays a TLS handshake for
+  350-400ms, landing on exactly the request a buy waits for.
+- A sale is priced against the pool as the feed last saw it, never against a
+  snapshot alone. Without live state for the pool being sold into, the sale
+  asks the router instead, and a sale that has already reverted once asks the
+  router whatever happens - the chain has just disagreed with the model, and
+  the retry is not the place to argue. A sale is not racing anyone, so paying
+  for an honest quote costs nothing that matters.
 - A buy is priced entirely from memory and never asks the router, so nothing
   rehearses it. The pool that dropped is priced from the very log that raised
   the signal - price, liquidity and the fee it actually charged; any other hop
