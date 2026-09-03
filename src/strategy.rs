@@ -165,11 +165,18 @@ pub enum Report {
         side: Side,
         token: ethers::types::Address,
         symbol: String,
-        qty: f64,
+        decimals: u8,
+        /// Raw units the trade was quoted at; the receipt overrides it.
+        raw: ethers::types::U256,
         price: f64,
     },
-    /// The chain answered.
-    Settled { hash: H256, pool: PoolRef, ok: bool },
+    /// The chain answered, with what the receipt says actually moved.
+    Settled {
+        hash: H256,
+        pool: PoolRef,
+        ok: bool,
+        moved: Option<ethers::types::U256>,
+    },
     /// A sale could not even be broadcast.
     SellFailed { pool: PoolRef },
     /// A sale was not attempted after all - a dry run, or nothing held.
@@ -182,6 +189,7 @@ struct Settled {
     hash: H256,
     pool: PoolRef,
     ok: bool,
+    moved: Option<ethers::types::U256>,
 }
 
 /// How many times a sale is retried before the pair is left alone. A sale that
@@ -219,14 +227,16 @@ impl Strategy {
     /// would never be sold again.
     pub async fn resolve_pending(&mut self) {
         for (hash, p) in self.inventory.unsettled() {
-            let outcome = crate::swap::await_receipt(&self.http, hash, "restored").await;
-            let side = if outcome.happened() {
-                self.inventory.settle(hash)
+            let landed = crate::swap::await_receipt(&self.http, hash, "restored").await;
+            let token = p.token.parse().unwrap_or_default();
+            let side = if landed.outcome.happened() {
+                let moved = self.moved_in(&landed, p.side, token);
+                self.inventory.settle(hash, moved)
             } else {
                 self.inventory.rollback(hash)
             };
             info!(
-                tx = ?hash, ?side, token = %p.symbol, outcome = ?outcome,
+                tx = ?hash, ?side, token = %p.symbol, outcome = ?landed.outcome,
                 "resolved a trade left in flight"
             );
         }
@@ -237,19 +247,41 @@ impl Strategy {
 
     /// Follow a transaction and bring its outcome back to the one place that
     /// may act on it.
-    fn follow(&self, hash: H256, pool: PoolRef, label: String) {
+    fn follow(&self, hash: H256, pool: PoolRef, token: ethers::types::Address, label: String) {
         let http = self.http.clone();
         let back = self.reports.clone();
+        let owner = self.exec.as_ref().map(|e| e.owner());
         tokio::spawn(async move {
-            let outcome = crate::swap::await_receipt(&http, hash, &label).await;
+            let landed = crate::swap::await_receipt(&http, hash, &label).await;
+            // What the receipt says arrived, not what the quote promised. For a
+            // sale nothing arrives in this token, so there is nothing to read
+            // and the reserved amount stands.
+            let moved = owner.and_then(|o| crate::swap::received(&landed.logs, token, o));
             let _ = back
                 .send(Report::Settled {
                     hash,
                     pool,
-                    ok: outcome.happened(),
+                    ok: landed.outcome.happened(),
+                    moved,
                 })
                 .await;
         });
+    }
+
+    /// What a settled trade moved in the token it is about.
+    fn moved_in(
+        &self,
+        landed: &crate::swap::Landed,
+        side: Side,
+        token: ethers::types::Address,
+    ) -> Option<ethers::types::U256> {
+        // Only a buy delivers the token to us; a sale sends it away, and its
+        // size is the amount we asked to sell.
+        if side != Side::Buy {
+            return None;
+        }
+        let owner = self.exec.as_ref()?.owner();
+        crate::swap::received(&landed.logs, token, owner)
     }
 
     /// Watch a pool for a drop of `threshold_pct` inside one block.
@@ -370,12 +402,8 @@ impl Strategy {
                 match exec.on_drop(&p, &s).await {
                     Ok(Some(fill)) => {
                         let Some(token) = p.base_currency() else { return };
-                        let (qty, symbol) = match exec.route_for(key) {
-                            Some(r) => (
-                                crate::route::u256_to_f64(fill.amount_out)
-                                    / 10f64.powi(r.output.decimals as i32),
-                                r.output.symbol.clone(),
-                            ),
+                        let (symbol, decimals) = match exec.route_for(key) {
+                            Some(r) => (r.output.symbol.clone(), r.output.decimals),
                             None => return,
                         };
                         let _ = back
@@ -385,7 +413,8 @@ impl Strategy {
                                 side: Side::Buy,
                                 token,
                                 symbol,
-                                qty,
+                                decimals,
+                                raw: fill.amount_out,
                                 price: s.price,
                             })
                             .await;
@@ -404,11 +433,19 @@ impl Strategy {
     /// or was never real.
     async fn on_report(&mut self, r: Report) {
         let s = match r {
-            Report::Filled { hash, pool, side, token, symbol, qty, price } => {
-                if self.inventory.reserve(hash, side, token, &symbol, qty, price) {
+            Report::Filled { hash, pool, side, token, symbol, decimals, raw, price } => {
+                let trade = crate::inventory::Trade {
+                    side,
+                    token,
+                    symbol: symbol.clone(),
+                    decimals,
+                    raw,
+                    price,
+                };
+                if self.inventory.reserve(hash, trade) {
                     self.save();
-                    info!(tx = ?hash, token = %symbol, ?side, qty, price, "reserved");
-                    self.follow(hash, pool, format!("{side:?} {symbol}").to_lowercase());
+                    info!(tx = ?hash, token = %symbol, ?side, %raw, price, "reserved");
+                    self.follow(hash, pool, token, format!("{side:?} {symbol}").to_lowercase());
                 }
                 return;
             }
@@ -424,10 +461,10 @@ impl Strategy {
                 }
                 return;
             }
-            Report::Settled { hash, pool, ok } => Settled { hash, pool, ok },
+            Report::Settled { hash, pool, ok, moved } => Settled { hash, pool, ok, moved },
         };
         let side = if s.ok {
-            self.inventory.settle(s.hash)
+            self.inventory.settle(s.hash, s.moved)
         } else {
             self.inventory.rollback(s.hash)
         };
@@ -567,9 +604,13 @@ impl Strategy {
             return;
         };
         let symbol = route.output.symbol.clone();
+        let decimals = route.output.decimals;
+        // Never more than this bot bought. The wallet may hold more, and what
+        // it holds beyond our own fills is not ours to sell.
+        let limit = self.inventory.get(token).map(|p| p.held());
         let back = self.reports.clone();
         tokio::spawn(async move {
-            let report = match exec.sell_all(&route, route.max_slippage_pct).await {
+            let report = match exec.sell_all(pool, &route, route.max_slippage_pct, limit).await {
                 // Held, not closed: the position stays on the books until the
                 // chain confirms it is gone.
                 Ok(Some(fill)) => Report::Filled {
@@ -578,7 +619,10 @@ impl Strategy {
                     side: Side::Sell,
                     token,
                     symbol,
-                    qty: 0.0,
+                    decimals,
+                    // What the sale asked to move, so settling subtracts
+                    // exactly that from the position.
+                    raw: fill.sold,
                     price: 0.0,
                 },
                 Ok(None) => Report::SellSkipped { pool },

@@ -65,6 +65,11 @@ struct Plan {
     /// in practice a hook charging its own fee on top of the pool's. Zero means
     /// it has not been measured yet.
     yield_ppm: AtomicU64,
+    /// The same, measured in the selling direction. A hook is free to charge
+    /// differently each way, so this is measured rather than assumed - but it
+    /// can only be measured while the token is actually held, so it falls back
+    /// to the buying figure until then.
+    sell_yield_ppm: AtomicU64,
     /// Last known price and liquidity of every pool on the route, so a quote
     /// can be worked out without asking anyone.
     state: Mutex<Option<RouteState>>,
@@ -86,6 +91,9 @@ struct HopState {
 /// A transaction that actually went out, and what it was expected to produce.
 pub struct Fill {
     pub hash: ethers::types::H256,
+    /// Raw units the trade was asked to move on the way in. For a sale this is
+    /// exactly what leaves the position.
+    pub sold: U256,
     /// Quoted output in raw units. What lands can differ by less than the
     /// slippage tolerance, and never by more - `amountOutMinimum` sees to that.
     pub amount_out: U256,
@@ -254,6 +262,7 @@ impl Executor {
                     cooldown: Duration::from_secs(rc.cooldown_secs),
                     gas_limit: AtomicU64::new(gas_limit),
                     yield_ppm: AtomicU64::new(0),
+                    sell_yield_ppm: AtomicU64::new(0),
                     state: Mutex::new(None),
                 },
             );
@@ -365,6 +374,12 @@ impl Executor {
                 .collect(),
         });
 
+        // The same measurement the other way round, while we hold enough of
+        // the token to ask. A hook may charge differently by direction, and the
+        // only way to know is to look; until then a sale borrows the buying
+        // figure, which is an assumption rather than a measurement.
+        self.measure_sell_yield(plan, at).await;
+
         let previous = plan.yield_ppm.swap(ppm, Ordering::Relaxed);
         let taken_pct = (PPM.saturating_sub(ppm.min(PPM))) as f64 / 10_000.0;
         let moved = previous != 0 && previous.abs_diff(ppm) > YIELD_ALERT_PPM;
@@ -388,6 +403,11 @@ impl Executor {
 
     /// React to one big-sell signal.
     /// React to one big-sell signal: decide, price, sign, send.
+    /// The address everything is signed and settled from.
+    pub fn owner(&self) -> Address {
+        self.owner
+    }
+
     /// The route armed against this pool, for a caller that needs to trade it
     /// in the other direction.
     pub fn route_for(&self, key: PoolRef) -> Option<&Route> {
@@ -438,7 +458,7 @@ impl Executor {
         }
         let amount_out = quoted.amount_out;
         let hash = self.broadcast(key, plan, &tx, quoted).await?;
-        Ok(Some(Fill { hash, amount_out }))
+        Ok(Some(Fill { hash, sold: route.amount_in, amount_out }))
     }
 
     /// Sell everything held of what a route buys, back down that same route.
@@ -448,20 +468,45 @@ impl Executor {
     /// or topped up by hand is still one balance. Unlike a buy, this is not
     /// racing anyone, so it is priced by asking the router even when that costs
     /// a bisection.
-    pub async fn sell_all(self: &Arc<Self>, route: &Route, slippage_pct: f64) -> Result<Option<Fill>> {
+    pub async fn sell_all(
+        self: &Arc<Self>,
+        key: PoolRef,
+        route: &Route,
+        slippage_pct: f64,
+        limit: Option<U256>,
+    ) -> Result<Option<Fill>> {
         let token = route.output.address;
-        let held = swap::balance_of(&self.http, token, self.owner).await?;
-        if held.is_zero() {
-            info!(token = %route.output.symbol, "nothing held; not selling");
+        let balance = swap::balance_of(&self.http, token, self.owner).await?;
+        // The lesser of what we hold and what we bought. The balance alone
+        // would sell tokens that arrived some other way - a manual buy, a
+        // transfer - which are not this bot's to sell. What we bought alone is
+        // a quote rather than a measurement, so it can exceed what actually
+        // landed and would simply fail.
+        let size = limit.map_or(balance, |l| l.min(balance));
+        if size.is_zero() {
+            info!(
+                token = %route.output.symbol,
+                %balance,
+                limit = ?limit,
+                "nothing to sell"
+            );
             return Ok(None);
         }
-        let sell = route.reversed(held);
+        if size < balance {
+            info!(
+                token = %route.output.symbol,
+                selling = %format_units(size, route.output.decimals),
+                held = %format_units(balance, route.output.decimals),
+                "selling only what this bot bought"
+            );
+        }
+        let sell = route.reversed(size);
         if sell.input.address != Address::zero() {
             let (erc20, p2) =
                 swap::check_approvals(&self.http, sell.input.address, self.owner, self.permit2, self.router)
                     .await?;
             anyhow::ensure!(
-                erc20 >= held && p2 >= held,
+                erc20 >= size && p2 >= size,
                 "{} is not approved for the router (erc20->permit2 {erc20}, permit2->router {p2}); \
                  run --approve {} --execute first",
                 sell.input.symbol,
@@ -470,19 +515,44 @@ impl Executor {
         }
 
         let deadline = execute::deadline_in(300);
-        let quote = execute::verify(
-            &self.http, self.router, self.owner, &sell, U256::zero(), deadline, None,
-        )
-        .await
-        .context("quoting the sale")?;
-        let min_out = execute::apply_slippage(quote.amount_out, slippage_pct);
+        // The model gets first refusal here too. It matters more on a sale than
+        // on a buy: a reversed route that ends on v3 is quoted by bisection,
+        // which is twenty-odd calls rather than one.
+        let modelled = match (self.model_pricing, self.plans.get(&key)) {
+            (true, Some(plan)) => {
+                // Measured in this direction when the token was held long
+                // enough to measure it; otherwise the buying figure, which
+                // assumes the hook charges the same both ways.
+                let measured = plan.sell_yield_ppm.load(Ordering::Relaxed);
+                let ppm = match measured {
+                    0 => plan.yield_ppm.load(Ordering::Relaxed),
+                    m => m,
+                };
+                self.model_quote(plan, &sell, ppm, None).await
+            }
+            _ => None,
+        };
+        let (amount_out, priced_by) = match modelled {
+            Some(a) => (a, "model"),
+            None => (
+                execute::verify(
+                    &self.http, self.router, self.owner, &sell, U256::zero(), deadline, None,
+                )
+                .await
+                .context("quoting the sale")?
+                .amount_out,
+                "router",
+            ),
+        };
+        let min_out = execute::apply_slippage(amount_out, slippage_pct);
         anyhow::ensure!(!min_out.is_zero(), "the sale's amountOutMinimum rounds to zero");
         let tx = execute::pending_swap(self.router, &sell, min_out, deadline)?;
 
         info!(
             route = %sell.name,
-            sell = format!("{} {}", format_units(held, sell.input.decimals), sell.input.symbol),
-            quoted = format!("{} {}", format_units(quote.amount_out, sell.output.decimals), sell.output.symbol),
+            sell = format!("{} {}", format_units(size, sell.input.decimals), sell.input.symbol),
+            quoted = format!("{} {}", format_units(amount_out, sell.output.decimals), sell.output.symbol),
+            priced_by,
             min_out = format!("{} {}", format_units(min_out, sell.output.decimals), sell.output.symbol),
             slippage_pct,
             "TAKE PROFIT"
@@ -501,7 +571,7 @@ impl Executor {
         match swap::send_nowait(&self.http, &self.wallet, &tx, nonce.into(), fees, gas).await {
             Ok(hash) => {
                 info!(route = %sell.name, ?hash, nonce, "sold");
-                Ok(Some(Fill { hash, amount_out: quote.amount_out }))
+                Ok(Some(Fill { hash, sold: size, amount_out }))
             }
             Err(e) => {
                 *self.next_nonce.lock().await = None;
@@ -577,7 +647,23 @@ impl Executor {
     ) -> Result<Quoted> {
         let started = Instant::now();
         let modelled = match self.model_pricing {
-            true => self.model_quote(plan, key, sig).await,
+            true => {
+                let fresh = (
+                    key,
+                    HopState {
+                        sqrt_p: crate::pool::sqrt_to_f64(sig.sqrt),
+                        liquidity: sig.liquidity,
+                        lp_fee: sig.lp_fee.unwrap_or(0),
+                    },
+                );
+                self.model_quote(
+                    plan,
+                    &plan.route,
+                    plan.yield_ppm.load(Ordering::Relaxed),
+                    sig.lp_fee.map(|_| fresh),
+                )
+                .await
+            }
             false => None,
         };
         // A nonce is only spent by a real send, so a dry run does not ask.
@@ -664,22 +750,85 @@ impl Executor {
         });
     }
 
-    /// Price the route without asking anyone, or say why not.
+    /// What the route yields sold back down, against what the model expects.
     ///
-    /// The pool that just dropped needs no lookup at all: its price, its
-    /// liquidity and the fee it actually charged all arrive in the log that
-    /// raised the signal, and they describe the pool as of that very swap. The
-    /// other pools come from the last calibration pass, which is fair because
-    /// they are not the ones that just moved. What the model cannot see - a
-    /// hook taking its own cut - is exactly what `yield_ppm` measures, so it is
-    /// applied on top.
+    /// Only possible while the token is held: quoting a sale means settling it
+    /// through Permit2, and a balance of nothing settles nothing.
+    async fn measure_sell_yield(&self, plan: &Plan, at: u64) {
+        let route = &plan.route;
+        let held = match swap::balance_of(&self.http, route.output.address, self.owner).await {
+            Ok(h) if !h.is_zero() => h,
+            _ => return,
+        };
+        let sell = route.reversed(held);
+        let local = match sell.quote(&self.http, self.manager, Some(at)).await {
+            Ok(q) if !q.amount_out.is_zero() => q,
+            _ => return,
+        };
+        let onchain = match execute::verify(
+            &self.http,
+            self.router,
+            self.owner,
+            &sell,
+            local.amount_out,
+            execute::deadline_in(600),
+            Some(at),
+        )
+        .await
+        {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::debug!(route = %route.name, err = %format!("{e:#}"),
+                                "could not measure the selling direction");
+                return;
+            }
+        };
+        let ppm = (onchain.amount_out * U256::from(PPM) / local.amount_out)
+            .min(U256::from(u64::MAX))
+            .as_u64();
+        let previous = plan.sell_yield_ppm.swap(ppm, Ordering::Relaxed);
+        let taken = (PPM.saturating_sub(ppm.min(PPM))) as f64 / 10_000.0;
+        if previous != 0 && previous.abs_diff(ppm) > YIELD_ALERT_PPM {
+            warn!(
+                route = %route.name,
+                was_pct = (PPM.saturating_sub(previous.min(PPM))) as f64 / 10_000.0,
+                now_pct = taken,
+                "the SELLING side's unstated fee CHANGED"
+            );
+        } else {
+            info!(
+                route = %route.name,
+                unstated_fee_pct = format!("{taken:.4}"),
+                yield_ppm = ppm,
+                "sell yield measured"
+            );
+        }
+    }
+
+    /// Price a route without asking anyone, or say why not.
+    ///
+    /// The pool that just moved needs no lookup: its price, its liquidity and
+    /// the fee it actually charged all arrive in the log that raised the
+    /// signal, and they describe the pool as of that very swap. The others come
+    /// from the last calibration pass, which is fair because they are not the
+    /// ones that moved. What the model cannot see - a hook taking its own cut -
+    /// is what `yield_ppm` measures, and it is applied on top.
+    ///
+    /// Works in either direction: the cached state describes a pool, not a
+    /// direction, so a reversed route reads the same numbers and only the
+    /// `zeroForOne` of each hop differs.
     ///
     /// Returns `None` whenever anything is missing or out of range, and the
     /// caller then asks the router as before. Being slow is recoverable;
     /// signing a wrong minimum is not.
-    async fn model_quote(&self, plan: &Plan, trigger: PoolRef, sig: &Signal) -> Option<U256> {
-        let yield_ppm = plan.yield_ppm.load(Ordering::Relaxed);
-        if yield_ppm == 0 {
+    async fn model_quote(
+        &self,
+        plan: &Plan,
+        route: &Route,
+        correction_ppm: u64,
+        fresh: Option<(PoolRef, HopState)>,
+    ) -> Option<U256> {
+        if correction_ppm == 0 {
             return None;
         }
         let guard = plan.state.lock().await;
@@ -687,19 +836,21 @@ impl Executor {
         if state.at.elapsed() > STATE_STALE_AFTER || state.hops.len() != plan.route.hops.len() {
             return None;
         }
+        // Keyed by pool rather than by position, so the same state serves a
+        // route walked in either order.
+        let known: HashMap<PoolRef, HopState> = plan
+            .route
+            .hops
+            .iter()
+            .map(|h| h.pool_ref())
+            .zip(state.hops.iter().copied())
+            .collect();
 
-        let mut amount = crate::route::u256_to_f64(plan.route.amount_in);
-        for (hop, cached) in plan.route.hops.iter().zip(&state.hops) {
-            // Prefer the signal over the cache wherever it speaks: it is both
-            // fresher and about the pool whose price is the reason we are here.
-            let here = if hop.pool_ref() == trigger {
-                HopState {
-                    sqrt_p: crate::pool::sqrt_to_f64(sig.sqrt),
-                    liquidity: sig.liquidity,
-                    lp_fee: sig.lp_fee.unwrap_or(cached.lp_fee),
-                }
-            } else {
-                *cached
+        let mut amount = crate::route::u256_to_f64(route.amount_in);
+        for hop in &route.hops {
+            let here = match fresh {
+                Some((p, s)) if p == hop.pool_ref() => s,
+                _ => *known.get(&hop.pool_ref())?,
             };
             let (out, after) = crate::depth::in_range_out(
                 here.sqrt_p,
@@ -718,7 +869,7 @@ impl Executor {
         }
 
         let raw = crate::route::f64_to_u256_pub(amount);
-        let corrected = raw * U256::from(yield_ppm) / U256::from(PPM);
+        let corrected = raw * U256::from(correction_ppm) / U256::from(PPM);
         (!corrected.is_zero()).then_some(corrected)
     }
 

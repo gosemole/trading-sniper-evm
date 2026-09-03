@@ -19,7 +19,14 @@ use std::path::{Path, PathBuf};
 pub struct Position {
     /// For logs; the map key is the address.
     pub symbol: String,
-    /// Human units acquired, as quoted at the time of each buy.
+    pub decimals: u8,
+    /// Exactly what is held, in raw units, as a decimal string - JSON has no
+    /// 256-bit integer and this number has to survive a restart intact. It is
+    /// the sum of what the receipts said actually arrived, so a sale can ask
+    /// for precisely it.
+    pub raw: String,
+    /// The same in human units, for the average and for logs. Approximate by
+    /// nature; nothing is ever sold on the strength of it.
     pub qty: f64,
     /// Pool price of this token, weighted by quantity across every buy.
     pub avg_price: f64,
@@ -29,6 +36,11 @@ pub struct Position {
 }
 
 impl Position {
+    /// Exactly what is held, for a sale to ask for.
+    pub fn held(&self) -> ethers::types::U256 {
+        ethers::types::U256::from_dec_str(&self.raw).unwrap_or_default()
+    }
+
     /// How far the price has to rise from here to hit a `pct` take-profit.
     pub fn target(&self, pct: f64) -> f64 {
         self.avg_price * (1.0 + pct / 100.0)
@@ -53,6 +65,19 @@ pub enum Side {
     Sell,
 }
 
+/// A trade to set aside, described in one place rather than as a row of
+/// arguments that are easy to hand over in the wrong order.
+pub struct Trade {
+    pub side: Side,
+    pub token: ethers::types::Address,
+    pub symbol: String,
+    pub decimals: u8,
+    /// Raw units the trade was quoted at, or asked to sell.
+    pub raw: ethers::types::U256,
+    /// Pool price at the moment of the trade; unused for a sale.
+    pub price: f64,
+}
+
 /// A trade that has been broadcast but not yet confirmed.
 ///
 /// Nothing enters the average on the strength of a transaction being *sent*: a
@@ -65,8 +90,10 @@ pub struct Pending {
     /// Lowercased address of the token the trade is about.
     pub token: String,
     pub symbol: String,
-    /// Quoted size, folded into the position only once this settles.
-    pub qty: f64,
+    pub decimals: u8,
+    /// The size this was quoted at, in raw units. Used only when the receipt
+    /// cannot be read; the receipt is the truth when there is one.
+    pub raw: String,
     /// Pool price at the moment of the trade.
     pub price: f64,
     pub at: u64,
@@ -81,6 +108,11 @@ pub struct Inventory {
     pending: HashMap<String, Pending>,
     #[serde(skip)]
     path: Option<PathBuf>,
+}
+
+/// Raw units to human units, for display and for the weighted average.
+fn raw_to_f64(raw: ethers::types::U256, decimals: u8) -> f64 {
+    raw.to_string().parse::<f64>().unwrap_or(0.0) / 10f64.powi(decimals as i32)
 }
 
 fn now_secs() -> u64 {
@@ -122,58 +154,80 @@ impl Inventory {
     ///
     /// Returns false for a size or price that cannot mean anything, so a
     /// caller can tell "reserved" from "ignored".
-    pub fn reserve(
-        &mut self,
-        hash: ethers::types::H256,
-        side: Side,
-        token: ethers::types::Address,
-        symbol: &str,
-        qty: f64,
-        price: f64,
-    ) -> bool {
-        if side == Side::Buy
-            && (!qty.is_finite() || !price.is_finite() || qty <= 0.0 || price <= 0.0)
-        {
+    pub fn reserve(&mut self, hash: ethers::types::H256, t: Trade) -> bool {
+        if t.side == Side::Buy && (!t.price.is_finite() || t.price <= 0.0 || t.raw.is_zero()) {
             return false;
         }
         self.pending.insert(
             format!("{hash:?}").to_lowercase(),
             Pending {
-                side,
-                token: key(token),
-                symbol: symbol.to_string(),
-                qty,
-                price,
+                side: t.side,
+                token: key(t.token),
+                symbol: t.symbol,
+                decimals: t.decimals,
+                raw: t.raw.to_string(),
+                price: t.price,
                 at: now_secs(),
             },
         );
         true
     }
 
-    /// The chain confirmed it: a buy joins the average, a sale ends the
-    /// position outright.
-    pub fn settle(&mut self, hash: ethers::types::H256) -> Option<Side> {
+    /// The chain confirmed it.
+    ///
+    /// `moved` is what the receipt says actually changed hands - the amount
+    /// bought, or the amount sold. It is preferred over the quote in every
+    /// case, because the quote is what was expected and this is what happened.
+    /// Without it the reservation's own figure is used, which is the best that
+    /// can be done and is why it is kept.
+    pub fn settle(
+        &mut self,
+        hash: ethers::types::H256,
+        moved: Option<ethers::types::U256>,
+    ) -> Option<Side> {
         let p = self.pending.remove(&format!("{hash:?}").to_lowercase())?;
+        let amount = moved.unwrap_or_else(|| {
+            ethers::types::U256::from_dec_str(&p.raw).unwrap_or_default()
+        });
+        let human = raw_to_f64(amount, p.decimals);
         match p.side {
             Side::Buy => {
+                if amount.is_zero() {
+                    return Some(p.side);
+                }
                 let e = self
                     .positions
                     .entry(p.token.clone())
                     .or_insert_with(|| Position {
                         symbol: p.symbol.clone(),
+                        decimals: p.decimals,
+                        raw: "0".to_string(),
                         qty: 0.0,
                         avg_price: p.price,
                         buys: 0,
                         updated: 0,
                     });
-                let total = e.qty + p.qty;
-                e.avg_price = (e.avg_price * e.qty + p.price * p.qty) / total;
+                let total = e.qty + human;
+                e.avg_price = (e.avg_price * e.qty + p.price * human) / total;
                 e.qty = total;
+                e.raw = (e.held() + amount).to_string();
                 e.buys += 1;
                 e.updated = now_secs();
             }
             Side::Sell => {
-                self.positions.remove(&p.token);
+                // Subtract rather than forget: a sale capped by the wallet
+                // balance can leave part of the position behind, and that part
+                // is still ours and still has an entry price.
+                if let Some(e) = self.positions.get_mut(&p.token) {
+                    let left = e.held().saturating_sub(amount);
+                    if left.is_zero() {
+                        self.positions.remove(&p.token);
+                    } else {
+                        e.raw = left.to_string();
+                        e.qty = raw_to_f64(left, e.decimals);
+                        e.updated = now_secs();
+                    }
+                }
             }
         }
         Some(p.side)
@@ -211,10 +265,44 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethers::types::Address;
+    use ethers::types::{Address, H256, U256};
 
     fn addr(b: u8) -> Address {
         Address::from([b; 20])
+    }
+
+    fn hash(b: u8) -> H256 {
+        H256::from([b; 32])
+    }
+
+    /// Raw units of an 18-decimal token.
+    fn raw(units: f64) -> U256 {
+        U256::from_dec_str(&format!("{:.0}", units * 1e18)).unwrap()
+    }
+
+    /// A buy that reached the chain and delivered exactly what it quoted.
+    fn buy(token: Address, units: f64, price: f64) -> Trade {
+        Trade {
+            side: Side::Buy,
+            token,
+            symbol: "TKN".into(),
+            decimals: 18,
+            raw: raw(units),
+            price,
+        }
+    }
+
+    fn sale(token: Address, units: f64) -> Trade {
+        Trade {
+            side: Side::Sell,
+            price: 0.0,
+            ..buy(token, units, 1.0)
+        }
+    }
+
+    fn filled(inv: &mut Inventory, h: u8, token: Address, units: f64, price: f64) {
+        inv.reserve(hash(h), buy(token, units, price));
+        inv.settle(hash(h), None);
     }
 
     #[test]
@@ -227,6 +315,38 @@ mod tests {
         assert_eq!(p.qty, 400.0);
         assert!((p.avg_price - 7.0).abs() < 1e-12, "{}", p.avg_price);
         assert_eq!(p.buys, 2);
+        assert_eq!(p.held(), raw(400.0), "and the raw total is exact");
+    }
+
+    #[test]
+    fn the_receipt_wins_over_the_quote() {
+        let mut inv = Inventory::default();
+        // Quoted 100, but 97 actually arrived. Both the average and the amount
+        // a later sale can ask for have to follow the second number: an average
+        // built on the first would drift, and a sale sized on it would ask for
+        // three tokens that are not there.
+        inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
+        inv.settle(hash(1), Some(raw(97.0)));
+        let p = inv.get(addr(1)).unwrap();
+        assert_eq!(p.held(), raw(97.0));
+        assert_eq!(p.qty, 97.0);
+        assert_eq!(p.avg_price, 10.0);
+    }
+
+    #[test]
+    fn an_unreadable_receipt_falls_back_to_the_quote() {
+        let mut inv = Inventory::default();
+        inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
+        inv.settle(hash(1), None);
+        assert_eq!(inv.get(addr(1)).unwrap().held(), raw(100.0));
+    }
+
+    #[test]
+    fn a_buy_that_delivered_nothing_is_not_a_position() {
+        let mut inv = Inventory::default();
+        inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
+        assert_eq!(inv.settle(hash(1), Some(U256::zero())), Some(Side::Buy));
+        assert!(inv.get(addr(1)).is_none(), "nothing arrived, so nothing is held");
     }
 
     #[test]
@@ -266,74 +386,42 @@ mod tests {
     fn nonsense_fills_are_refused_rather_than_poisoning_the_average() {
         let mut inv = Inventory::default();
         filled(&mut inv, 1, addr(1), 100.0, 10.0);
-        for (n, qty, price) in [
-            (2u8, 0.0, 5.0),
-            (3, -5.0, 5.0),
-            (4, f64::NAN, 5.0),
-            (5, 10.0, 0.0),
-            (6, 10.0, f64::INFINITY),
+        for (n, size, price) in [
+            (2u8, U256::zero(), 5.0),
+            (3, raw(10.0), 0.0),
+            (4, raw(10.0), f64::NAN),
+            (5, raw(10.0), f64::INFINITY),
         ] {
             assert!(
-                !inv.reserve(hash(n), Side::Buy, addr(1), "TKN", qty, price),
-                "qty {qty} at {price} should be refused"
+                !inv.reserve(hash(n), Trade { raw: size, price, ..buy(addr(1), 1.0, 1.0) }),
+                "{size} at {price} should be refused"
             );
-            assert!(inv.settle(hash(n)).is_none(), "and nothing to settle");
+            assert!(inv.settle(hash(n), None).is_none(), "and nothing to settle");
         }
         let p = inv.get(addr(1)).unwrap();
-        assert_eq!(p.qty, 100.0);
+        assert_eq!(p.held(), raw(100.0));
         assert_eq!(p.avg_price, 10.0);
         assert_eq!(p.buys, 1);
     }
 
     #[test]
-    fn positions_survive_a_round_trip_through_disk() {
-        let dir = std::env::temp_dir().join(format!("mmfall-inv-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("inventory.json");
-        let _ = std::fs::remove_file(&path);
-
-        let mut inv = Inventory::load(&path).unwrap();
-        assert!(inv.is_empty(), "a missing file is a first run, not a failure");
-        inv.reserve(hash(7), Side::Buy, addr(7), "CAMELTOE", 500.0, 0.0000123);
-        inv.settle(hash(7));
-        inv.save().unwrap();
-
-        let back = Inventory::load(&path).unwrap();
-        assert_eq!(back.get(addr(7)), inv.get(addr(7)));
-        assert_eq!(back.get(addr(7)).unwrap().symbol, "CAMELTOE");
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    fn hash(b: u8) -> ethers::types::H256 {
-        ethers::types::H256::from([b; 32])
-    }
-
-    /// A buy that reached the chain, which is the only way a position grows.
-    fn filled(inv: &mut Inventory, h: u8, token: Address, qty: f64, price: f64) {
-        inv.reserve(hash(h), Side::Buy, token, "TKN", qty, price);
-        inv.settle(hash(h));
-    }
-
-    #[test]
     fn a_reservation_changes_nothing_until_it_settles() {
         let mut inv = Inventory::default();
-        assert!(inv.reserve(hash(1), Side::Buy, addr(1), "TKN", 100.0, 10.0));
+        assert!(inv.reserve(hash(1), buy(addr(1), 100.0, 10.0)));
         assert!(inv.get(addr(1)).is_none(), "a sent transaction is not a fill");
-        assert_eq!(inv.settle(hash(1)), Some(Side::Buy));
-        assert_eq!(inv.get(addr(1)).unwrap().qty, 100.0);
+        assert_eq!(inv.settle(hash(1), None), Some(Side::Buy));
+        assert_eq!(inv.get(addr(1)).unwrap().held(), raw(100.0));
     }
 
     #[test]
     fn a_rolled_back_buy_leaves_the_average_untouched() {
         let mut inv = Inventory::default();
-        inv.reserve(hash(1), Side::Buy, addr(1), "TKN", 100.0, 10.0);
-        inv.settle(hash(1));
+        filled(&mut inv, 1, addr(1), 100.0, 10.0);
         // A second buy that never lands must not drag the average down with it.
-        inv.reserve(hash(2), Side::Buy, addr(1), "TKN", 900.0, 1.0);
+        inv.reserve(hash(2), buy(addr(1), 900.0, 1.0));
         assert_eq!(inv.rollback(hash(2)), Some(Side::Buy));
         let p = inv.get(addr(1)).unwrap();
-        assert_eq!(p.qty, 100.0);
+        assert_eq!(p.held(), raw(100.0));
         assert_eq!(p.avg_price, 10.0);
         assert_eq!(p.buys, 1);
     }
@@ -342,43 +430,65 @@ mod tests {
     fn a_sale_ends_the_position_only_once_it_confirms() {
         let mut inv = Inventory::default();
         filled(&mut inv, 1, addr(1), 100.0, 10.0);
-        inv.reserve(hash(3), Side::Sell, addr(1), "TKN", 0.0, 0.0);
+        inv.reserve(hash(3), sale(addr(1), 100.0));
         assert!(inv.get(addr(1)).is_some(), "still held while the sale is in flight");
         // A sale that fails leaves the position exactly as it was, so the next
         // attempt still knows what it is selling and at what average.
         assert_eq!(inv.rollback(hash(3)), Some(Side::Sell));
         assert_eq!(inv.get(addr(1)).unwrap().avg_price, 10.0);
 
-        inv.reserve(hash(4), Side::Sell, addr(1), "TKN", 0.0, 0.0);
-        assert_eq!(inv.settle(hash(4)), Some(Side::Sell));
+        inv.reserve(hash(4), sale(addr(1), 100.0));
+        assert_eq!(inv.settle(hash(4), None), Some(Side::Sell));
         assert!(inv.get(addr(1)).is_none());
+    }
+
+    #[test]
+    fn a_partial_sale_leaves_the_rest_of_the_position() {
+        let mut inv = Inventory::default();
+        filled(&mut inv, 1, addr(1), 100.0, 10.0);
+        // Capped by the wallet balance, only 40 went. The remaining 60 are
+        // still ours and still carry the price they were bought at.
+        inv.reserve(hash(2), sale(addr(1), 40.0));
+        inv.settle(hash(2), None);
+        let p = inv.get(addr(1)).expect("the rest is still held");
+        assert_eq!(p.held(), raw(60.0));
+        assert_eq!(p.qty, 60.0);
+        assert_eq!(p.avg_price, 10.0, "selling does not change what it cost");
     }
 
     #[test]
     fn settling_the_same_transaction_twice_does_nothing() {
         let mut inv = Inventory::default();
-        inv.reserve(hash(1), Side::Buy, addr(1), "TKN", 100.0, 10.0);
-        assert_eq!(inv.settle(hash(1)), Some(Side::Buy));
-        assert_eq!(inv.settle(hash(1)), None, "the reservation is gone");
-        assert_eq!(inv.get(addr(1)).unwrap().qty, 100.0, "and was counted once");
+        inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
+        assert_eq!(inv.settle(hash(1), None), Some(Side::Buy));
+        assert_eq!(inv.settle(hash(1), None), None, "the reservation is gone");
+        assert_eq!(inv.get(addr(1)).unwrap().held(), raw(100.0), "and was counted once");
     }
 
     #[test]
-    fn reservations_outlive_a_restart_and_can_be_looked_up() {
-        let dir = std::env::temp_dir().join(format!("mmfall-pend-{}", std::process::id()));
+    fn exact_amounts_survive_a_round_trip_through_disk() {
+        let dir = std::env::temp_dir().join(format!("mmfall-inv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("inventory.json");
         let _ = std::fs::remove_file(&path);
 
         let mut inv = Inventory::load(&path).unwrap();
-        inv.reserve(hash(9), Side::Buy, addr(2), "TKN", 5.0, 2.0);
+        assert!(inv.is_empty(), "a missing file is a first run, not a failure");
+        // A number f64 cannot hold, which is the whole reason it is stored as
+        // a string: a sale asks for exactly this.
+        let odd = U256::from_dec_str("123456789012345678901").unwrap();
+        inv.reserve(
+            hash(7),
+            Trade { symbol: "CAMELTOE".into(), raw: odd, ..buy(addr(7), 1.0, 0.0000123) },
+        );
+        inv.settle(hash(7), None);
+        inv.reserve(hash(8), buy(addr(8), 1.0, 5.0));
         inv.save().unwrap();
 
         let back = Inventory::load(&path).unwrap();
-        let un = back.unsettled();
-        assert_eq!(un.len(), 1, "a restart must not lose a trade in flight");
-        assert_eq!(un[0].0, hash(9));
-        assert_eq!(un[0].1.side, Side::Buy);
+        assert_eq!(back.get(addr(7)).unwrap().held(), odd);
+        assert_eq!(back.get(addr(7)).unwrap().symbol, "CAMELTOE");
+        assert_eq!(back.unsettled().len(), 1, "a trade in flight is not lost either");
         std::fs::remove_file(&path).ok();
     }
 
@@ -386,9 +496,9 @@ mod tests {
     fn a_position_is_only_forgotten_by_a_sale_that_landed() {
         let mut inv = Inventory::default();
         filled(&mut inv, 1, addr(1), 100.0, 10.0);
-        inv.reserve(hash(2), Side::Sell, addr(1), "TKN", 0.0, 0.0);
-        inv.settle(hash(2));
+        inv.reserve(hash(2), sale(addr(1), 100.0));
+        inv.settle(hash(2), None);
         assert!(inv.get(addr(1)).is_none());
-        assert!(inv.settle(hash(2)).is_none(), "and stays forgotten");
+        assert!(inv.settle(hash(2), None).is_none(), "and stays forgotten");
     }
 }

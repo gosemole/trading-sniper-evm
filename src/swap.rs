@@ -370,27 +370,83 @@ impl Outcome {
     }
 }
 
-/// Follow a broadcast transaction to its receipt, saying how it ended.
-pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> Outcome {
+/// `Transfer(address,address,uint256)`, the only place a receipt says how much
+/// actually moved.
+const TRANSFER_TOPIC: [u8; 32] = [
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d, 0xaa,
+    0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
+];
+
+/// How much of `token` a transaction actually delivered to `to`.
+///
+/// The quote is what the swap was expected to pay; this is what it paid. They
+/// differ by however much the pool moved between the two, which is exactly the
+/// error that would otherwise accumulate in an average entry price - and, worse,
+/// the error that would make a later sale ask for more than is there.
+///
+/// Every matching transfer is summed rather than the first taken: a route may
+/// pay out in more than one, and a token may charge a fee by sending less.
+pub fn received(logs: &[ethers::types::Log], token: Address, to: Address) -> Option<U256> {
+    let mut total = U256::zero();
+    let mut seen = false;
+    for log in logs {
+        if log.address != token || log.topics.len() < 3 || log.topics[0].0 != TRANSFER_TOPIC {
+            continue;
+        }
+        // `to` is the second indexed argument, right-aligned in its topic.
+        if Address::from_slice(&log.topics[2].as_bytes()[12..]) != to {
+            continue;
+        }
+        if log.data.0.len() < 32 {
+            continue;
+        }
+        total += U256::from_big_endian(&log.data.0[..32]);
+        seen = true;
+    }
+    seen.then_some(total)
+}
+
+/// A transaction that has stopped being pending.
+pub struct Landed {
+    pub outcome: Outcome,
+    /// Present whenever the chain had a receipt to give, whatever it said.
+    pub logs: Vec<ethers::types::Log>,
+}
+
+/// Follow a broadcast transaction to its receipt, saying how it ended and
+/// carrying the logs so a caller can read what actually moved.
+pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> Landed {
     match ethers::providers::PendingTransaction::new(hash, http).await {
         Ok(Some(r)) if r.status == Some(1u64.into()) => {
             tracing::info!(
                 tx = ?hash, block = ?r.block_number, gas_used = ?r.gas_used, label,
                 "confirmed"
             );
-            Outcome::Confirmed
+            Landed {
+                outcome: Outcome::Confirmed,
+                logs: r.logs,
+            }
         }
         Ok(Some(r)) => {
             tracing::error!(tx = ?hash, block = ?r.block_number, label, "REVERTED");
-            Outcome::Reverted
+            Landed {
+                outcome: Outcome::Reverted,
+                logs: r.logs,
+            }
         }
         Ok(None) => {
             tracing::warn!(tx = ?hash, label, "dropped from the mempool");
-            Outcome::Dropped
+            Landed {
+                outcome: Outcome::Dropped,
+                logs: Vec::new(),
+            }
         }
         Err(e) => {
             tracing::warn!(tx = ?hash, err = %e, label, "lost track of the transaction");
-            Outcome::Unknown
+            Landed {
+                outcome: Outcome::Unknown,
+                logs: Vec::new(),
+            }
         }
     }
 }
@@ -500,6 +556,68 @@ pub async fn balance_of(http: &Provider<Http>, token: Address, owner: Address) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethers::types::{Bytes, Log, H256};
+
+    fn transfer_log(token: Address, to: Address, amount: u64) -> Log {
+        let mut to_topic = [0u8; 32];
+        to_topic[12..].copy_from_slice(to.as_bytes());
+        let mut data = [0u8; 32];
+        U256::from(amount).to_big_endian(&mut data);
+        Log {
+            address: token,
+            topics: vec![
+                H256::from(TRANSFER_TOPIC),
+                H256::zero(),
+                H256::from(to_topic),
+            ],
+            data: Bytes::from(data.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    fn a(b: u8) -> Address {
+        Address::from([b; 20])
+    }
+
+    #[test]
+    fn the_transfer_topic_is_the_published_one() {
+        assert_eq!(
+            hex::encode(TRANSFER_TOPIC),
+            "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        );
+    }
+
+    #[test]
+    fn only_transfers_of_that_token_to_that_address_are_counted() {
+        let (token, other, me, someone) = (a(1), a(2), a(9), a(8));
+        let logs = vec![
+            transfer_log(token, me, 100),
+            transfer_log(token, someone, 500),  // not ours
+            transfer_log(other, me, 700),       // not that token
+            transfer_log(token, me, 23),        // routes may pay in parts
+        ];
+        assert_eq!(received(&logs, token, me), Some(U256::from(123u64)));
+    }
+
+    #[test]
+    fn a_receipt_with_nothing_for_us_says_so() {
+        let (token, me) = (a(1), a(9));
+        assert_eq!(received(&[], token, me), None);
+        assert_eq!(received(&[transfer_log(token, a(8), 5)], token, me), None);
+        // Zero is a real answer and not the same as no answer: a swap that
+        // delivered nothing must not be read as "could not tell".
+        assert_eq!(received(&[transfer_log(token, me, 0)], token, me), Some(U256::zero()));
+    }
+
+    #[test]
+    fn a_malformed_log_is_skipped_rather_than_trusted() {
+        let (token, me) = (a(1), a(9));
+        let mut short = transfer_log(token, me, 10);
+        short.data = Bytes::from(vec![0u8; 8]);
+        let mut untopiced = transfer_log(token, me, 10);
+        untopiced.topics.truncate(2);
+        assert_eq!(received(&[short, untopiced], token, me), None);
+    }
 
     #[test]
     fn approval_calldata_is_well_formed() {
