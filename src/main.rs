@@ -292,10 +292,13 @@ async fn quote_route_cmd(
     );
     for (i, h) in q.hops.iter().enumerate() {
         println!(
-            "  hop {i}: {} -> {}  fee={}bps ticks_crossed={} impact={:+.3}%",
+            "  hop {i}: {} -> {}  fee={}bps (lp {}bps + protocol {}bps) \
+             ticks_crossed={} impact={:+.3}%",
             route::format_units(route::f64_to_u256_pub(h.amount_in), h.input_decimals),
             route::format_units(route::f64_to_u256_pub(h.amount_out), h.output_decimals),
+            h.swap_fee() as f64 / 100.0,
             h.lp_fee as f64 / 100.0,
+            h.protocol_fee_paid() as f64 / 100.0,
             h.ticks_crossed,
             h.price_impact_pct
         );

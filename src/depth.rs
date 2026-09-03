@@ -210,10 +210,13 @@ fn scan_word(word: U256, bit: i32, up: bool, first: bool) -> Option<u32> {
 /// overstates the output once it would - so callers must check the price move
 /// it reports and stop trusting it before that point. Returns the output and
 /// the price the pool would be left at.
+///
+/// `fee_pips` is the WHOLE fee charged on the input, protocol fee included -
+/// `PoolState::swap_fee` for this direction, not the pool's bare `lp_fee`.
 pub fn in_range_out(
     sqrt_p: f64,
     liquidity: u128,
-    lp_fee_pips: u32,
+    fee_pips: u32,
     zero_for_one: bool,
     amount_in: f64,
 ) -> Option<(f64, f64)> {
@@ -224,13 +227,13 @@ pub fn in_range_out(
         || !amount_in.is_finite()
         || amount_in <= 0.0
         || liquidity == 0
-        || lp_fee_pips >= 1_000_000
+        || fee_pips >= 1_000_000
     {
         return None;
     }
     let l = liquidity as f64;
     // The fee comes off the input before it reaches the curve.
-    let net = amount_in * (1.0 - lp_fee_pips as f64 / 1_000_000.0);
+    let net = amount_in * (1.0 - fee_pips as f64 / 1_000_000.0);
     // Paying token1 pushes the raw price up; paying token0 pushes it down.
     let up = !zero_for_one;
     let (sqrt_new, out) = if up {
@@ -340,7 +343,42 @@ pub struct PoolState {
     /// Current LP fee in hundredths of a bip. For v4 this is read from slot0,
     /// so a hook that changes the fee dynamically is reflected.
     pub lp_fee: u32,
+    /// Protocol fee charged on the input of a zeroForOne swap, in hundredths
+    /// of a bip. It is taken before the LP fee and never reaches the curve, so
+    /// it is invisible in sqrtPriceX96 and has to be read separately or it is
+    /// simply lost. Always 0 on v3, where the protocol's cut comes out of the
+    /// LPs' share and the swapper pays the same either way.
+    pub protocol_fee_0for1: u32,
+    /// The same for a oneForZero swap. v4 lets the two halves differ, so the
+    /// direction has to be known before a fee can be named.
+    pub protocol_fee_1for0: u32,
 }
+
+impl PoolState {
+    /// The whole fee a swapper pays on the way in, in hundredths of a bip.
+    ///
+    /// The protocol takes its cut first and the LPs take theirs from what is
+    /// left, so the two do not simply add: this is `pf + lp * (1 - pf)`, which
+    /// is what v4's `ProtocolFeeLibrary.calculateSwapFee` computes, kept in
+    /// integer pips so it agrees with the chain exactly.
+    pub fn swap_fee(&self, zero_for_one: bool) -> u32 {
+        let pf = match zero_for_one {
+            true => self.protocol_fee_0for1,
+            false => self.protocol_fee_1for0,
+        } as u64;
+        let lp = self.lp_fee as u64;
+        (pf + lp - pf * lp / PIPS).min(PIPS) as u32
+    }
+}
+
+/// Denominator every fee on both protocols is quoted against: a fee of 3000 is
+/// 3000/1_000_000 = 0.3%.
+const PIPS: u64 = 1_000_000;
+
+/// Largest value either half of v4's packed `protocolFee` may hold (0.1%).
+/// Anything above it is not a fee the protocol would accept, so reading one is
+/// evidence the word was decoded wrongly rather than evidence of a big fee.
+const MAX_PROTOCOL_FEE_PIPS: u32 = 1_000;
 
 /// Read sqrt(price), in-range liquidity and the live fee for a pool.
 pub async fn read_state(reader: &TickReader<'_>) -> Result<PoolState> {
@@ -349,12 +387,21 @@ pub async fn read_state(reader: &TickReader<'_>) -> Result<PoolState> {
             let base = TickReader::v4_base(*pool_id);
             let s0 = reader.storage(*manager, base).await?;
             anyhow::ensure!(!s0.is_zero(), "pool is not initialized");
-            let (sqrt_x96, _tick, _protocol_fee, lp_fee) = decode_slot0(s0);
+            let (sqrt_x96, _tick, protocol_fee, lp_fee) = decode_slot0(s0);
+            let (pf_0for1, pf_1for0) = protocol_fee_halves(protocol_fee);
+            anyhow::ensure!(
+                pf_0for1 <= MAX_PROTOCOL_FEE_PIPS && pf_1for0 <= MAX_PROTOCOL_FEE_PIPS,
+                "slot0 reports a protocol fee above the protocol's own ceiling \
+                 ({pf_0for1}/{pf_1for0} > {MAX_PROTOCOL_FEE_PIPS} pips), which means this \
+                 word was decoded wrongly - refusing to price anything from it"
+            );
             let liq = reader.storage(*manager, base + U256::from(3)).await?;
             Ok(PoolState {
                 sqrt_p: x96_to_f64(sqrt_x96),
                 liquidity: u128::from_be_bytes(liq.0[16..32].try_into().unwrap()),
                 lp_fee,
+                protocol_fee_0for1: pf_0for1,
+                protocol_fee_1for0: pf_1for0,
             })
         }
         Source::V3 { pool } => {
@@ -369,6 +416,10 @@ pub async fn read_state(reader: &TickReader<'_>) -> Result<PoolState> {
                 sqrt_p: x96_to_f64(sqrt_x96),
                 liquidity: U256::from_big_endian(&l[16..32]).as_u128(),
                 lp_fee: U256::from_big_endian(&f[0..32]).low_u32(),
+                // v3's protocol fee is carved out of the LP fee rather than
+                // charged on top, so the swapper pays `fee()` and nothing more.
+                protocol_fee_0for1: 0,
+                protocol_fee_1for0: 0,
             })
         }
     }
@@ -392,6 +443,13 @@ pub fn decode_slot0(word: H256) -> (U256, i32, u32, u32) {
     let protocol_fee = ((b[6] as u32) << 16) | ((b[7] as u32) << 8) | b[8] as u32;
     let lp_fee = ((b[3] as u32) << 16) | ((b[4] as u32) << 8) | b[5] as u32;
     (sqrt_x96, tick, protocol_fee, lp_fee)
+}
+
+/// Split v4's packed 24-bit `protocolFee` into `(zeroForOne, oneForZero)`.
+/// The low 12 bits apply to a zeroForOne swap, the high 12 to the other
+/// direction - a pool may be configured to charge only one way.
+pub fn protocol_fee_halves(packed: u32) -> (u32, u32) {
+    (packed & 0xfff, (packed >> 12) & 0xfff)
 }
 
 fn x96_to_f64(v: U256) -> f64 {
@@ -430,11 +488,15 @@ pub async fn swap_exact_in(
 ) -> Result<SwapResult> {
     anyhow::ensure!(amount_in > 0.0, "amount_in must be > 0");
     anyhow::ensure!(state.sqrt_p > 0.0, "sqrt price must be > 0");
-    anyhow::ensure!(state.lp_fee < 1_000_000, "fee must be < 100%");
+    let fee_pips = state.swap_fee(zero_for_one);
+    anyhow::ensure!(fee_pips < 1_000_000, "fee must be < 100%");
 
-    // The LP fee is taken off the input before it reaches the curve.
-    let mut remaining = amount_in * (1.0 - state.lp_fee as f64 / 1_000_000.0);
-    let gross_per_net = 1.0 / (1.0 - state.lp_fee as f64 / 1_000_000.0);
+    // Protocol fee first, LP fee on the remainder, and only what survives both
+    // reaches the curve - which is why the price the curve reports afterwards
+    // knows nothing about either of them.
+    let fee_frac = fee_pips as f64 / 1_000_000.0;
+    let mut remaining = amount_in * (1.0 - fee_frac);
+    let gross_per_net = 1.0 / (1.0 - fee_frac);
 
     let mut sqrt_cur = state.sqrt_p;
     let mut liquidity = state.liquidity as f64;
@@ -519,7 +581,7 @@ pub async fn swap_exact_in(
         crossed += 1;
     }
 
-    let net_used = amount_in * (1.0 - state.lp_fee as f64 / 1_000_000.0) - remaining;
+    let net_used = amount_in * (1.0 - fee_frac) - remaining;
     Ok(SwapResult {
         amount_out: out,
         amount_in_used: net_used * gross_per_net,
@@ -647,6 +709,69 @@ mod tests {
         // cross-check: the tick must agree with the price sqrtPriceX96 implies
         let sqrt_p = x96_to_f64(sqrt_x96);
         assert_eq!(tick_at_sqrt(sqrt_p), tick);
+
+        // and the halves are what a swapper on THIS pool actually pays on top
+        // of the 0.25% tier, which is the whole reason they are read at all
+        assert_eq!(protocol_fee_halves(protocol_fee), (400, 400));
+    }
+
+    /// The combined fee has to be the chain's, digit for digit: v4's
+    /// `ProtocolFeeLibrary.calculateSwapFee` is
+    /// `protocolFee + lpFee - protocolFee * lpFee / 1_000_000`, truncating.
+    /// Off by one pip here is off by one pip on every quote the model makes.
+    #[test]
+    fn the_combined_fee_is_the_protocol_librarys() {
+        let s = |pf0, pf1, lp| PoolState {
+            sqrt_p: 1.0,
+            liquidity: 1,
+            lp_fee: lp,
+            protocol_fee_0for1: pf0,
+            protocol_fee_1for0: pf1,
+        };
+        // The real POOLS/ETH numbers: 400 + 2500 - 400*2500/1e6 = 2899, and the
+        // subtracted pip is exactly what naive addition would miss.
+        assert_eq!(s(400, 400, 2500).swap_fee(true), 2899);
+        assert_ne!(s(400, 400, 2500).swap_fee(true), 2900, "not a plain sum");
+        // No protocol fee leaves the LP fee untouched - the v3 case, and the
+        // v4 case before the fee controller ever sets one.
+        assert_eq!(s(0, 0, 3000).swap_fee(true), 3000);
+        assert_eq!(s(0, 0, 3000).swap_fee(false), 3000);
+        // The halves are independent: a pool may charge one way only, and the
+        // direction is what picks between them.
+        let one_way = s(1000, 0, 500);
+        // 1000 + 500, with the cross term truncating away at this size - the
+        // same truncation the chain's integer division does.
+        assert_eq!(one_way.swap_fee(true), 1_500);
+        assert_eq!(one_way.swap_fee(false), 500);
+    }
+
+    /// The point of the whole exercise: the protocol's cut is money that never
+    /// reaches the curve, so a quote that ignores it is optimistic.
+    #[test]
+    fn the_protocol_fee_costs_the_swapper_output() {
+        let with = in_range_out(
+            2.0,
+            1_000_000_000,
+            PoolState {
+                sqrt_p: 2.0,
+                liquidity: 1_000_000_000,
+                lp_fee: 2500,
+                protocol_fee_0for1: 400,
+                protocol_fee_1for0: 400,
+            }
+            .swap_fee(true),
+            true,
+            1_000_000.0,
+        )
+        .unwrap()
+        .0;
+        let without = in_range_out(2.0, 1_000_000_000, 2500, true, 1_000_000.0)
+            .unwrap()
+            .0;
+        assert!(
+            with < without,
+            "charging the protocol fee must return less, got {with} >= {without}"
+        );
     }
 
     #[test]

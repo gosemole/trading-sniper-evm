@@ -317,8 +317,36 @@ pub struct HopQuote {
     pub output_decimals: u8,
     pub ticks_crossed: u32,
     pub lp_fee: u32,
+    /// Both halves of the pool's protocol fee, in hundredths of a bip, kept
+    /// whole rather than resolved against this hop's direction: the snapshot
+    /// describes a pool, and the same snapshot has to price the reversed route
+    /// when the position is sold. 0/0 on v3, which charges the swapper nothing
+    /// beyond `lp_fee`.
+    pub protocol_fee_0for1: u32,
+    pub protocol_fee_1for0: u32,
+    /// The direction this hop was priced in, which is what picks the half of
+    /// the protocol fee that was actually charged.
+    pub zero_for_one: bool,
     /// How far this hop moves the pool's own price, in percent.
     pub price_impact_pct: f64,
+}
+
+impl HopQuote {
+    /// The protocol's cut on this hop's input, in hundredths of a bip.
+    pub fn protocol_fee_paid(&self) -> u32 {
+        match self.zero_for_one {
+            true => self.protocol_fee_0for1,
+            false => self.protocol_fee_1for0,
+        }
+    }
+
+    /// The whole fee this hop's input paid on the way in - protocol first, LPs
+    /// on what is left. See `depth::PoolState::swap_fee`.
+    pub fn swap_fee(&self) -> u32 {
+        let pf = self.protocol_fee_paid() as u64;
+        let lp = self.lp_fee as u64;
+        (pf + lp - pf * lp / 1_000_000).min(1_000_000) as u32
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -399,6 +427,9 @@ impl Route {
                 output_decimals: hop.output_decimals,
                 ticks_crossed: res.ticks_crossed,
                 lp_fee: state.lp_fee,
+                protocol_fee_0for1: state.protocol_fee_0for1,
+                protocol_fee_1for0: state.protocol_fee_1for0,
+                zero_for_one: hop.zero_for_one(),
                 price_impact_pct: impact * 100.0,
             });
             amount = res.amount_out;
@@ -431,6 +462,33 @@ mod tests {
 
     fn addr(b: u8) -> Address {
         Address::from([b; 20])
+    }
+
+    /// A quoted hop reports what its own direction was charged, not the half
+    /// of the protocol fee that happened to be larger - a pool may charge one
+    /// way only, and the sale walks the other way.
+    #[test]
+    fn a_hop_reports_the_fee_its_own_direction_paid() {
+        let hop = |zero_for_one| HopQuote {
+            pool: PoolRef::V3(addr(1)),
+            sqrt_p: 1.0,
+            liquidity: 1,
+            amount_in: 1.0,
+            amount_out: 1.0,
+            input_decimals: 18,
+            output_decimals: 18,
+            ticks_crossed: 0,
+            lp_fee: 2500,
+            protocol_fee_0for1: 400,
+            protocol_fee_1for0: 0,
+            zero_for_one,
+            price_impact_pct: 0.0,
+        };
+        assert_eq!(hop(true).protocol_fee_paid(), 400);
+        assert_eq!(hop(false).protocol_fee_paid(), 0);
+        // Same pool, same tier, and the two directions cost different money.
+        assert_eq!(hop(true).swap_fee(), 2899);
+        assert_eq!(hop(false).swap_fee(), 2500);
     }
 
     fn two_hop() -> Route {

@@ -88,6 +88,24 @@ struct HopState {
     sqrt_p: f64,
     liquidity: u128,
     lp_fee: u32,
+    /// Both halves of the pool's protocol fee, in hundredths of a bip, kept
+    /// unresolved because one snapshot has to serve both directions: the same
+    /// state prices the buy and the sale that undoes it.
+    protocol_fee_0for1: u32,
+    protocol_fee_1for0: u32,
+}
+
+impl HopState {
+    /// The whole fee this hop's input pays, protocol cut included. See
+    /// `depth::PoolState::swap_fee` - the same arithmetic, on a snapshot.
+    fn swap_fee(&self, zero_for_one: bool) -> u32 {
+        let pf = match zero_for_one {
+            true => self.protocol_fee_0for1,
+            false => self.protocol_fee_1for0,
+        } as u64;
+        let lp = self.lp_fee as u64;
+        (pf + lp - pf * lp / PPM).min(PPM) as u32
+    }
 }
 
 /// A transaction that actually went out, and what it was expected to produce.
@@ -372,6 +390,8 @@ impl Executor {
                     sqrt_p: h.sqrt_p,
                     liquidity: h.liquidity,
                     lp_fee: h.lp_fee,
+                    protocol_fee_0for1: h.protocol_fee_0for1,
+                    protocol_fee_1for0: h.protocol_fee_1for0,
                 })
                 .collect(),
         });
@@ -535,7 +555,7 @@ impl Executor {
                     m => m,
                 };
                 match self.unstated_fee_acceptable(plan, ppm) {
-                    true => self.model_quote(plan, &sell, None).await,
+                    true => self.model_quote(plan, &sell, None, ppm).await,
                     false => None,
                 }
             }
@@ -679,17 +699,28 @@ impl Executor {
                 .map(|h| h.fee)
                 .filter(|f| u64::from(*f) < PPM)
         });
-        let fresh = fee.map(|lp_fee| {
+        // v4 emits the fee the swap was CHARGED, which is already the protocol
+        // cut and the LP fee combined (`Pool.swap`: `swapFee = protocolFee == 0
+        // ? lpFee : calculateSwapFee(protocolFee, lpFee)`), so it goes in whole
+        // with no protocol fee left to add. A v3 log carries no fee word at all
+        // and falls back to the pool's fixed `fee()`, where the protocol's cut
+        // comes out of the LPs' share and the swapper pays no more either way.
+        // `model_quote` checks this reading against the calibration snapshot
+        // and says so if the chain disagrees.
+        let fresh = fee.map(|charged| {
             (
                 key,
                 HopState {
                     sqrt_p: crate::pool::sqrt_to_f64(sig.sqrt),
                     liquidity: sig.liquidity,
-                    lp_fee,
+                    lp_fee: charged,
+                    protocol_fee_0for1: 0,
+                    protocol_fee_1for0: 0,
                 },
             )
         });
-        let modelled = self.model_quote(plan, &plan.route, fresh).await;
+        let ppm = plan.yield_ppm.load(Ordering::Relaxed);
+        let modelled = self.model_quote(plan, &plan.route, fresh, ppm).await;
         // The model prices every buy or none does: there is no router
         // fallback on this path. Skip the buy instead of guessing; it costs
         // nothing but this one drop, and there will be another.
@@ -721,13 +752,14 @@ impl Executor {
         })
     }
 
-    /// The calibration's one job on the trading path: a check, not a term.
+    /// The calibration's job as a check, alongside its job as a term.
     ///
-    /// What a route is measured to take beyond its stated fees is not folded
-    /// into the price - the pool that drops reports the fee it really charged
-    /// in its own log, and that is what the model prices with. The measurement
-    /// stands guard instead: a route never measured is not traded, and one
-    /// found keeping more than `MAX_UNSTATED_FEE_PPM` is refused and said so.
+    /// What a route is measured to take beyond its stated fees is priced in by
+    /// `model_quote`, but only within reason: past `MAX_UNSTATED_FEE_PPM` the
+    /// figure stops being a fee worth paying and starts being a sign that the
+    /// route is not what it was measured to be. So a route never measured is
+    /// not traded, and one keeping more than the limit is refused and said so.
+    /// Neither is a number to quietly fold into a price.
     fn unstated_fee_acceptable(&self, plan: &Plan, yield_ppm: u64) -> bool {
         if yield_ppm == 0 {
             warn!(
@@ -862,10 +894,17 @@ impl Executor {
     /// the fee it actually charged all arrive in the log that raised the
     /// signal, and they describe the pool as of that very swap. The others come
     /// from the last calibration pass, which is fair because they are not the
-    /// ones that moved. Nothing measured by calibration is applied on top: the
-    /// fee the log reports is the fee that was charged, override and all, and
-    /// what `yield_ppm` measures beyond it is a guard the caller checks first
-    /// (`unstated_fee_acceptable`), not a term in this arithmetic.
+    /// ones that moved.
+    ///
+    /// `yield_ppm` is what calibration measured this direction to actually pay
+    /// against what this same arithmetic predicted, and it IS applied here as
+    /// a term: whatever a hook takes on top of the pools' stated fees is real
+    /// money, and a quote that leaves it out is optimistic by exactly that
+    /// much. It is clamped at 1.0 - a route measured to pay more than the
+    /// model says is a stale snapshot or measurement noise, never a bonus to
+    /// price in. It stays a guard as well: the caller checks
+    /// `unstated_fee_acceptable` first and does not get here at all when the
+    /// unstated fee is out of hand.
     ///
     /// Works in either direction: the cached state describes a pool, not a
     /// direction, so a reversed route reads the same numbers and only the
@@ -884,7 +923,13 @@ impl Executor {
         plan: &Plan,
         route: &Route,
         fresh: Option<(PoolRef, HopState)>,
+        yield_ppm: u64,
     ) -> Option<U256> {
+        // Never priced by a measurement that does not exist. The callers check
+        // this too, and both of them refusing is the point.
+        if yield_ppm == 0 {
+            return None;
+        }
         let guard = plan.state.lock().await;
         // Keyed by pool rather than by position, so the same state serves a
         // route walked in either order. Absent or stale, it simply is not
@@ -905,14 +950,37 @@ impl Executor {
 
         let mut amount = crate::route::u256_to_f64(route.amount_in);
         for hop in &route.hops {
-            let here = match fresh {
+            let mut here = match fresh {
                 Some((p, s)) if p == hop.pool_ref() => s,
                 _ => *known.as_ref()?.get(&hop.pool_ref())?,
             };
+            // The one thing about the log the chain gets to overrule. A log fee
+            // landing exactly on the pool's stored LP fee while slot0 says a
+            // protocol fee is charged cannot be a combined figure: combining a
+            // non-zero protocol fee always lands strictly above the LP fee. So
+            // that log is reporting the LP fee alone, and pricing it as the
+            // total would undercharge every buy by the protocol's cut. Take the
+            // snapshot's reading instead, and say so rather than silently
+            // disagreeing with the log.
+            if let Some(snap) = known.as_ref().and_then(|k| k.get(&hop.pool_ref())) {
+                let from_log = matches!(fresh, Some((p, _)) if p == hop.pool_ref());
+                let charges_protocol = snap.swap_fee(hop.zero_for_one()) != snap.lp_fee;
+                if from_log && charges_protocol && here.lp_fee == snap.lp_fee {
+                    warn!(
+                        route = %route.name,
+                        pool = %hop.pool_ref(),
+                        log_fee = here.lp_fee,
+                        "the swap log reports the LP fee alone, not the combined swap fee - \
+                         pricing this hop from slot0's protocol fee instead"
+                    );
+                    here.protocol_fee_0for1 = snap.protocol_fee_0for1;
+                    here.protocol_fee_1for0 = snap.protocol_fee_1for0;
+                }
+            }
             let (out, after) = crate::depth::in_range_out(
                 here.sqrt_p,
                 here.liquidity,
-                here.lp_fee,
+                here.swap_fee(hop.zero_for_one()),
                 hop.zero_for_one(),
                 amount,
             )?;
@@ -924,6 +992,10 @@ impl Executor {
             }
             amount = out;
         }
+
+        // What the pools state, less what this direction was measured to pay
+        // beyond them.
+        let amount = amount * yield_ppm.min(PPM) as f64 / PPM as f64;
 
         let raw = crate::route::f64_to_u256_pub(amount);
         (!raw.is_zero()).then_some(raw)
