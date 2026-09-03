@@ -32,9 +32,9 @@
 //!
 //! Usage:
 //!   probe [--endpoint URL]... [--read URL] [--rounds 5] [--send] [--config PATH]
-//!   probe --watch [--feed WSS] [--ws WSS] [--address 0x..] [--seconds 300] [--warmup 100]
+//!   probe --watch [--feed WSS] [--ws WSS] [--address 0x..] [--seconds 300] [--warmup 10]
 //!   probe --offset [--feed WSS] [--read URL] [--samples 10]
-//!   probe --heads  [--feed WSS] [--ws WSS] [--seconds 300] [--warmup 100]
+//!   probe --heads  [--feed WSS] [--ws WSS] [--seconds 300] [--warmup 10]
 //!
 //! Takes what it needs from the environment, the same names the bot itself
 //! reads over its config file: `SUBMIT_URLS` (comma separated) for what to
@@ -152,6 +152,34 @@ fn block_stats(v: &[i64]) -> String {
 }
 
 
+/// Open the feed at the head rather than wherever its backlog begins.
+///
+/// A plain connection is handed about four and a half minutes of history and
+/// streams it forward at several times real time before reaching the present.
+/// Every measurement taken during that stretch is a measurement of the backlog,
+/// and the first three attempts at timing this feed were ruined by it.
+///
+/// The broadcaster honours `Arbitrum-Requested-Sequence-Number`, and a number
+/// past the end means "start at the head" rather than "wait for it" - so the
+/// largest one there is asks for the present without having to know what the
+/// present is. The equivalent query parameter is ignored; only the header
+/// works. Tested against this chain, both facts.
+async fn connect_feed(
+    url: &str,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
+{
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().context("bad feed url")?;
+    req.headers_mut().insert(
+        "Arbitrum-Requested-Sequence-Number",
+        u64::MAX.to_string().parse().expect("a number is a valid header value"),
+    );
+    let (stream, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .context("connecting to the feed")?;
+    Ok(stream)
+}
+
 /// A Nitro sequencer feed frame. Only the transactions are wanted; the rest of
 /// the envelope - sequence numbers, L1 header, delayed-message counts - is
 /// deliberately not modelled, because none of it is a key this can match on.
@@ -225,15 +253,13 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
         .transpose()
         .context("--seconds is not a number")?
         .unwrap_or(300);
-    // The feed does not start at the head. A fresh connection is handed a
-    // backlog and streams forward until it catches up, and every frame in that
-    // stretch is read later than it was sent - which reads as the feed being
-    // tens of seconds SLOWER than it is. Nothing before this is counted.
+    // Small now that `connect_feed` asks for the head: what is left to settle is
+    // a connection warming up, not four minutes of history being replayed.
     let warmup: u64 = value("--warmup")
         .map(|v| v.parse())
         .transpose()
         .context("--warmup is not a number")?
-        .unwrap_or(seconds / 3);
+        .unwrap_or(10);
     anyhow::ensure!(warmup < seconds, "--warmup must be shorter than --seconds");
     let feed_url = value("--feed")
         .or_else(|| env_var("FEED_URL"))
@@ -266,9 +292,7 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     // ahead of. So the reader does nothing but stamp and hand off.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Duration, String)>();
     let reader = tokio::spawn(async move {
-        let (stream, _) = tokio_tungstenite::connect_async(&feed_url)
-            .await
-            .context("connecting to the feed")?;
+        let stream = connect_feed(&feed_url).await?;
         println!("feed open");
         let (_w, mut r) = stream.split();
         while let Some(msg) = r.next().await {
@@ -323,7 +347,7 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     });
 
     println!(
-        "watching for {seconds}s, ignoring the first {warmup}s while the feed catches up: \
+        "watching for {seconds}s, ignoring the first {warmup}s while both connections settle: \
          feed against the rpc log stream{}",
         address.map(|a| format!(" for {a}")).unwrap_or_default()
     );
@@ -463,9 +487,7 @@ async fn offset(args: &[String], cfg: &Cfg) -> Result<()> {
         .context("nowhere to ask: pass --read URL or set HTTP_URL")?;
     let read = Provider::<Http>::try_from(read_url.clone()).context("bad read endpoint")?;
 
-    let (stream, _) = tokio_tungstenite::connect_async(&feed_url)
-        .await
-        .context("connecting to the feed")?;
+    let stream = connect_feed(&feed_url).await?;
     println!("feed open, reads via {}\n", label(&read_url));
     let (_w, mut r) = stream.split();
 
@@ -551,14 +573,13 @@ async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
         .transpose()
         .context("--seconds is not a number")?
         .unwrap_or(300);
-    // The feed opens behind the head and streams forward until it catches up.
-    // Everything before it does is a measurement of the backlog, not of the
-    // network, so none of it is counted.
+    // Small now that `connect_feed` asks for the head: what is left to settle is
+    // a connection warming up, not four minutes of history being replayed.
     let warmup: u64 = value("--warmup")
         .map(|v| v.parse())
         .transpose()
         .context("--warmup is not a number")?
-        .unwrap_or(seconds / 3);
+        .unwrap_or(10);
     anyhow::ensure!(warmup < seconds, "--warmup must be shorter than --seconds");
     let feed_url = value("--feed")
         .or_else(|| env_var("FEED_URL"))
@@ -574,9 +595,7 @@ async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
 
     let feed_seen = Arc::clone(&from_feed);
     let feed_task = tokio::spawn(async move {
-        let (stream, _) = tokio_tungstenite::connect_async(&feed_url)
-            .await
-            .context("connecting to the feed")?;
+        let stream = connect_feed(&feed_url).await?;
         println!("feed open");
         let (_w, mut r) = stream.split();
         while let Some(msg) = r.next().await {
@@ -611,7 +630,7 @@ async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    println!("watching for {seconds}s, ignoring the first {warmup}s while the feed catches up");
+    println!("watching for {seconds}s, ignoring the first {warmup}s while both connections settle");
     tokio::time::sleep(Duration::from_secs(seconds)).await;
     feed_task.abort();
     rpc_task.abort();
