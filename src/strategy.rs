@@ -12,7 +12,7 @@ use crate::pool::Pool;
 use crate::route::PoolRef;
 use ethers::providers::{Http, Provider};
 use ethers::types::{H256, U256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -169,6 +169,9 @@ pub enum Report {
         /// Raw units the trade was quoted at; the receipt overrides it.
         raw: ethers::types::U256,
         price: f64,
+        /// A sale's proceeds - which token comes back and how much - credited
+        /// to tracked cash the moment this is reserved. `None` for a buy.
+        credit: Option<(ethers::types::Address, ethers::types::U256)>,
     },
     /// The chain answered, with what the receipt says actually moved.
     Settled {
@@ -176,7 +179,12 @@ pub enum Report {
         pool: PoolRef,
         ok: bool,
         moved: Option<ethers::types::U256>,
+        /// A sale's real proceeds, if this settlement has any to reconcile.
+        credit_moved: Option<ethers::types::U256>,
     },
+    /// A buy was never broadcast - skipped, or failed before it went out.
+    /// Releases the spend `on_tick` committed when it decided to try.
+    BuyAborted { pool: PoolRef },
     /// A sale could not even be broadcast.
     SellFailed { pool: PoolRef },
     /// A sale was not attempted after all - a dry run, or nothing held.
@@ -190,6 +198,7 @@ struct Settled {
     pool: PoolRef,
     ok: bool,
     moved: Option<ethers::types::U256>,
+    credit_moved: Option<ethers::types::U256>,
 }
 
 /// How many times a sale is retried before the pair is left alone. A sale that
@@ -231,7 +240,8 @@ impl Strategy {
             let token = p.token.parse().unwrap_or_default();
             let side = if landed.outcome.happened() {
                 let moved = self.moved_in(&landed, p.side, token);
-                self.inventory.settle(hash, moved)
+                let credit_moved = self.received_of(&landed, p.credit_token());
+                self.inventory.settle(hash, moved, credit_moved)
             } else {
                 self.inventory.rollback(hash)
             };
@@ -245,9 +255,129 @@ impl Strategy {
         }
     }
 
+    /// Adopt whatever the wallet already holds of the tokens we could sell.
+    ///
+    /// Without this the bot is blind to its own balance: a token bought before
+    /// it started, or by hand, would never be sold - not on a target and not on
+    /// a timeout - while a single new fill would then sell all of it anyway,
+    /// against an average that only knew about the new part.
+    ///
+    /// The entry price has to be assumed, because the real one is unknowable.
+    /// The price right now is the least wrong choice and is marked as a guess,
+    /// so a target derived from it is never mistaken for one derived from fills.
+    pub async fn seed_inventory(&mut self) {
+        let Some(exec) = self.exec.clone() else {
+            return;
+        };
+        let mut seeded = 0;
+        for (key, watch) in &self.watches {
+            let Some(token) = watch.pool.base_currency() else {
+                continue;
+            };
+            let Some(route) = exec.route_for(*key) else {
+                continue;
+            };
+            // The same misconfiguration `armed_for` refuses to buy on: a route
+            // aimed at a pool whose base side is not what it buys. Adopting
+            // here would stamp one token's balance with another's name.
+            if route.output.address != token {
+                warn!(
+                    pool = %watch.pool.name,
+                    route = %route.name,
+                    buys = %route.output.symbol,
+                    "route buys a different token than this pool's base - not adopting its \
+                     balance; check base_token on the pool, or trigger_pool on the route"
+                );
+                continue;
+            }
+            if self.inventory.get(token).is_some() {
+                continue;
+            }
+            let held = match crate::swap::balance_of(&self.http, token, exec.owner()).await {
+                Ok(h) if !h.is_zero() => h,
+                _ => continue,
+            };
+            let Some(price) = self.pool_price(&watch.pool).await else {
+                warn!(
+                    pool = %watch.pool.name,
+                    "holds a balance but its price cannot be read; not adopting it"
+                );
+                continue;
+            };
+            if self.inventory.seed(
+                token,
+                &route.output.symbol,
+                route.output.decimals,
+                held,
+                price,
+            ) {
+                seeded += 1;
+                warn!(
+                    token = %route.output.symbol,
+                    qty = %crate::route::format_units(held, route.output.decimals),
+                    assumed_entry = price,
+                    "ADOPTED a balance this bot did not buy; its entry price is the price now, \
+                     not what it cost"
+                );
+            }
+        }
+        if seeded > 0 {
+            self.save();
+        }
+
+        // Every distinct token an armed route spends, read once each: this is
+        // the one real chain read the tracked cash balance ever gets, and
+        // everything after startup keeps it in step locally instead.
+        let mut spend_tokens = HashSet::new();
+        for key in self.watches.keys() {
+            if let Some(route) = exec.route_for(*key) {
+                spend_tokens.insert((route.input.address, route.input.symbol.clone()));
+            }
+        }
+        for (token, symbol) in spend_tokens {
+            match crate::swap::balance_of(&self.http, token, exec.owner()).await {
+                Ok(balance) => {
+                    info!(token = %symbol, %balance, "wallet balance tracked");
+                    self.inventory.set_cash(token, balance);
+                }
+                Err(e) => warn!(
+                    token = %symbol, err = %format!("{e:#}"),
+                    "could not read starting balance; treating it as zero until the next \
+                     successful sale credits it"
+                ),
+            }
+        }
+        self.save();
+    }
+
+    /// This pool's price of its base token, read from its own state.
+    async fn pool_price(&self, pool: &Pool) -> Option<f64> {
+        let reader = crate::depth::TickReader::new(
+            &self.http,
+            pool.tick_source()?,
+            pool.tick_spacing?,
+        )
+        .ok()?;
+        let state = crate::depth::read_state(&reader).await.ok()?;
+        let price = crate::price::from_sqrt(
+            state.sqrt_p,
+            pool.decimals0,
+            pool.decimals1,
+            pool.base_token,
+        );
+        (price.is_finite() && price > 0.0).then_some(price)
+    }
+
     /// Follow a transaction and bring its outcome back to the one place that
     /// may act on it.
-    fn follow(&self, hash: H256, pool: PoolRef, token: ethers::types::Address, label: String) {
+    fn follow(
+        &self,
+        hash: H256,
+        pool: PoolRef,
+        token: ethers::types::Address,
+        credit_token: Option<ethers::types::Address>,
+        label: String,
+    ) {
         let http = self.http.clone();
         let back = self.reports.clone();
         let owner = self.exec.as_ref().map(|e| e.owner());
@@ -257,12 +387,19 @@ impl Strategy {
             // sale nothing arrives in this token, so there is nothing to read
             // and the reserved amount stands.
             let moved = owner.and_then(|o| crate::swap::received(&landed.logs, token, o));
+            // The same question about a sale's proceeds, in whichever token
+            // that is - `settle` reconciles the optimistic credit against this.
+            let credit_moved = match (owner, credit_token) {
+                (Some(o), Some(ct)) => crate::swap::received(&landed.logs, ct, o),
+                _ => None,
+            };
             let _ = back
                 .send(Report::Settled {
                     hash,
                     pool,
                     ok: landed.outcome.happened(),
                     moved,
+                    credit_moved,
                 })
                 .await;
         });
@@ -280,8 +417,18 @@ impl Strategy {
         if side != Side::Buy {
             return None;
         }
+        self.received_of(landed, Some(token))
+    }
+
+    /// What a settled trade delivered of `token`, read from the receipt - or
+    /// `None` when there is nothing to ask about.
+    fn received_of(
+        &self,
+        landed: &crate::swap::Landed,
+        token: Option<ethers::types::Address>,
+    ) -> Option<ethers::types::U256> {
         let owner = self.exec.as_ref()?.owner();
-        crate::swap::received(&landed.logs, token, owner)
+        crate::swap::received(&landed.logs, token?, owner)
     }
 
     /// Watch a pool for a drop of `threshold_pct` inside one block.
@@ -396,33 +543,63 @@ impl Strategy {
         // let the next signal be judged on a backlog rather than on the state
         // it was raised from.
         if let Some(exec) = self.exec.clone() {
-            let back = self.reports.clone();
-            let (p, s, key) = (pool.clone(), sig.clone(), tick.pool);
-            tokio::spawn(async move {
-                match exec.on_drop(&p, &s).await {
-                    Ok(Some(fill)) => {
-                        let Some(token) = p.base_currency() else { return };
-                        let (symbol, decimals) = match exec.route_for(key) {
-                            Some(r) => (r.output.symbol.clone(), r.output.decimals),
-                            None => return,
-                        };
-                        let _ = back
-                            .send(Report::Filled {
-                                hash: fill.hash,
-                                pool: key,
-                                side: Side::Buy,
-                                token,
-                                symbol,
-                                decimals,
-                                raw: fill.amount_out,
-                                price: s.price,
-                            })
-                            .await;
-                    }
-                    Ok(None) => {}
-                    Err(e) => warn!(pool = %p.name, err = %format!("{e:#}"), "auto-buy failed"),
+            if let Some(route) = exec.route_for(tick.pool) {
+                let (spend_token, spend) = (route.input.address, route.amount_in);
+                let have = self.inventory.cash(spend_token);
+                if have < spend {
+                    warn!(
+                        pool = %pool.name,
+                        token = %route.input.symbol,
+                        have = %crate::route::format_units(have, route.input.decimals),
+                        need = %crate::route::format_units(spend, route.input.decimals),
+                        "not buying: tracked balance is not enough"
+                    );
+                } else {
+                    // Committed here, synchronously, so a decision made a
+                    // moment later for a different route spending the same
+                    // token sees the wallet as already spoken for. Released by
+                    // whichever of `BuyAborted` or a failed `Settled` fits what
+                    // actually happened to it. Not written to disk: this loop
+                    // must not wait on a file, every outcome that can follow
+                    // saves anyway, and a crash before one arrives is healed by
+                    // the balance re-read at startup.
+                    self.inventory.debit_cash(spend_token, spend);
+
+                    // What the route buys, decided now rather than looked up
+                    // after the fact: a fill has to be recorded whatever the
+                    // pool knows about its own tokens, and the route is the one
+                    // thing that certainly knows what it just bought.
+                    let bought = route.output.clone();
+                    let back = self.reports.clone();
+                    let (p, s, key) = (pool.clone(), sig.clone(), tick.pool);
+                    tokio::spawn(async move {
+                        match exec.on_drop(&p, &s).await {
+                            Ok(Some(fill)) => {
+                                let _ = back
+                                    .send(Report::Filled {
+                                        hash: fill.hash,
+                                        pool: key,
+                                        side: Side::Buy,
+                                        token: bought.address,
+                                        symbol: bought.symbol,
+                                        decimals: bought.decimals,
+                                        raw: fill.amount_out,
+                                        price: s.price,
+                                        credit: None,
+                                    })
+                                    .await;
+                            }
+                            Ok(None) => {
+                                let _ = back.send(Report::BuyAborted { pool: key }).await;
+                            }
+                            Err(e) => {
+                                warn!(pool = %p.name, err = %format!("{e:#}"), "auto-buy failed");
+                                let _ = back.send(Report::BuyAborted { pool: key }).await;
+                            }
+                        }
+                    });
                 }
-            });
+            }
         }
 
         let http = self.http.clone();
@@ -433,7 +610,8 @@ impl Strategy {
     /// or was never real.
     async fn on_report(&mut self, r: Report) {
         let s = match r {
-            Report::Filled { hash, pool, side, token, symbol, decimals, raw, price } => {
+            Report::Filled { hash, pool, side, token, symbol, decimals, raw, price, credit } => {
+                let credit_token = credit.map(|(t, _)| t);
                 let trade = crate::inventory::Trade {
                     side,
                     token,
@@ -441,12 +619,23 @@ impl Strategy {
                     decimals,
                     raw,
                     price,
+                    credit,
                 };
                 if self.inventory.reserve(hash, trade) {
                     self.save();
                     info!(tx = ?hash, token = %symbol, ?side, %raw, price, "reserved");
-                    self.follow(hash, pool, token, format!("{side:?} {symbol}").to_lowercase());
+                    self.follow(
+                        hash,
+                        pool,
+                        token,
+                        credit_token,
+                        format!("{side:?} {symbol}").to_lowercase(),
+                    );
                 }
+                return;
+            }
+            Report::BuyAborted { pool } => {
+                self.release_buy_spend(pool);
                 return;
             }
             Report::SellSkipped { pool } => {
@@ -461,13 +650,20 @@ impl Strategy {
                 }
                 return;
             }
-            Report::Settled { hash, pool, ok, moved } => Settled { hash, pool, ok, moved },
+            Report::Settled { hash, pool, ok, moved, credit_moved } => {
+                Settled { hash, pool, ok, moved, credit_moved }
+            }
         };
         let side = if s.ok {
-            self.inventory.settle(s.hash, s.moved)
+            self.inventory.settle(s.hash, s.moved, s.credit_moved)
         } else {
             self.inventory.rollback(s.hash)
         };
+        // Broadcast, but reverted or dropped: the spend `on_tick` committed
+        // never left the wallet. Given back before the one save below.
+        if side == Some(Side::Buy) && !s.ok {
+            self.release_buy_spend(s.pool);
+        }
         self.save();
 
         let Some(side) = side else {
@@ -538,6 +734,20 @@ impl Strategy {
     fn save(&self) {
         if let Err(e) = self.inventory.save() {
             warn!(err = %format!("{e:#}"), "could not write the inventory");
+        }
+    }
+
+    /// Give a buy's committed spend back - by the route that would have spent
+    /// it, in case more than one shares this pool's input token. In memory
+    /// only: the debit it undoes was never written either, so there is nothing
+    /// on disk to correct.
+    fn release_buy_spend(&mut self, pool: PoolRef) {
+        match self.exec.as_ref().and_then(|e| e.route_for(pool)) {
+            Some(route) => self.inventory.credit_cash(route.input.address, route.amount_in),
+            None => warn!(
+                id = %pool,
+                "a buy's spend could not be given back: no route is armed against this pool"
+            ),
         }
     }
 }
@@ -624,6 +834,12 @@ impl Strategy {
                     // exactly that from the position.
                     raw: fill.sold,
                     price: 0.0,
+                    // What it should bring back, credited to tracked cash the
+                    // moment this reserves - see `Trade::credit`. The quote,
+                    // not the receipt: precise enough for a spend gate, and
+                    // available now rather than after a bisection's worth of
+                    // waiting.
+                    credit: Some((route.input.address, fill.amount_out)),
                 },
                 Ok(None) => Report::SellSkipped { pool },
                 Err(e) => {

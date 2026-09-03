@@ -57,8 +57,12 @@ pub struct Config {
     pub tokens: HashMap<String, String>,
     /// How often (seconds) to re-measure what an armed route's pools take on
     /// top of their stated fees - a hook charging its own cut shows up here and
-    /// nowhere else. 0 turns the measurement off. Only armed routes are
-    /// measured, and only in the background.
+    /// nowhere else. The figure is a check, not a term in the price: a route
+    /// never measured is not traded, and one found keeping more than a quarter
+    /// of a swap is refused (see `executor::unstated_fee_acceptable`). The same
+    /// pass snapshots every pool on the route, which is what the hops a signal
+    /// says nothing about are priced from. So 0 here means no armed route is
+    /// ever bought. Only armed routes are measured, and only in the background.
     #[serde(default = "default_calibrate")]
     pub calibrate_secs: u64,
     /// Where to keep what the chain has already told us about pools and
@@ -70,14 +74,6 @@ pub struct Config {
     /// written after every fill, so a restart does not forget an entry price.
     #[serde(default = "default_inventory")]
     pub inventory_path: String,
-    /// Price an armed buy from the measured model instead of asking the router,
-    /// which takes the last round trip out of the path between a drop and a
-    /// signed transaction. Off by default: the router's answer is exact and
-    /// doubles as a rehearsal, and giving that up trades a guarantee for
-    /// latency. Falls back to asking whenever the model is not in a position to
-    /// answer - see `calibrate_secs`, which is what keeps it honest.
-    #[serde(default)]
-    pub fast_quote: bool,
     /// Uniswap Universal Router, the contract swaps are sent to.
     #[serde(default)]
     pub universal_router: Option<String>,

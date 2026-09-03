@@ -106,8 +106,7 @@ Global:
 |---|---|
 | `threshold_pct` | drop inside one block that counts as a signal |
 | `max_move_pct` | what the depth line in a signal is measured against |
-| `calibrate_secs` | how often to re-measure what pools take on top of their stated fee; `0` disables |
-| `fast_quote` | price a buy from the measured model instead of asking the router - one round trip instead of two, at the cost of the router's rehearsal |
+| `calibrate_secs` | how often to re-measure what a route takes on top of its pools' stated fees. A safety check, not a price input: an unmeasured route is not bought, and one keeping over 25% is refused. `0` disables it, so nothing is ever bought |
 | `pool_cache_path` | where recovered PoolKeys, decimals and symbols are kept |
 | `inventory_path` | where positions and unsettled trades are kept |
 | `universal_router`, `pool_manager`, `permit2` | contracts |
@@ -156,7 +155,7 @@ and said so, with the position still held and still recorded.
 
 | | |
 |---|---|
-| `inventory.json` | positions and trades in flight. Deleting it loses the entry prices, and with them the take-profit targets |
+| `inventory.json` | positions, trades in flight, and the tracked spendable balance of whatever a route spends. Deleting it loses the entry prices (and with them the take-profit targets) and the tracked balance - the next start just re-reads the real one |
 | `pools.json` | recovered PoolKeys, decimals, symbols. All immutable; deleting it only costs a slow start (about 5s instead of 0.2s) |
 
 Both are gitignored and written through a temporary file, so a crash mid-write
@@ -168,9 +167,19 @@ leaves the previous state rather than half of the new one.
   On `CAMELTOE/LULU` a 5% drop means 5% cheaper in LULU; if LULU itself moved,
   the dollar price may have gone the other way. The same goes for
   `take_profit_pct`.
-- Trades are priced by asking the router, which also proves the balance,
-  allowances and deadline for free. `fast_quote` gives that up for one round
-  trip of latency.
+- A buy is priced entirely from memory and never asks the router, so nothing
+  rehearses it. The pool that dropped is priced from the very log that raised
+  the signal - price, liquidity and the fee it actually charged; any other hop
+  on the route from the last calibration snapshot. What calibration measures on
+  top of that is only a check: an unmeasured route is not bought, one keeping
+  over 25% of a swap is refused. Nor is the wallet balance read from the chain
+  per buy: it is read once at startup and kept as a running total from there,
+  debited the moment a buy is decided and credited back if it never lands -
+  accurate because nothing but this bot spends from the wallet while it runs.
+  Allowance is checked once when the route is armed and otherwise relies on the
+  unlimited approval `--approve` sets up. Selling and every manual command
+  (`--swap`, `--sell-all`, `--quote`) still ask the router when the model cannot
+  answer, which is slower but proves the trade first.
 - `cooldown_secs = 0` buys on every signal, so a dip lasting ten blocks buys ten
   times.
 

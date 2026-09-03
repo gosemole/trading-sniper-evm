@@ -16,20 +16,22 @@
 //! the route buys - that is a misconfiguration, and refusing to buy is the only
 //! safe reading of it.
 //!
-//! One round trip stands between a signal and a signed transaction. The quote
-//! is taken from the router at that instant - not from the price in the log,
-//! and not from the local tick walk - and `amountOutMinimum` is that quote less
-//! the route's own slippage tolerance, so what the trade will accept is
-//! recomputed for this pair every single time.
+//! One round trip stands between a signal and a signed transaction, and it is
+//! the send. The buy is priced entirely from memory: the pool that dropped
+//! brought its own price, liquidity and fee in the very log that raised the
+//! signal, the other pools on the route come from the last calibration pass,
+//! and what a hook takes on top is the correction that pass measured. See
+//! `model_quote` for the arithmetic and the conditions under which it refuses
+//! to answer - and `amountOutMinimum` is that price less the route's own
+//! slippage tolerance, so what the trade will accept is recomputed for this
+//! pair every single time.
 //!
-//! That single call also *is* the rehearsal. It runs the real batch and is
-//! refused only by the final `TAKE_ALL`, which means the input was settled
-//! through Permit2 and every hop swapped - balance, allowance and deadline all
-//! proven. The minimum it then goes out with is derived from the amount that
-//! call reported, so it can only be lower. A second `eth_call` to confirm the
-//! exact bytes would re-prove that arithmetic and cost a round trip on the one
-//! path where latency is the whole point, so the hot path does without it;
-//! `--swap` and `--sell-all`, where nobody is racing, still run it.
+//! Nothing here asks the router to rehearse the trade, so nothing proves the
+//! wallet can afford it except a balance check run for that purpose alone -
+//! see `quote`. Allowance is checked once, when the route is armed, and relies
+//! on the unlimited approval this bot's own `--approve` sets up; it is not
+//! re-proven per buy. `--swap` and `--sell-all`, where nobody is racing, still
+//! run the real rehearsal through `execute::verify` before sending.
 //!
 //! Routes are resolved once at startup: recovering a PoolKey takes a couple of
 //! dozen archive reads, which is fine before the stream opens and far too slow
@@ -106,8 +108,6 @@ struct Quoted {
     /// How long the asking took, so the log separates the network from
     /// everything else - which is otherwise invisible and dominates.
     took: Duration,
-    /// Where the number came from, for the log: the model or the router.
-    by: &'static str,
     /// Deferred: a gas price that could not be read only matters if we send.
     fees: Result<(U256, U256)>,
     /// The nonce the node reported while the quote was in flight, if asked.
@@ -133,6 +133,11 @@ const MAX_MODELLED_IMPACT: f64 = 0.005;
 /// noise; measurement jitter across sizes came out at 3 ppm.
 const YIELD_ALERT_PPM: u64 = 500;
 
+/// The most a route may be measured to take beyond its pools' stated fees
+/// before the bot refuses to price it at all. A hook that suddenly keeps a
+/// quarter of every swap is not a fee to model around; it is a reason to stop.
+const MAX_UNSTATED_FEE_PPM: u64 = 250_000;
+
 /// What to sign with when the route has never been measured - enough for a
 /// two-leg swap, and unused gas is refunded either way.
 const GAS_FALLBACK: u64 = 1_200_000;
@@ -151,8 +156,6 @@ pub struct Executor {
     /// Trigger pool -> what to buy when it drops.
     plans: HashMap<PoolRef, Plan>,
     last_fire: Mutex<HashMap<PoolRef, Instant>>,
-    /// Price armed buys from the measured model rather than by asking.
-    model_pricing: bool,
     /// The gas price, kept current from the block stream instead of asked for
     /// on every buy.
     fees: Arc<swap::FeeWatch>,
@@ -280,7 +283,6 @@ impl Executor {
             manager,
             permit2,
             calibrate_secs: cfg.calibrate_secs,
-            model_pricing: cfg.fast_quote,
             wallet,
             owner,
             execute,
@@ -401,8 +403,6 @@ impl Executor {
         Ok(())
     }
 
-    /// React to one big-sell signal.
-    /// React to one big-sell signal: decide, price, sign, send.
     /// The address everything is signed and settled from.
     pub fn owner(&self) -> Address {
         self.owner
@@ -414,6 +414,7 @@ impl Executor {
         self.plans.get(&key).map(|p| &p.route)
     }
 
+    /// React to one big-sell signal: decide, price, sign, send.
     pub async fn on_drop(self: &Arc<Self>, pool: &Pool, sig: &Signal) -> Result<Option<Fill>> {
         let Some((key, plan)) = self.armed_for(pool) else {
             return Ok(None);
@@ -425,7 +426,7 @@ impl Executor {
         let route = &plan.route;
         let started = Instant::now();
         let deadline = execute::deadline_in(120);
-        let quoted = self.quote(plan, key, sig, deadline).await?;
+        let quoted = self.quote(plan, key, sig).await?;
 
         let min_out = execute::apply_slippage(quoted.amount_out, route.max_slippage_pct);
         anyhow::ensure!(
@@ -444,7 +445,7 @@ impl Executor {
             drop_pct = format!("-{:.3}%", sig.drop_pct),
             spend = amount(route.amount_in, &route.input),
             quoted = amount(quoted.amount_out, &route.output),
-            priced_by = quoted.by,
+            priced_by = "model",
             quote_ms = quoted.took.as_millis(),
             min_out = amount(min_out, &route.output),
             slippage_pct = route.max_slippage_pct,
@@ -465,9 +466,10 @@ impl Executor {
     ///
     /// The size is the wallet's actual balance rather than anything remembered:
     /// what is there is what can be sold, and a position built by several buys
-    /// or topped up by hand is still one balance. Unlike a buy, this is not
-    /// racing anyone, so it is priced by asking the router even when that costs
-    /// a bisection.
+    /// or topped up by hand is still one balance. Priced by the model when one
+    /// is armed and calibrated; unlike a buy, this is not racing anyone, so a
+    /// model that cannot answer falls back to asking the router even when that
+    /// costs a bisection, rather than skipping the sale.
     pub async fn sell_all(
         self: &Arc<Self>,
         key: PoolRef,
@@ -515,22 +517,29 @@ impl Executor {
         }
 
         let deadline = execute::deadline_in(300);
-        // The model gets first refusal here too. It matters more on a sale than
-        // on a buy: a reversed route that ends on v3 is quoted by bisection,
-        // which is twenty-odd calls rather than one.
-        let modelled = match (self.model_pricing, self.plans.get(&key)) {
-            (true, Some(plan)) => {
-                // Measured in this direction when the token was held long
-                // enough to measure it; otherwise the buying figure, which
-                // assumes the hook charges the same both ways.
-                let measured = plan.sell_yield_ppm.load(Ordering::Relaxed);
-                let ppm = match measured {
+        // The model gets first refusal here too, when there is a plan to price
+        // it from - a sale of a token no route buys has no calibration to draw
+        // on and goes straight to the router. It matters more here than on a
+        // buy: a reversed route that ends on v3 is quoted by bisection, which
+        // is twenty-odd calls rather than one, and unlike a buy a sale is not
+        // racing anyone, so the fallback stays.
+        let modelled = match self.plans.get(&key) {
+            Some(plan) => {
+                // The fee check uses the figure measured in this direction when
+                // the token was held long enough to measure it; otherwise the
+                // buying figure, which assumes the hook charges the same both
+                // ways. Failing it does not stop the sale - the router prices
+                // it instead, and prices it honestly.
+                let ppm = match plan.sell_yield_ppm.load(Ordering::Relaxed) {
                     0 => plan.yield_ppm.load(Ordering::Relaxed),
                     m => m,
                 };
-                self.model_quote(plan, &sell, ppm, None).await
+                match self.unstated_fee_acceptable(plan, ppm) {
+                    true => self.model_quote(plan, &sell, None).await,
+                    false => None,
+                }
             }
-            _ => None,
+            None => None,
         };
         let (amount_out, priced_by) = match modelled {
             Some(a) => (a, "model"),
@@ -634,52 +643,68 @@ impl Executor {
 
     /// Everything a buy needs that could not be worked out from memory alone.
     ///
-    /// All three are asked for at once, so the slowest of them sets the pace
-    /// rather than their sum. The gas price usually answers from the last block
-    /// header without going anywhere, and the quote is skipped entirely when
-    /// the model can price the route itself.
+    /// The router is never asked here: the model prices the trade from the
+    /// dropping pool's own log plus the last calibration pass, or the buy is
+    /// skipped - see `model_quote`. That is what keeps a buy to one round trip
+    /// (the send) instead of two, at the cost of the router's rehearsal - which
+    /// is why nothing here reads a balance either: the caller already checked
+    /// the wallet can cover this against its own tracked figure before this was
+    /// ever called, and a second read here would be the very round trip that
+    /// tracking it locally exists to avoid. Fees and nonce are asked for
+    /// together, so the slower of the two sets the pace rather than their sum -
+    /// and the gas price usually answers from the last block header without
+    /// going anywhere at all.
     async fn quote(
         &self,
         plan: &Plan,
         key: PoolRef,
         sig: &Signal,
-        deadline: U256,
     ) -> Result<Quoted> {
         let started = Instant::now();
-        let modelled = match self.model_pricing {
-            true => {
-                let fresh = (
-                    key,
-                    HopState {
-                        sqrt_p: crate::pool::sqrt_to_f64(sig.sqrt),
-                        liquidity: sig.liquidity,
-                        lp_fee: sig.lp_fee.unwrap_or(0),
-                    },
-                );
-                self.model_quote(
-                    plan,
-                    &plan.route,
-                    plan.yield_ppm.load(Ordering::Relaxed),
-                    sig.lp_fee.map(|_| fresh),
-                )
-                .await
-            }
-            false => None,
+        anyhow::ensure!(
+            self.unstated_fee_acceptable(plan, plan.yield_ppm.load(Ordering::Relaxed)),
+            "route '{}': not buying - see the fee check above",
+            plan.route.name
+        );
+        // The fee the swap was actually charged when the log carries one (v4,
+        // hook override and all), else the pool's own fixed fee (v3 logs have
+        // no fee word because the fee cannot change). A v4 pool that logged
+        // nothing is left to the calibration snapshot rather than priced with
+        // its PoolKey's dynamic-fee flag, which is a flag and not a fee.
+        let fee = sig.lp_fee.or_else(|| {
+            plan.route
+                .hops
+                .iter()
+                .find(|h| h.pool_ref() == key)
+                .map(|h| h.fee)
+                .filter(|f| u64::from(*f) < PPM)
+        });
+        let fresh = fee.map(|lp_fee| {
+            (
+                key,
+                HopState {
+                    sqrt_p: crate::pool::sqrt_to_f64(sig.sqrt),
+                    liquidity: sig.liquidity,
+                    lp_fee,
+                },
+            )
+        });
+        let modelled = self.model_quote(plan, &plan.route, fresh).await;
+        // The model prices every buy or none does: there is no router
+        // fallback on this path. Skip the buy instead of guessing; it costs
+        // nothing but this one drop, and there will be another.
+        let Some(amount_out) = modelled else {
+            anyhow::bail!(
+                "route '{}': the model could not price this trade right now (state too \
+                 stale, a hop's pool changed count, or the move too large to trust the \
+                 in-range formula) - skipping rather than guessing",
+                plan.route.name
+            );
         };
+
         // A nonce is only spent by a real send, so a dry run does not ask.
         let want_nonce = self.execute;
-        let (amount, fees, nonce_seen) = tokio::join!(
-            async {
-                match modelled {
-                    Some(a) => Ok((a, "model")),
-                    None => execute::verify(
-                        &self.http, self.router, self.owner, &plan.route,
-                        U256::zero(), deadline, None,
-                    )
-                    .await
-                    .map(|q| (q.amount_out, "router")),
-                }
-            },
+        let (fees, nonce_seen) = tokio::join!(
             self.fees.params(&self.http),
             async {
                 match want_nonce {
@@ -688,14 +713,40 @@ impl Executor {
                 }
             },
         );
-        let (amount_out, by) = amount.context("quoting the route")?;
         Ok(Quoted {
             amount_out,
             took: started.elapsed(),
-            by,
             fees,
             nonce_seen,
         })
+    }
+
+    /// The calibration's one job on the trading path: a check, not a term.
+    ///
+    /// What a route is measured to take beyond its stated fees is not folded
+    /// into the price - the pool that drops reports the fee it really charged
+    /// in its own log, and that is what the model prices with. The measurement
+    /// stands guard instead: a route never measured is not traded, and one
+    /// found keeping more than `MAX_UNSTATED_FEE_PPM` is refused and said so.
+    fn unstated_fee_acceptable(&self, plan: &Plan, yield_ppm: u64) -> bool {
+        if yield_ppm == 0 {
+            warn!(
+                route = %plan.route.name,
+                "not priced: the route's fee has not been measured yet (see calibrate_secs)"
+            );
+            return false;
+        }
+        let unstated = PPM.saturating_sub(yield_ppm);
+        if unstated > MAX_UNSTATED_FEE_PPM {
+            warn!(
+                route = %plan.route.name,
+                unstated_fee_pct = unstated as f64 / 10_000.0,
+                limit_pct = MAX_UNSTATED_FEE_PPM as f64 / 10_000.0,
+                "REFUSED: the route keeps far more than its pools state - not trading it"
+            );
+            return false;
+        }
+        true
     }
 
     /// Sign and broadcast, then let go: the receipt and the next gas figure are
@@ -811,46 +862,52 @@ impl Executor {
     /// the fee it actually charged all arrive in the log that raised the
     /// signal, and they describe the pool as of that very swap. The others come
     /// from the last calibration pass, which is fair because they are not the
-    /// ones that moved. What the model cannot see - a hook taking its own cut -
-    /// is what `yield_ppm` measures, and it is applied on top.
+    /// ones that moved. Nothing measured by calibration is applied on top: the
+    /// fee the log reports is the fee that was charged, override and all, and
+    /// what `yield_ppm` measures beyond it is a guard the caller checks first
+    /// (`unstated_fee_acceptable`), not a term in this arithmetic.
     ///
     /// Works in either direction: the cached state describes a pool, not a
     /// direction, so a reversed route reads the same numbers and only the
     /// `zeroForOne` of each hop differs.
     ///
-    /// Returns `None` whenever anything is missing or out of range, and the
-    /// caller then asks the router as before. Being slow is recoverable;
+    /// Each hop is priced from the freshest state there is for its pool: the
+    /// signal's own log where this is the pool that dropped, else the last
+    /// calibration snapshot - which is only consulted for hops the signal says
+    /// nothing about, so a single-hop route never waits on a snapshot at all.
+    ///
+    /// Returns `None` whenever anything is missing or out of range; a buy is
+    /// then skipped and a sale asks the router. Being slow is recoverable;
     /// signing a wrong minimum is not.
     async fn model_quote(
         &self,
         plan: &Plan,
         route: &Route,
-        correction_ppm: u64,
         fresh: Option<(PoolRef, HopState)>,
     ) -> Option<U256> {
-        if correction_ppm == 0 {
-            return None;
-        }
         let guard = plan.state.lock().await;
-        let state = guard.as_ref()?;
-        if state.at.elapsed() > STATE_STALE_AFTER || state.hops.len() != plan.route.hops.len() {
-            return None;
-        }
         // Keyed by pool rather than by position, so the same state serves a
-        // route walked in either order.
-        let known: HashMap<PoolRef, HopState> = plan
-            .route
-            .hops
-            .iter()
-            .map(|h| h.pool_ref())
-            .zip(state.hops.iter().copied())
-            .collect();
+        // route walked in either order. Absent or stale, it simply is not
+        // there to fall back on.
+        let known: Option<HashMap<PoolRef, HopState>> = guard
+            .as_ref()
+            .filter(|s| {
+                s.at.elapsed() <= STATE_STALE_AFTER && s.hops.len() == plan.route.hops.len()
+            })
+            .map(|s| {
+                plan.route
+                    .hops
+                    .iter()
+                    .map(|h| h.pool_ref())
+                    .zip(s.hops.iter().copied())
+                    .collect()
+            });
 
         let mut amount = crate::route::u256_to_f64(route.amount_in);
         for hop in &route.hops {
             let here = match fresh {
                 Some((p, s)) if p == hop.pool_ref() => s,
-                _ => *known.get(&hop.pool_ref())?,
+                _ => *known.as_ref()?.get(&hop.pool_ref())?,
             };
             let (out, after) = crate::depth::in_range_out(
                 here.sqrt_p,
@@ -869,8 +926,7 @@ impl Executor {
         }
 
         let raw = crate::route::f64_to_u256_pub(amount);
-        let corrected = raw * U256::from(correction_ppm) / U256::from(PPM);
-        (!corrected.is_zero()).then_some(corrected)
+        (!raw.is_zero()).then_some(raw)
     }
 
     /// Take the next nonce.

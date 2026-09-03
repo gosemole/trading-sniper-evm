@@ -22,9 +22,17 @@ pub fn raw_price(sqrt: U256) -> f64 {
 /// Displayed price of the configured base token.
 /// `raw` is token1-per-token0; real quote = raw * 10^(decimals0-decimals1).
 pub fn display_price(sqrt: U256, decimals0: u8, decimals1: u8, base_token: u8) -> f64 {
-    let raw = raw_price(sqrt);
-    let scale = 10f64.powi(decimals0 as i32 - decimals1 as i32);
-    let p = raw * scale;
+    from_raw(raw_price(sqrt), decimals0, decimals1, base_token)
+}
+
+/// The same, from a price already out of the X96 domain - as the tick walk
+/// keeps it. One function so the two paths cannot drift apart.
+pub fn from_sqrt(sqrt_p: f64, decimals0: u8, decimals1: u8, base_token: u8) -> f64 {
+    from_raw(sqrt_p * sqrt_p, decimals0, decimals1, base_token)
+}
+
+fn from_raw(raw: f64, decimals0: u8, decimals1: u8, base_token: u8) -> f64 {
+    let p = raw * 10f64.powi(decimals0 as i32 - decimals1 as i32);
     match base_token {
         1 => 1.0 / p,
         _ => p,
@@ -51,5 +59,18 @@ mod tests {
         let d1 = display_price(s, 18, 6, 1);
         let rel1 = (d1 - 1e-12).abs() / 1e-12;
         assert!(rel1 < 1e-9, "got {d1}");
+    }
+
+    #[test]
+    fn both_domains_agree() {
+        // The X96 path and the plain-sqrt path must give the same price, or a
+        // seeded entry price would not compare with the prices that follow it.
+        let s = U256::from(2u8).pow(96.into()) * 3u64;
+        for base in [0u8, 1] {
+            let from_x96 = display_price(s, 18, 6, base);
+            let plain = from_sqrt(3.0, 18, 6, base);
+            let rel = (from_x96 - plain).abs() / from_x96;
+            assert!(rel < 1e-12, "base {base}: {from_x96} vs {plain}");
+        }
     }
 }

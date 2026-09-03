@@ -192,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
     // Everything that had to be looked up has been; keep it for next time.
     cache::flush();
     strategy.resolve_pending().await;
+    strategy.seed_inventory().await;
     let decisions = tokio::spawn(strategy.run(rx, reports_rx));
 
     tokio::select! {
