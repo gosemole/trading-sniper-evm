@@ -51,7 +51,7 @@ use ethers::providers::{Http, Middleware, Provider};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, U256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -78,6 +78,25 @@ struct Plan {
     /// Last known price and liquidity of every pool on the route, so a quote
     /// can be worked out without asking anyone.
     state: Mutex<Option<RouteState>>,
+    /// The same as `gas_limit`, for the sale back down this route. A separate
+    /// figure because the reversed route is a different transaction: it starts
+    /// on a different token and can settle a different way. Zero until one sale
+    /// has been measured, and `GAS_FALLBACK` stands in until then.
+    sell_gas_limit: AtomicU64,
+    /// Whether the token this route buys is approved to the router without a
+    /// practical ceiling, so a sale need not go and ask. Set only by an
+    /// allowance big enough that no position could reach it - a partial
+    /// approval is left un-cached and re-checked every time, because a cached
+    /// "yes" that was only ever true for a smaller size is how a sale comes to
+    /// be signed against an allowance that cannot cover it.
+    sell_approved: AtomicBool,
+}
+
+/// An allowance at least this large is treated as unlimited. `--approve` sets
+/// `type(uint160).max` on Permit2 and the full `uint256` on the ERC20, and no
+/// position this bot can build comes within a factor of billions of 2^96.
+fn effectively_unlimited() -> U256 {
+    U256::one() << 96
 }
 
 /// Everything the model needs to price the route, and when it was true.
@@ -325,6 +344,8 @@ impl Executor {
                     gas_limit: AtomicU64::new(gas_limit),
                     yield_ppm: AtomicU64::new(0),
                     sell_yield_ppm: AtomicU64::new(0),
+                    sell_gas_limit: AtomicU64::new(0),
+                    sell_approved: AtomicBool::new(false),
                     state: Mutex::new(None),
                 },
             );
@@ -570,32 +591,40 @@ impl Executor {
         retry: bool,
     ) -> Result<Option<Fill>> {
         let token = route.output.address;
-        let balance = swap::balance_of(&self.http, token, self.owner).await?;
-        // The lesser of what we hold and what we bought. The balance alone
-        // would sell tokens that arrived some other way - a manual buy, a
-        // transfer - which are not this bot's to sell. What we bought alone is
-        // a quote rather than a measurement, so it can exceed what actually
-        // landed and would simply fail.
-        let size = limit.map_or(balance, |l| l.min(balance));
-        if size.is_zero() {
-            info!(
-                token = %route.output.symbol,
-                %balance,
-                limit = ?limit,
-                "nothing to sell"
-            );
-            return Ok(None);
-        }
-        if size < balance {
-            info!(
-                token = %route.output.symbol,
-                selling = %format_units(size, route.output.decimals),
-                held = %format_units(balance, route.output.decimals),
-                "selling only what this bot bought"
-            );
-        }
+        // What this bot's own books say it holds, which is a figure it already
+        // has. The balance was read from the chain here until a take-profit was
+        // measured spending ~130 ms of a falling market on the question - and
+        // the answer was one the inventory already knew, having built it from
+        // the fills themselves. Only a sale with nothing on the books asks:
+        // `--sell-all` on a token no position covers, which is not racing
+        // anything. What the books cannot see - a transfer in, a manual buy -
+        // is not this bot's to sell anyway, so reading it would only ever
+        // enlarge a sale beyond what it should be.
+        let size = match limit {
+            Some(l) if !l.is_zero() => l,
+            Some(_) => {
+                info!(token = %route.output.symbol, "nothing to sell: the position is empty");
+                return Ok(None);
+            }
+            None => {
+                let balance = swap::balance_of(&self.http, token, self.owner).await?;
+                if balance.is_zero() {
+                    info!(token = %route.output.symbol, "nothing to sell: the wallet is empty");
+                    return Ok(None);
+                }
+                balance
+            }
+        };
         let sell = route.reversed(size);
-        if sell.input.address != Address::zero() {
+        let plan = self.plans.get(&key);
+        // Two `eth_call`s that answer the same way every time once `--approve`
+        // has been run, and answering them here cost a sale two round trips of
+        // a moving market. Asked once, cached when the answer is "unlimited",
+        // and refreshed in the background after every sale - so a revoked
+        // approval is noticed by the pass after the one that used it, and a
+        // partial one is never cached at all.
+        let cached = plan.is_some_and(|p| p.sell_approved.load(Ordering::Relaxed));
+        if sell.input.address != Address::zero() && !cached {
             let (erc20, p2) =
                 swap::check_approvals(&self.http, sell.input.address, self.owner, self.permit2, self.router)
                     .await?;
@@ -606,6 +635,10 @@ impl Executor {
                 sell.input.symbol,
                 sell.input.symbol
             );
+            if let Some(p) = plan {
+                let unlimited = erc20 >= effectively_unlimited() && p2 >= effectively_unlimited();
+                p.sell_approved.store(unlimited, Ordering::Relaxed);
+            }
         }
 
         let deadline = execute::deadline_in(300);
@@ -645,7 +678,7 @@ impl Executor {
                  this sale from a snapshot"
             );
         }
-        let modelled = match self.plans.get(&key).filter(|_| !retry && fresh.is_some()) {
+        let modelled = match plan.filter(|_| !retry && fresh.is_some()) {
             Some(plan) => {
                 // The fee check uses the figure measured in this direction when
                 // the token was held long enough to measure it; otherwise the
@@ -699,15 +732,31 @@ impl Executor {
             return Ok(None);
         }
 
-        let fees = self.fees.params(&self.http).await.context("reading the gas price")?;
-        let gas = swap::measure_gas(&self.http, self.owner, &tx)
-            .await
-            .unwrap_or_else(|_| U256::from(GAS_FALLBACK));
-        let seen = swap::pending_nonce(&self.http, self.owner).await.ok();
+        // Everything a buy already had, now that a sale races the same market:
+        // the gas comes from the last sale down this route, the nonce from this
+        // process's own counter, and the two that can still have to go and look
+        // are joined rather than sequenced so the cost is the slower of them
+        // rather than their sum. See `quote`, which explains each in full.
+        let gas = match plan.map(|p| p.sell_gas_limit.load(Ordering::Relaxed)) {
+            Some(g) if g != 0 => U256::from(g),
+            _ => U256::from(GAS_FALLBACK),
+        };
+        let want_nonce = self.next_nonce.lock().await.is_none();
+        let (fees, seen) = tokio::join!(
+            self.fees.params(&self.http),
+            async {
+                match want_nonce {
+                    true => swap::pending_nonce(&self.http, self.owner).await.ok(),
+                    false => None,
+                }
+            },
+        );
+        let fees = fees.context("reading the gas price")?;
         let nonce = self.claim_nonce(seen).await?;
         match swap::send_nowait(&self.submit, &self.wallet, &tx, nonce.into(), fees, gas).await {
             Ok(hash) => {
-                info!(route = %sell.name, ?hash, nonce, "sold");
+                info!(route = %sell.name, ?hash, nonce, %gas, "sold");
+                self.refresh_sell(key, size);
                 Ok(Some(Fill { hash, sold: size, amount_out }))
             }
             Err(e) => {
@@ -947,6 +996,66 @@ impl Executor {
                 Err(e)
             }
         }
+    }
+
+    /// Everything a sale used from memory, checked again once the sale is out.
+    ///
+    /// Both facts are cheap to be wrong about for one sale and expensive to ask
+    /// for during one: a gas limit that is too low costs a revert, and unused
+    /// gas is refunded, so the fallback errs high until a real measurement
+    /// lands here. An approval that has been revoked stops the sale after this
+    /// one rather than this one - which is the same window `--approve` already
+    /// leaves, and far better than paying for the question every time.
+    fn refresh_sell(self: &Arc<Self>, key: PoolRef, size: U256) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let Some(plan) = me.plans.get(&key) else { return };
+            let sell = plan.route.reversed(size);
+            if sell.input.address != Address::zero() {
+                match swap::check_approvals(
+                    &me.http, sell.input.address, me.owner, me.permit2, me.router,
+                )
+                .await
+                {
+                    Ok((erc20, p2)) => {
+                        let unlimited =
+                            erc20 >= effectively_unlimited() && p2 >= effectively_unlimited();
+                        // Said out loud on the way down, never on the way up: a
+                        // route that stops being sellable is a position that
+                        // cannot be closed, and the next sale finding out for
+                        // itself is too late to be the first anyone hears.
+                        if !unlimited && plan.sell_approved.swap(false, Ordering::Relaxed) {
+                            warn!(
+                                route = %sell.name,
+                                token = %sell.input.symbol,
+                                %erc20, %p2,
+                                "this token is no longer approved without limit - every sale \
+                                 will check again, and one bigger than the allowance will fail"
+                            );
+                        } else {
+                            plan.sell_approved.store(unlimited, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => warn!(
+                        route = %sell.name, err = %format!("{e:#}"),
+                        "could not re-check this token's approval"
+                    ),
+                }
+            }
+            let probe = match execute::pending_swap(
+                me.router,
+                &sell,
+                U256::one(),
+                execute::deadline_in(600),
+            ) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            if let Ok(g) = swap::measure_gas(&me.http, me.owner, &probe).await {
+                plan.sell_gas_limit
+                    .store(g.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
+            }
+        });
     }
 
     /// Re-measure a route's gas in the background, so the next buy signs with a

@@ -83,14 +83,24 @@ const POLL_EVERY: Duration = Duration::from_millis(25);
 /// Scheme and host only. Endpoint URLs carry API keys in their path or query,
 /// and a printed table is exactly where one must not appear.
 fn label(url: &str) -> String {
+    // Long enough for a hostname, short enough that the table keeps its
+    // columns: a label that overruns its field pushes every number right, and
+    // the header then stops describing what is under it.
+    const WIDTH: usize = 44;
     let rest = url.split("://").nth(1).unwrap_or(url);
     let scheme = url.split("://").next().unwrap_or("");
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or("");
-    match (scheme.is_empty() || scheme == url, host.is_empty()) {
+    let full = match (scheme.is_empty() || scheme == url, host.is_empty()) {
         (_, true) => "endpoint".to_string(),
         (true, false) => host.to_string(),
         (false, false) => format!("{scheme}://{host}"),
+    };
+    match full.len() > WIDTH {
+        // Trimmed from the left: a host's own name is at the END of it, and
+        // that is the part that tells two endpoints apart.
+        true => format!("...{}", &full[full.len() - WIDTH + 3..]),
+        false => full,
     }
 }
 
@@ -102,6 +112,9 @@ struct Target {
     wait_ms: Vec<u128>,
     blocks: Vec<i64>,
     refused: usize,
+    /// Why `ping` is empty, when it is. Kept rather than printed on the spot so
+    /// one unreadable endpoint does not repeat itself once per round.
+    ping_err: Option<String>,
 }
 
 fn stats(v: &[u128]) -> String {
@@ -185,6 +198,7 @@ async fn main() -> Result<()> {
             wait_ms: Vec::new(),
             blocks: Vec::new(),
             refused: 0,
+            ping_err: None,
         });
     }
 
@@ -201,9 +215,21 @@ async fn main() -> Result<()> {
     for _ in 0..rounds {
         for t in targets.iter_mut() {
             let started = Instant::now();
-            if t.http.get_block_number().await.is_ok() {
-                t.ping_ms.push(started.elapsed().as_millis());
+            match t.http.get_block_number().await {
+                Ok(_) => t.ping_ms.push(started.elapsed().as_millis()),
+                // Said once rather than once a round. An endpoint may take
+                // transactions and still refuse to be read - a sequencer often
+                // serves little but `eth_sendRawTransaction` - and a bare dash
+                // in the table would leave that looking like a bug in here.
+                Err(e) => {
+                    t.ping_err.get_or_insert(e.to_string());
+                }
             }
+        }
+    }
+    for t in &targets {
+        if let Some(e) = &t.ping_err {
+            println!("{} does not answer eth_blockNumber: {e}", t.label);
         }
     }
 
@@ -280,7 +306,7 @@ async fn main() -> Result<()> {
             if let Err(e) = &accepted {
                 // "Already known" cannot happen here - every round signs a new
                 // nonce - so any error is a refusal worth seeing in full.
-                println!("round {round} {:>28}  REFUSED: {e}", targets[i].label);
+                println!("round {round} {:>44}  REFUSED: {e}", targets[i].label);
                 targets[i].refused += 1;
                 continue;
             }
@@ -299,7 +325,7 @@ async fn main() -> Result<()> {
             }
             let Some(r) = receipt else {
                 println!(
-                    "round {round} {:>28}  accept {accept_ms:>4} ms, then NO RECEIPT in {}s - \
+                    "round {round} {:>44}  accept {accept_ms:>4} ms, then NO RECEIPT in {}s - \
                      stopping, the nonce is stuck",
                     targets[i].label,
                     INCLUSION_TIMEOUT.as_secs()
@@ -314,7 +340,7 @@ async fn main() -> Result<()> {
             targets[i].wait_ms.push(wait_ms);
             targets[i].blocks.push(delta);
             println!(
-                "round {round} {:>28}  accept {accept_ms:>4} ms   landed +{delta} block(s) \
+                "round {round} {:>44}  accept {accept_ms:>4} ms   landed +{delta} block(s) \
                  (head {head} -> {landed}), seen after {wait_ms:>4} ms",
                 targets[i].label
             );
@@ -328,12 +354,12 @@ async fn main() -> Result<()> {
 
 fn report(targets: &[Target]) {
     println!(
-        "\n{:>28}  {:^17}  {:^17}  {:^17}  {:>6}  refused",
+        "\n{:>44}  {:^17}  {:^17}  {:^17}  {:>6}  refused",
         "endpoint", "ping min/med/max", "accept min/med/max", "seen min/med/max", "blocks"
     );
     for t in targets {
         println!(
-            "{:>28}  {}  {}  {}  {}  {:>7}",
+            "{:>44}  {}  {}  {}  {}  {:>7}",
             t.label,
             stats(&t.ping_ms),
             stats(&t.accept_ms),
@@ -345,6 +371,8 @@ fn report(targets: &[Target]) {
     println!(
         "\nall times in ms. `blocks` is the mean distance from the head at send to the block it \
          landed in - the figure that decides whether a dip is still there, and the only one not \
-         limited by how fast a receipt can be polled for."
+         limited by how fast a receipt can be polled for. It is counted from the READING \
+         endpoint's head, so a reader that lags the chain is inside it: point --read at the \
+         endpoint under test to take that out."
     );
 }
