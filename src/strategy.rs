@@ -14,6 +14,7 @@ use ethers::providers::{Http, Provider};
 use ethers::types::{H256, U256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -138,6 +139,8 @@ struct Watch {
     max_move_pct: f64,
     /// Sell the position once the price is this far above what it cost.
     take_profit_pct: Option<f64>,
+    /// Sell it anyway once it has been held this long since the last buy.
+    exit_after: Option<Duration>,
     /// A sale is on its way. Held until the chain answers, because the price
     /// keeps arriving in the meantime and every tick would otherwise start
     /// another sale of the same position.
@@ -256,11 +259,13 @@ impl Strategy {
         threshold_pct: f64,
         max_move_pct: f64,
         take_profit_pct: Option<f64>,
+        exit_after_secs: Option<u64>,
     ) {
         let held = self.inventory.get(pool.base_currency().unwrap_or_default());
         info!(
             pool = %pool.name, threshold_pct, max_move_pct,
             take_profit_pct = ?take_profit_pct,
+            exit_after_secs = ?exit_after_secs,
             quote = %pool.quote_symbol.clone().unwrap_or_else(|| "quote".into()),
             holding = ?held.map(|p| format!("{:.6} at {:.10}", p.qty, p.avg_price)),
             "watching"
@@ -272,6 +277,7 @@ impl Strategy {
                 meter: BigSellMeter::new(threshold_pct),
                 max_move_pct,
                 take_profit_pct,
+                exit_after: exit_after_secs.map(Duration::from_secs),
                 selling: false,
                 sell_attempts: 0,
                 halted: false,
@@ -285,14 +291,46 @@ impl Strategy {
 
     /// Read the feed until it ends, and act on what comes back from the chain.
     pub async fn run(mut self, mut ticks: mpsc::Receiver<Tick>, mut reports: mpsc::Receiver<Report>) {
+        // Time passes whether or not anyone trades, so the clock gets a branch
+        // of its own rather than riding on price updates.
+        let mut clock = tokio::time::interval(Duration::from_secs(5));
+        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 Some(tick) = ticks.recv() => self.on_tick(tick),
                 Some(r) = reports.recv() => self.on_report(r).await,
+                _ = clock.tick() => self.check_hold_times(),
                 else => break,
             }
         }
         warn!("feed ended");
+    }
+
+    /// Give up on positions that have been held too long.
+    ///
+    /// Held from the last buy, so averaging into a dip restarts the clock: the
+    /// rule is "this has not worked out for a while", and a fresh buy is a
+    /// fresh opinion.
+    fn check_hold_times(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let expired: Vec<(PoolRef, String, u64)> = self
+            .watches
+            .iter()
+            .filter(|(_, w)| !w.halted && !w.selling)
+            .filter_map(|(key, w)| {
+                let after = w.exit_after?.as_secs();
+                let position = self.inventory.get(w.pool.base_currency()?)?;
+                let held = position.held_for(now);
+                (held >= after).then(|| (*key, position.symbol.clone(), held))
+            })
+            .collect();
+        for (key, symbol, held) in expired {
+            info!(token = %symbol, held_secs = held, "HOLD EXPIRED");
+            self.start_sale(key);
+        }
     }
 
     fn on_tick(&mut self, tick: Tick) {

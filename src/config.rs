@@ -131,6 +131,15 @@ pub struct RouteConfig {
     /// a gain against the pool's quote token, not against the dollar.
     #[serde(default)]
     pub take_profit_pct: Option<f64>,
+    /// Sell the position regardless of price once it has been held this long,
+    /// counted from the MOST RECENT buy - so averaging further into a dip
+    /// restarts the clock. Unset means hold indefinitely.
+    ///
+    /// This is checked on a timer rather than on price updates: a position
+    /// worth abandoning is often in a pool that has gone quiet, and a rule that
+    /// only fires on a tick would never fire on exactly those.
+    #[serde(default)]
+    pub exit_after_secs: Option<u64>,
     /// Shortest gap between two automatic buys of this route. A drop usually
     /// arrives as a run of blocks, and without a gap each of those blocks buys
     /// again. Zero is allowed and means exactly that: every signal buys.
@@ -269,6 +278,13 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
         }
         // Without a gap a single dip fires one buy per block for as long as it
         // lasts, which is never what "buy the dip" is meant to mean.
+        if let Some(secs) = r.exit_after_secs {
+            anyhow::ensure!(
+                secs > 0,
+                "route '{}': exit_after_secs must be > 0",
+                r.name
+            );
+        }
         if let Some(tp) = r.take_profit_pct {
             anyhow::ensure!(
                 tp.is_finite() && tp > 0.0,

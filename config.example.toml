@@ -84,3 +84,8 @@ CAMELTOE = "0xc32b91fe216af1b834db02f33326e983ad8cf201"
 #
 # What is held and what it cost, kept across restarts. Written after every fill.
 # inventory_path = "inventory.json"
+#
+# Give up on a position that has been held this long since the LAST buy,
+# whatever the price is doing. Checked on a timer, not on price updates: a
+# position worth abandoning is usually in a pool that has gone quiet.
+#   exit_after_secs = 3600

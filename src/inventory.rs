@@ -34,6 +34,12 @@ impl Position {
         self.avg_price * (1.0 + pct / 100.0)
     }
 
+    /// How long this has been held, counted from the most recent buy - so
+    /// averaging further into a dip restarts the clock.
+    pub fn held_for(&self, now: u64) -> u64 {
+        now.saturating_sub(self.updated)
+    }
+
     /// Gain against the average entry, in percent.
     pub fn gain_pct(&self, price: f64) -> f64 {
         (price / self.avg_price - 1.0) * 100.0
@@ -233,6 +239,18 @@ mod tests {
         assert!(after < before, "{after} should be under {before}");
         // 9.0 average, +5% -> 9.45
         assert!((after - 9.45).abs() < 1e-12, "{after}");
+    }
+
+    #[test]
+    fn the_hold_clock_runs_from_the_last_buy() {
+        let mut inv = Inventory::default();
+        filled(&mut inv, 1, addr(1), 10.0, 100.0);
+        let p = inv.get(addr(1)).unwrap();
+        let bought_at = p.updated;
+        assert_eq!(p.held_for(bought_at + 90), 90);
+        // A clock that has not reached the buy yet must not read as a long
+        // hold, which is what a plain subtraction would do.
+        assert_eq!(p.held_for(bought_at.saturating_sub(10)), 0);
     }
 
     #[test]

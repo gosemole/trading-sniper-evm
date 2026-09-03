@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         };
         // A take-profit belongs to the route that bought the position, and the
         // route is armed against this pool, so the two meet here.
-        let take_profit = cfg
+        let armed = cfg
             .routes
             .iter()
             .find(|r| {
@@ -147,13 +147,13 @@ async fn main() -> anyhow::Result<()> {
                         .or_else(|| r.pools.last().cloned())
                         .and_then(|p| route::parse_pool_ref(&p).ok())
                         == Some(pool.pool_ref())
-            })
-            .and_then(|r| r.take_profit_pct);
+            });
         strategy.watch(
             pool.clone(),
             pool_cfg.threshold_pct.unwrap_or(cfg.threshold_pct),
             pool_cfg.max_move_pct.unwrap_or(cfg.max_move_pct),
-            take_profit,
+            armed.and_then(|r| r.take_profit_pct),
+            armed.and_then(|r| r.exit_after_secs),
         );
         let ws = cfg.ws_url.clone();
         let out = ticks.clone();
