@@ -23,8 +23,14 @@
 //! change what trades.
 //!
 //! Usage:
-//!   cargo run --bin probe -- [--config config.toml] [--endpoint URL]... \
-//!                           [--rounds 5] [--send]
+//!   probe [--endpoint URL]... [--read URL] [--rounds 5] [--send] [--config PATH]
+//!
+//! Takes what it needs from the environment, the same names the bot itself
+//! reads over its config file: `SUBMIT_URLS` (comma separated) for what to
+//! measure, `HTTP_URL` for where to read the head block and the receipts, and
+//! `PRIVATE_KEY` to sign with. A config file is consulted only for whatever
+//! the environment and the flags left unanswered, and not having one is fine:
+//! with `--endpoint` given, nothing else is needed to measure `ping`.
 //!
 //! Without `--send` nothing is signed and only `ping` is measured. With it,
 //! each round sends one real transaction per endpoint, in turn, waiting for
@@ -41,15 +47,24 @@ use ethers::types::{Eip1559TransactionRequest, H256, U256};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-/// Only the fields this needs. Everything else in the file is ignored, so the
-/// probe does not have to be kept in step with the bot's own config struct.
-#[derive(serde::Deserialize)]
+/// Only the fields this needs, all optional: the file is a last resort behind
+/// the flags and the environment, and every field it might answer can equally
+/// come from either. Everything else in it is ignored, so the probe does not
+/// have to be kept in step with the bot's own config struct.
+#[derive(Default, serde::Deserialize)]
 struct Cfg {
-    http_url: String,
+    #[serde(default)]
+    http_url: Option<String>,
     #[serde(default)]
     submit_urls: Vec<String>,
     #[serde(default)]
     private_key: Option<String>,
+}
+
+/// A non-empty environment variable, trimmed - `config::env_var`'s rule, so
+/// the probe answers to exactly the names the bot does.
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// A self-send costs exactly this and cannot cost more: no call, no storage.
@@ -117,13 +132,19 @@ async fn main() -> Result<()> {
         .transpose()
         .context("--rounds is not a number")?
         .unwrap_or(5);
-    let cfg_path = value("--config").unwrap_or_else(|| "config.toml".to_string());
+    // Explicitly asked for, else the usual name, else nothing - a config file
+    // is optional and a missing one is not an error. Only a file that was named
+    // or that exists and cannot be read is.
+    let named = value("--config");
+    let cfg_path = named.clone().unwrap_or_else(|| "config.toml".to_string());
+    let cfg: Cfg = match std::fs::read_to_string(&cfg_path) {
+        Ok(raw) => toml::from_str(&raw).with_context(|| format!("parsing {cfg_path}"))?,
+        Err(e) if named.is_none() && e.kind() == std::io::ErrorKind::NotFound => Cfg::default(),
+        Err(e) => return Err(e).with_context(|| format!("reading {cfg_path}")),
+    };
 
-    let raw = std::fs::read_to_string(&cfg_path).with_context(|| format!("reading {cfg_path}"))?;
-    let cfg: Cfg = toml::from_str(&raw).with_context(|| format!("parsing {cfg_path}"))?;
-
-    // Every `--endpoint` given, else whatever the bot itself broadcasts
-    // through, so a bare run measures the status quo.
+    // Every `--endpoint` given, else what the bot itself broadcasts through -
+    // so a bare run measures the status quo rather than nothing.
     let given: Vec<String> = args
         .iter()
         .enumerate()
@@ -132,17 +153,25 @@ async fn main() -> Result<()> {
         .collect();
     let urls = match given.is_empty() {
         false => given,
-        true => cfg.submit_urls.clone(),
+        true => env_var("SUBMIT_URLS")
+            .map(|v| v.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+            .unwrap_or(cfg.submit_urls),
     };
     anyhow::ensure!(
         !urls.is_empty(),
-        "nothing to measure: pass --endpoint URL, or set submit_urls in {cfg_path}"
+        "nothing to measure: pass --endpoint URL, or set SUBMIT_URLS"
     );
 
-    // Reads - the head block, the receipts - all go to the configured HTTP
-    // endpoint whichever endpoint is under test. One reader keeps the
-    // comparison fair; only the submission changes.
-    let read = Provider::<Http>::try_from(cfg.http_url.clone()).context("bad http_url")?;
+    // Reads - the head block, the receipts - all go to one endpoint whichever
+    // endpoint is under test, so the comparison stays fair and only the
+    // submission changes. The first endpoint measured is a fine reader when
+    // nothing else says otherwise, which is what lets a bare `--endpoint` run
+    // need no configuration at all.
+    let read_url = value("--read")
+        .or_else(|| env_var("HTTP_URL"))
+        .or(cfg.http_url)
+        .unwrap_or_else(|| urls[0].clone());
+    let read = Provider::<Http>::try_from(read_url.clone()).context("bad read endpoint")?;
     let chain_id = read.get_chainid().await.context("eth_chainId")?.as_u64();
 
     let mut targets: Vec<Target> = Vec::with_capacity(urls.len());
@@ -160,7 +189,7 @@ async fn main() -> Result<()> {
     }
 
     println!("chain {chain_id}, {} endpoint(s), {rounds} round(s)", targets.len());
-    println!("reads via {}", label(&cfg.http_url));
+    println!("reads via {}", label(&read_url));
 
     // One uncounted call each: the first request to a cold endpoint pays a TLS
     // handshake, and measuring that would say more about this process's age
@@ -189,10 +218,9 @@ async fn main() -> Result<()> {
 
     // The key, preferring the environment over the file, the same way the bot
     // does. Never printed - only the address it derives.
-    let key = std::env::var("PRIVATE_KEY")
-        .ok()
+    let key = env_var("PRIVATE_KEY")
         .or(cfg.private_key)
-        .context("no signing key: set PRIVATE_KEY, or private_key in the config")?;
+        .context("no signing key: set PRIVATE_KEY")?;
     let wallet = LocalWallet::from_str(key.trim().trim_start_matches("0x"))
         .context("the signing key is not a valid secp256k1 key")?
         .with_chain_id(chain_id);
