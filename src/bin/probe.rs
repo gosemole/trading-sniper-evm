@@ -242,16 +242,24 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     let from_feed: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
     let from_rpc: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let feed_seen = Arc::clone(&from_feed);
-    let feed_task = tokio::spawn(async move {
+    // Reading and decoding are separate tasks on purpose, and this is the whole
+    // correctness of the measurement. The feed carries about a thousand
+    // transactions a second, each needing base64, a JSON walk and a keccak; a
+    // loop that decodes before returning to `next()` leaves the following frame
+    // sitting in the socket until it is done, and stamps it with the time it
+    // got round to it rather than the time it arrived. The backlog compounds,
+    // and the feed ends up looking seconds SLOWER than a stream it is in fact
+    // ahead of. So the reader does nothing but stamp and hand off.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Duration, String)>();
+    let reader = tokio::spawn(async move {
         let (stream, _) = tokio_tungstenite::connect_async(&feed_url)
             .await
             .context("connecting to the feed")?;
         println!("feed open");
         let (_w, mut r) = stream.split();
-        let mut frames = 0u64;
         while let Some(msg) = r.next().await {
             let msg = msg.context("reading the feed")?;
+            let at = started.elapsed();
             let text = match msg {
                 tokio_tungstenite::tungstenite::Message::Text(t) => t,
                 tokio_tungstenite::tungstenite::Message::Binary(b) => {
@@ -259,8 +267,16 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
                 }
                 _ => continue,
             };
-            let at = started.elapsed();
-            frames += 1;
+            if tx.send((at, text)).is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let feed_seen = Arc::clone(&from_feed);
+    let decoder = tokio::spawn(async move {
+        while let Some((at, text)) = rx.recv().await {
             let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
             let mut hashes = Vec::new();
             for m in &frame.messages {
@@ -270,13 +286,12 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
             }
             let mut seen = feed_seen.lock().await;
             for h in hashes {
-                // First sighting only: a transaction reannounced later is not
-                // news, and letting it overwrite would make the feed look slower
-                // than it is.
+                // First sighting only: the feed replays recent history when a
+                // connection opens, and a transaction announced twice is not
+                // news the second time.
                 seen.entry(h).or_insert(at);
             }
         }
-        Ok::<u64, anyhow::Error>(frames)
     });
 
     let rpc_seen = Arc::clone(&from_rpc);
@@ -298,7 +313,8 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
         address.map(|a| format!(" for {a}")).unwrap_or_default()
     );
     tokio::time::sleep(Duration::from_secs(seconds)).await;
-    feed_task.abort();
+    reader.abort();
+    decoder.abort();
     rpc_task.abort();
 
     let feed = from_feed.lock().await;
@@ -322,6 +338,23 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
         );
         return Ok(());
     }
+    // Kept in arrival order first, because a measurement that drifts is a
+    // measurement that is wrong, and the only way to see drift is to look at
+    // when each comparison was made rather than at the sorted middle of them.
+    let mut over_time: Vec<(Duration, i64)> = rpc
+        .iter()
+        .filter_map(|(h, t_rpc)| {
+            feed.get(h).map(|t_feed| (*t_rpc, t_rpc.as_millis() as i64 - t_feed.as_millis() as i64))
+        })
+        .collect();
+    over_time.sort_by_key(|(t, _)| *t);
+    let third = over_time.len() / 3;
+    let median_of = |v: &[(Duration, i64)]| -> i64 {
+        let mut d: Vec<i64> = v.iter().map(|(_, x)| *x).collect();
+        d.sort_unstable();
+        d.get(d.len() / 2).copied().unwrap_or(0)
+    };
+
     lead.sort_unstable();
     let q = |p: f64| lead[((lead.len() as f64 * p) as usize).min(lead.len() - 1)];
     println!(
@@ -339,6 +372,23 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
         lead.len(),
         (lead.len() - first) as f64 * 100.0 / lead.len() as f64
     );
+    if third > 0 {
+        let (first_third, last_third) = (median_of(&over_time[..third]), median_of(&over_time[over_time.len() - third..]));
+        println!(
+            "median over the first third of the run {first_third} ms, over the last third \
+             {last_third} ms"
+        );
+        // A stream that cannot be consumed as fast as it arrives stamps every
+        // frame later than the one before, and says so here rather than being
+        // read as a fact about the network.
+        if (last_third - first_third).abs() > 200 {
+            println!(
+                "  ^ these should be the same. They are not, so one side is falling behind and \
+                 is being timed on when it was PROCESSED rather than when it arrived - do not \
+                 read the numbers above as latency."
+            );
+        }
+    }
     println!(
         "\nthe median is the head start a feed-driven signal would have. Only the swaps both \
          streams saw are counted, so a transaction the rpc never reported cannot flatter it."
