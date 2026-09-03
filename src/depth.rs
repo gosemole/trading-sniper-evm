@@ -68,12 +68,31 @@ pub struct TickReader<'a> {
     http: &'a Provider<Http>,
     source: Source,
     spacing: i32,
+    /// Block to read at, or `None` for the head. Pinning it matters whenever a
+    /// reading is compared against another: a pool that moves between two
+    /// "latest" reads turns the difference between them into price movement
+    /// rather than whatever was being measured.
+    at: Option<u64>,
 }
 
 impl<'a> TickReader<'a> {
     pub fn new(http: &'a Provider<Http>, source: Source, spacing: i32) -> Result<Self> {
         anyhow::ensure!(spacing > 0, "tick spacing must be > 0, got {spacing}");
-        Ok(Self { http, source, spacing })
+        Ok(Self { http, source, spacing, at: None })
+    }
+
+    /// Read every value at one fixed block.
+    pub fn at_block(mut self, block: Option<u64>) -> Self {
+        self.at = block;
+        self
+    }
+
+    /// The block tag every read in this reader uses.
+    fn tag(&self) -> String {
+        match self.at {
+            Some(n) => format!("0x{n:x}"),
+            None => "latest".to_string(),
+        }
     }
 
     async fn storage(&self, addr: Address, slot: U256) -> Result<H256> {
@@ -84,7 +103,7 @@ impl<'a> TickReader<'a> {
                 (
                     format!("0x{addr:x}"),
                     format!("0x{slot:064x}"),
-                    "latest".to_string(),
+                    self.tag(),
                 ),
             )
             .await
@@ -94,7 +113,8 @@ impl<'a> TickReader<'a> {
 
     async fn call(&self, to: Address, data: Vec<u8>) -> Result<Bytes> {
         let tx = TransactionRequest::new().to(to).data(Bytes::from(data));
-        self.http.call(&tx.into(), None).await.context("eth_call")
+        let at = self.at.map(ethers::types::BlockId::from);
+        self.http.call(&tx.into(), at).await.context("eth_call")
     }
 
     /// Base storage slot of `_pools[poolId]` for a v4 pool.
@@ -180,6 +200,50 @@ fn scan_word(word: U256, bit: i32, up: bool, first: bool) -> Option<u32> {
         }
         (0..=end as u32).rev().find(|b| word.bit(*b as usize))
     }
+}
+
+/// What a swap yields while it stays inside the current tick range, where
+/// liquidity is constant and no tick data is needed at all.
+///
+/// This is the same step `swap_exact_in` takes between two ticks, on its own.
+/// It is exact whenever the swap does not reach an initialized tick, and it
+/// overstates the output once it would - so callers must check the price move
+/// it reports and stop trusting it before that point. Returns the output and
+/// the price the pool would be left at.
+pub fn in_range_out(
+    sqrt_p: f64,
+    liquidity: u128,
+    lp_fee_pips: u32,
+    zero_for_one: bool,
+    amount_in: f64,
+) -> Option<(f64, f64)> {
+    // NaN has to fail these too, hence the explicit finiteness checks rather
+    // than negated comparisons.
+    if !sqrt_p.is_finite()
+        || sqrt_p <= 0.0
+        || !amount_in.is_finite()
+        || amount_in <= 0.0
+        || liquidity == 0
+        || lp_fee_pips >= 1_000_000
+    {
+        return None;
+    }
+    let l = liquidity as f64;
+    // The fee comes off the input before it reaches the curve.
+    let net = amount_in * (1.0 - lp_fee_pips as f64 / 1_000_000.0);
+    // Paying token1 pushes the raw price up; paying token0 pushes it down.
+    let up = !zero_for_one;
+    let (sqrt_new, out) = if up {
+        let s = sqrt_p + net / l;
+        (s, l * (1.0 / sqrt_p - 1.0 / s))
+    } else {
+        let s = 1.0 / (1.0 / sqrt_p + net / l);
+        (s, l * (sqrt_p - s))
+    };
+    if !out.is_finite() || out <= 0.0 || !sqrt_new.is_finite() || sqrt_new <= 0.0 {
+        return None;
+    }
+    Some((out, sqrt_new))
 }
 
 /// sqrt(price) at a tick, in the plain f64 domain (not X96).
@@ -462,6 +526,47 @@ pub async fn swap_exact_in(
         sqrt_p_after: sqrt_cur,
         ticks_crossed: crossed,
     })
+}
+
+#[cfg(test)]
+mod tests_in_range {
+    use super::*;
+
+    /// The in-range step and the full walk have to agree wherever the walk
+    /// crosses nothing - they are the same formula, and this is what lets the
+    /// cheap one stand in for the expensive one on small trades.
+    #[test]
+    fn it_is_the_same_step_the_walk_takes() {
+        let sqrt_p = 2.0f64;
+        let l = 1_000_000_000u128;
+        // A trade small enough to stay put: the price barely moves.
+        let (out, after) = in_range_out(sqrt_p, l, 3000, false, 1_000.0).unwrap();
+        assert!(out > 0.0);
+        assert!(after > sqrt_p, "paying token1 lifts the raw price");
+        let moved = (after / sqrt_p).powi(2) - 1.0;
+        assert!(moved < 1e-5, "moved {moved}");
+
+        // The other direction moves it the other way.
+        let (_, after) = in_range_out(sqrt_p, l, 3000, true, 1_000.0).unwrap();
+        assert!(after < sqrt_p);
+    }
+
+    #[test]
+    fn the_fee_comes_off_the_input() {
+        let free = in_range_out(2.0, 1_000_000_000, 0, false, 1_000.0).unwrap().0;
+        let charged = in_range_out(2.0, 1_000_000_000, 10_000, false, 1_000.0).unwrap().0;
+        // 1% of the input never reaches the curve, so ~1% less comes out.
+        let ratio = charged / free;
+        assert!((ratio - 0.99).abs() < 1e-6, "ratio {ratio}");
+    }
+
+    #[test]
+    fn nothing_is_quoted_out_of_nothing() {
+        assert!(in_range_out(2.0, 0, 3000, false, 1.0).is_none(), "no liquidity");
+        assert!(in_range_out(0.0, 1_000, 3000, false, 1.0).is_none(), "no price");
+        assert!(in_range_out(2.0, 1_000, 3000, false, 0.0).is_none(), "no input");
+        assert!(in_range_out(2.0, 1_000, 1_000_000, false, 1.0).is_none(), "a 100% fee");
+    }
 }
 
 #[cfg(test)]

@@ -370,13 +370,14 @@ async fn probe(
     route: &Route,
     min_out: U256,
     deadline: U256,
+    at: Option<u64>,
 ) -> Result<Probe> {
     let tx = TransactionRequest::new()
         .from(from)
         .to(router)
         .value(call_value(route))
         .data(execute_calldata(route, min_out, deadline)?);
-    match http.call(&tx.into(), None).await {
+    match http.call(&tx.into(), at.map(ethers::types::BlockId::from)).await {
         Ok(_) => Ok(Probe::Ok),
         Err(e) => {
             let msg = e.to_string();
@@ -418,11 +419,12 @@ pub async fn verify(
     route: &Route,
     hint: U256,
     deadline: U256,
+    at: Option<u64>,
 ) -> Result<OnChainQuote> {
     let mut probes = 1u32;
     // Above any real output, and still inside the uint128 the hops accept.
     let impossible = U256::from(u128::MAX);
-    if let Probe::Reverted(msg) = probe(http, router, from, route, impossible, deadline).await? {
+    if let Probe::Reverted(msg) = probe(http, router, from, route, impossible, deadline, at).await? {
         if let Some(amount) = amount_from_too_little(&msg) {
             anyhow::ensure!(
                 !amount.is_zero(),
@@ -441,7 +443,7 @@ pub async fn verify(
     // the swap returned nothing at all, which would look like success.
     let mut lo = U256::one();
     probes += 1;
-    if let Probe::Reverted(msg) = probe(http, router, from, route, lo, deadline).await? {
+    if let Probe::Reverted(msg) = probe(http, router, from, route, lo, deadline, at).await? {
         anyhow::bail!(
             "the swap reverts even with amountOutMinimum = 1, so nothing about it is \
              executable right now: {}",
@@ -454,7 +456,7 @@ pub async fn verify(
     let mut hi = if hint > lo { hint } else { U256::from(2) };
     loop {
         probes += 1;
-        match probe(http, router, from, route, hi, deadline).await? {
+        match probe(http, router, from, route, hi, deadline, at).await? {
             Probe::Reverted(_) => break,
             Probe::Ok => {
                 lo = hi;
@@ -482,7 +484,7 @@ pub async fn verify(
             break;
         }
         probes += 1;
-        match probe(http, router, from, route, mid, deadline).await? {
+        match probe(http, router, from, route, mid, deadline, at).await? {
             Probe::Ok => lo = mid,
             Probe::Reverted(_) => hi = mid,
         }
@@ -506,7 +508,7 @@ pub async fn dry_run(
     min_out: U256,
     deadline: U256,
 ) -> Result<()> {
-    match probe(http, router, from, route, min_out, deadline).await? {
+    match probe(http, router, from, route, min_out, deadline, None).await? {
         Probe::Ok => Ok(()),
         Probe::Reverted(msg) => Err(anyhow::anyhow!(
             "the transaction as built reverts: {}",

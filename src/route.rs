@@ -307,6 +307,10 @@ impl Route {
 #[derive(Debug, Clone)]
 pub struct HopQuote {
     pub pool: PoolRef,
+    /// The pool's state this hop was priced from, kept so a caller can price
+    /// the same hop again later without reading it back.
+    pub sqrt_p: f64,
+    pub liquidity: u128,
     pub amount_in: f64,
     pub amount_out: f64,
     pub input_decimals: u8,
@@ -326,7 +330,7 @@ pub struct Quote {
     pub min_out: U256,
 }
 
-fn u256_to_f64(v: U256) -> f64 {
+pub fn u256_to_f64(v: U256) -> f64 {
     v.to_string().parse().unwrap_or(f64::MAX)
 }
 
@@ -345,12 +349,18 @@ fn f64_to_u256(v: f64) -> U256 {
 impl Route {
     /// Simulate the whole route, hop by hop, walking every tick each swap
     /// crosses. Read-only: this touches no wallet and sends no transaction.
-    pub async fn quote(&self, http: &Provider<Http>, manager: Address) -> Result<Quote> {
+    pub async fn quote(
+        &self,
+        http: &Provider<Http>,
+        manager: Address,
+        at: Option<u64>,
+    ) -> Result<Quote> {
         let mut amount = u256_to_f64(self.amount_in);
         let mut out_hops = Vec::with_capacity(self.hops.len());
 
         for (i, hop) in self.hops.iter().enumerate() {
             let reader = crate::depth::TickReader::new(http, hop.tick_source(manager), hop.tick_spacing)
+                .map(|r| r.at_block(at))
                 .with_context(|| format!("hop {i}: bad tick spacing"))?;
             let state = crate::depth::read_state(&reader)
                 .await
@@ -381,6 +391,8 @@ impl Route {
             let impact = (res.sqrt_p_after / state.sqrt_p).powi(2) - 1.0;
             out_hops.push(HopQuote {
                 pool: hop.pool_ref(),
+                sqrt_p: state.sqrt_p,
+                liquidity: state.liquidity,
                 amount_in: amount,
                 amount_out: res.amount_out,
                 input_decimals: hop.input_decimals,

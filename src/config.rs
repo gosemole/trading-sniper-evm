@@ -55,6 +55,20 @@ pub struct Config {
     /// that takes a token accepts either a ticker from here or a raw address.
     #[serde(default)]
     pub tokens: HashMap<String, String>,
+    /// How often (seconds) to re-measure what an armed route's pools take on
+    /// top of their stated fees - a hook charging its own cut shows up here and
+    /// nowhere else. 0 turns the measurement off. Only armed routes are
+    /// measured, and only in the background.
+    #[serde(default = "default_calibrate")]
+    pub calibrate_secs: u64,
+    /// Price an armed buy from the measured model instead of asking the router,
+    /// which takes the last round trip out of the path between a drop and a
+    /// signed transaction. Off by default: the router's answer is exact and
+    /// doubles as a rehearsal, and giving that up trades a guarantee for
+    /// latency. Falls back to asking whenever the model is not in a position to
+    /// answer - see `calibrate_secs`, which is what keeps it honest.
+    #[serde(default)]
+    pub fast_quote: bool,
     /// Uniswap Universal Router, the contract swaps are sent to.
     #[serde(default)]
     pub universal_router: Option<String>,
@@ -110,6 +124,10 @@ pub struct RouteConfig {
 
 fn default_cooldown() -> u64 {
     60
+}
+
+fn default_calibrate() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Deserialize)]

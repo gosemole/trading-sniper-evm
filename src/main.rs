@@ -24,8 +24,8 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Flags that take a value, so their value is not mistaken for the config
     // path: `--quote "test buy CAMELTOE"` must not try to open the route name.
-    const VALUE_FLAGS: [&str; 5] =
-        ["--quote", "--approve", "--swap", "--sell-all", "--config"];
+    const VALUE_FLAGS: [&str; 6] =
+        ["--quote", "--approve", "--swap", "--sell-all", "--amount", "--config"];
     let consumed: std::collections::HashSet<usize> = args
         .iter()
         .enumerate()
@@ -44,6 +44,9 @@ async fn main() -> anyhow::Result<()> {
     let quote_route = flag_value("--quote");
     let swap_route = flag_value("--swap");
     let sell_token = flag_value("--sell-all");
+    // Overrides a route's configured amount_in, for asking "what would this
+    // size do" without editing config.
+    let amount = flag_value("--amount");
     let approve_token = flag_value("--approve");
     let path = flag_value("--config")
         .or_else(|| {
@@ -69,10 +72,10 @@ async fn main() -> anyhow::Result<()> {
         return check_all_routes(&http, &cfg).await;
     }
     if let Some(name) = quote_route {
-        return quote_route_cmd(&http, &cfg, &name).await;
+        return quote_route_cmd(&http, &cfg, &name, amount.as_deref()).await;
     }
     if let Some(name) = swap_route {
-        return swap_cmd(&http, &cfg, &name, execute).await;
+        return swap_cmd(&http, &cfg, &name, amount.as_deref(), execute).await;
     }
     if let Some(token) = sell_token {
         return sell_all_cmd(&http, &cfg, &token, execute).await;
@@ -229,6 +232,7 @@ async fn quote_route_cmd(
     http: &ethers::providers::Provider<ethers::providers::Http>,
     cfg: &config::Config,
     name: &str,
+    amount: Option<&str>,
 ) -> anyhow::Result<()> {
     let rc = cfg
         .routes
@@ -236,8 +240,9 @@ async fn quote_route_cmd(
         .find(|r| r.name == name)
         .with_context(|| format!("no route named '{name}' in config"))?;
     let manager = pool_manager(cfg)?;
-    let r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
-    let q = r.quote(http, manager).await?;
+    let mut r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
+    override_amount(&mut r, amount)?;
+    let q = r.quote(http, manager, None).await?;
 
     println!("\nroute \"{}\"", r.name);
     println!(
@@ -323,10 +328,21 @@ async fn approve_cmd(
 /// not model hooks, and a hook that charges a fee (or a pool that has moved
 /// since the quote) shows up here as a smaller output rather than as a failed
 /// transaction later.
+/// Replace a route's configured size, when the caller named one.
+fn override_amount(r: &mut route::Route, amount: Option<&str>) -> anyhow::Result<()> {
+    let Some(raw) = amount else { return Ok(()) };
+    let parsed = route::parse_units(raw, r.input.decimals)
+        .with_context(|| format!("--amount {raw}"))?;
+    anyhow::ensure!(!parsed.is_zero(), "--amount {raw} is zero");
+    r.amount_in = parsed;
+    Ok(())
+}
+
 async fn swap_cmd(
     http: &ethers::providers::Provider<ethers::providers::Http>,
     cfg: &config::Config,
     name: &str,
+    amount: Option<&str>,
     execute: bool,
 ) -> anyhow::Result<()> {
     use ethers::types::U256;
@@ -340,7 +356,8 @@ async fn swap_cmd(
     let router = swap::resolve_addr(&cfg.universal_router, None, "universal_router")?;
     let permit2 = swap::resolve_addr(&cfg.permit2, Some(swap::PERMIT2_DEFAULT), "permit2")?;
 
-    let r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
+    let mut r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
+    override_amount(&mut r, amount)?;
     let chain_id = http.get_chainid().await?.as_u64();
     let wallet = swap::load_wallet(cfg, chain_id)?;
     let owner = ethers::signers::Signer::address(&wallet);
@@ -376,7 +393,7 @@ async fn swap_cmd(
 
     // The local walk only seeds the bracket; a wrong hint costs a few extra
     // eth_calls and nothing else.
-    let hint = match r.quote(http, manager).await {
+    let hint = match r.quote(http, manager, None).await {
         Ok(q) => {
             println!(
                 "  local  {} {}   (tick walk, hooks not modelled)",
@@ -392,7 +409,7 @@ async fn swap_cmd(
     };
 
     let deadline = execute::deadline_in(600);
-    let onchain = execute::verify(http, router, owner, &r, hint, deadline).await?;
+    let onchain = execute::verify(http, router, owner, &r, hint, deadline, None).await?;
     println!(
         "  actual {} {}   ({}, {} eth_call{})",
         route::format_units(onchain.amount_out, r.output.decimals),
@@ -521,7 +538,7 @@ async fn sell_all_cmd(
 
     // Quoting is only to show what the sale is worth. It does not protect it,
     // and a failure here must not stop the sale being built.
-    match execute::verify(http, router, owner, &sell, U256::zero(), deadline).await {
+    match execute::verify(http, router, owner, &sell, U256::zero(), deadline, None).await {
         Ok(q) => println!(
             "  worth  {} {}   (quoted on chain, not enforced)",
             route::format_units(q.amount_out, sell.output.decimals),

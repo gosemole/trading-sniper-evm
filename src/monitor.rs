@@ -15,14 +15,22 @@ struct Swap {
     sqrt: U256,
     liquidity: u128,
     price: f64,
+    /// The fee this swap was actually charged, straight from the v4 log. It is
+    /// the pool's own fee unless a hook overrode it, which is the only place
+    /// that override is visible. v3 does not report it and does not need to:
+    /// its fee is fixed at creation.
+    lp_fee: Option<u32>,
 }
 
 /// Fired signal data for a big sell.
+#[derive(Clone)]
 pub struct Signal {
     pub block: u64,
     pub sqrt: U256,
     /// In-range liquidity as reported by the swap that triggered the signal.
     pub liquidity: u128,
+    /// Fee charged by the swap that triggered the signal, when the log says.
+    pub lp_fee: Option<u32>,
     /// Price the drop is measured from (close of the previous block).
     pub reference: f64,
     pub price: f64,
@@ -47,6 +55,8 @@ pub struct BigSellMeter {
     sqrt: Option<U256>,
     /// In-range liquidity reported by the most recent swap.
     liquidity: u128,
+    /// Fee reported by the most recent swap.
+    lp_fee: Option<u32>,
     /// Whether a signal already fired within the current block (once per block).
     fired: bool,
 }
@@ -60,6 +70,7 @@ impl BigSellMeter {
             price: None,
             sqrt: None,
             liquidity: 0,
+            lp_fee: None,
             fired: false,
         }
     }
@@ -95,6 +106,7 @@ impl BigSellMeter {
         self.price = Some(s.price);
         self.sqrt = Some(s.sqrt);
         self.liquidity = s.liquidity;
+        self.lp_fee = s.lp_fee;
     }
 
     fn try_fire(&mut self) -> Option<Signal> {
@@ -116,6 +128,7 @@ impl BigSellMeter {
             block: self.cur_block.unwrap_or(0),
             sqrt,
             liquidity: self.liquidity,
+            lp_fee: self.lp_fee,
             reference,
             price,
             drop_pct: -change_pct,
@@ -180,21 +193,38 @@ pub async fn run_pool(
             }
         };
         if let Some(sig) = meter.observe(&swap) {
+            // Said before anything is measured, so the signal keeps its place
+            // in the log. Everything in this line came out of the log itself.
+            emit_signal(&pool, &sig);
+
+            // The buy goes next and goes on its own: it is the only part with
+            // a deadline. Everything after this is reporting, and reporting is
+            // not worth a block of latency. Nothing here waits for it, so the
+            // stream keeps draining and a later drop is judged on fresh state
+            // rather than on a backlog that built up during a purchase.
+            if let Some(auto) = &auto {
+                let auto = auto.clone();
+                let pool = pool.clone();
+                let sig = sig.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = auto.on_drop(&pool, &sig).await {
+                        warn!(pool = %pool.name, err = %format!("{e:#}"), "auto-buy failed");
+                    }
+                });
+            }
+
+            // This one costs a walk over the tick data, which is why it comes
+            // last and on its own line rather than holding up the two above it.
             let (pay, method) = estimate_depth(&pool, &http, &sig, max_move_pct).await;
             let depth = match pay {
                 Some(v) => format!("{:.4} {quote_unit}", v / quote_scale),
                 None => format!("? {quote_unit}"),
             };
-            emit_signal(&pool, &sig, max_move_pct, &depth, method);
-
-            // Buying blocks the stream for a few seconds. That is on purpose:
-            // the logs queue up behind it, and a second drop cannot start a
-            // second buy while the first is still being signed.
-            if let Some(auto) = &auto {
-                if let Err(e) = auto.on_drop(&pool, sig.drop_pct).await {
-                    warn!(pool = %pool.name, err = %format!("{e:#}"), "auto-buy failed");
-                }
-            }
+            info!(
+                pool = %pool.name, block = sig.block,
+                pay_to_move = format!("{depth} / +{max_move_pct}%"), method,
+                "depth"
+            );
         }
     }
     warn!(pool = %pool.name, "stream ended");
@@ -246,7 +276,7 @@ async fn estimate_depth(
     }
 }
 
-fn emit_signal(pool: &Pool, sig: &Signal, max_move_pct: f64, depth: &str, method: &str) {
+fn emit_signal(pool: &Pool, sig: &Signal) {
     // Absolute prices are only meaningful once decimals are known; the drop
     // percentage is valid either way.
     let (from, to) = if pool.decimals_known {
@@ -261,8 +291,6 @@ fn emit_signal(pool: &Pool, sig: &Signal, max_move_pct: f64, depth: &str, method
         from = %from,
         to = %to,
         liquidity = sig.liquidity,
-        pay_to_move = format!("{depth} / +{max_move_pct}%"),
-        method,
         "BIG SELL"
     );
 }
@@ -275,11 +303,16 @@ fn decode_swap(pool: &Pool, log: &Log) -> Result<Swap> {
     let data = &log.data.0;
     // Both v3 and v4 Swap lay out the non-indexed args as
     // [amount0][amount1][sqrtPriceX96][liquidity][tick]... so the offsets below
-    // hold for either version.
+    // hold for either version. v4 adds one more word after the tick, and that
+    // last word is the whole reason this log is worth more than a price: it is
+    // the fee the swap was charged, hook override and all.
     anyhow::ensure!(data.len() >= 128, "log data too short: {} bytes", data.len());
     let sqrt = U256::from_big_endian(&data[64..96]);
     // liquidity is uint128: low 16 bytes of its 32-byte word.
     let liquidity = u128::from_be_bytes(data[112..128].try_into().unwrap());
+    // fee is uint24: low 3 bytes of the sixth word.
+    let lp_fee = (data.len() >= 192)
+        .then(|| u32::from_be_bytes([0, data[189], data[190], data[191]]));
     let price = price::display_price(sqrt, pool.decimals0, pool.decimals1, pool.base_token);
     anyhow::ensure!(price.is_finite() && price > 0.0, "non-finite price from sqrt");
     Ok(Swap {
@@ -287,6 +320,7 @@ fn decode_swap(pool: &Pool, log: &Log) -> Result<Swap> {
         sqrt,
         liquidity,
         price,
+        lp_fee,
     })
 }
 
@@ -301,6 +335,7 @@ mod tests {
             sqrt: U256::from((p.sqrt() * 2f64.powi(96)) as u128),
             liquidity: 1_000,
             price: p,
+            lp_fee: Some(3000),
         }
     }
 

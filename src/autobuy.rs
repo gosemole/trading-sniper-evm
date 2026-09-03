@@ -33,14 +33,16 @@
 
 use crate::config::Config;
 use crate::execute;
+use crate::monitor::Signal;
 use crate::pool::Pool;
 use crate::route::{format_units, parse_pool_ref, PoolRef, Route};
 use crate::swap;
 use anyhow::{Context, Result};
-use ethers::providers::{Http, Provider};
+use ethers::providers::{Http, Middleware, Provider};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, U256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -49,11 +51,75 @@ use tracing::{info, warn};
 struct Plan {
     route: Route,
     cooldown: Duration,
+    /// Gas limit to sign with, measured once when the route is armed and
+    /// refreshed after each send. Keeping it here is what takes `estimate_gas`
+    /// out of the path between a drop and a broadcast.
+    gas_limit: AtomicU64,
+    /// What the route actually pays as a fraction of what the local tick walk
+    /// says it should, in parts per million. 1_000_000 is "the model is right";
+    /// anything under that is being taken by something the model cannot see -
+    /// in practice a hook charging its own fee on top of the pool's. Zero means
+    /// it has not been measured yet.
+    yield_ppm: AtomicU64,
+    /// Last known price and liquidity of every pool on the route, so a quote
+    /// can be worked out without asking anyone.
+    state: Mutex<Option<RouteState>>,
 }
+
+/// Everything the model needs to price the route, and when it was true.
+struct RouteState {
+    at: Instant,
+    hops: Vec<HopState>,
+}
+
+#[derive(Clone, Copy)]
+struct HopState {
+    sqrt_p: f64,
+    liquidity: u128,
+    lp_fee: u32,
+}
+
+/// What one buy had to go and find out, gathered in one place so the send does
+/// not have to reach back for any of it.
+struct Quoted {
+    amount_out: U256,
+    /// Where the number came from, for the log: the model or the router.
+    by: &'static str,
+    /// Deferred: a gas price that could not be read only matters if we send.
+    fees: Result<(U256, U256)>,
+    /// The nonce the node reported while the quote was in flight, if asked.
+    nonce_seen: Option<u64>,
+}
+
+/// Fixed-point scale for `yield_ppm`.
+const PPM: u64 = 1_000_000;
+
+/// How stale the cached pool state may be before a fast quote is refused.
+/// Pools other than the one that just dropped move slowly enough that a few
+/// minutes is fine; past that, asking the router is cheaper than being wrong.
+const STATE_STALE_AFTER: Duration = Duration::from_secs(120);
+
+/// How far a fast-quoted swap may move a pool's own price before the model is
+/// no longer trusted. Inside a tick range the arithmetic is exact; past one it
+/// silently overstates the output, and this is what keeps it from getting
+/// there. Measured impact on the configured sizes is under 0.01%.
+const MAX_MODELLED_IMPACT: f64 = 0.005;
+
+/// How far the measured yield has to move before it is worth saying out loud,
+/// in parts per million. A hook that changes its cut is a change of terms, not
+/// noise; measurement jitter across sizes came out at 3 ppm.
+const YIELD_ALERT_PPM: u64 = 500;
+
+/// What to sign with when the route has never been measured - enough for a
+/// two-leg swap, and unused gas is refunded either way.
+const GAS_FALLBACK: u64 = 1_200_000;
 
 pub struct AutoBuy {
     http: Provider<Http>,
     router: Address,
+    manager: Address,
+    /// Seconds between yield measurements; 0 turns them off.
+    calibrate_secs: u64,
     wallet: LocalWallet,
     owner: Address,
     /// Sign and send, rather than only reporting what would have been sent.
@@ -61,9 +127,17 @@ pub struct AutoBuy {
     /// Trigger pool -> what to buy when it drops.
     plans: HashMap<PoolRef, Plan>,
     last_fire: Mutex<HashMap<PoolRef, Instant>>,
-    /// One buy at a time. Two sends racing would read the same nonce and one of
-    /// them would be dropped.
-    sending: Mutex<()>,
+    /// Price armed buys from the measured model rather than by asking.
+    model_pricing: bool,
+    /// The gas price, kept current from the block stream instead of asked for
+    /// on every buy.
+    fees: Arc<swap::FeeWatch>,
+    /// Next nonce to hand out. Held only long enough to take a number, never
+    /// across a network call: two buys may be in flight at once, and asking the
+    /// node for a nonce while the first is unmined would return the same one.
+    /// `None` means "ask the node", which is also how a failed broadcast is
+    /// recovered from - the gap is refilled rather than left to stall the queue.
+    next_nonce: Mutex<Option<u64>>,
 }
 
 impl AutoBuy {
@@ -136,39 +210,215 @@ impl AutoBuy {
                 mode = if execute { "LIVE" } else { "dry run" },
                 "auto-buy armed"
             );
+            // Measured now, while nobody is waiting, so the hot path never has
+            // to ask. A route that cannot be estimated yet still gets armed:
+            // the fallback is generous and the next send re-measures.
+            let probe = execute::pending_swap(router, &route, U256::one(), execute::deadline_in(600))?;
+            let gas_limit = match swap::measure_gas(http, owner, &probe).await {
+                Ok(g) => g.min(U256::from(u64::MAX)).as_u64(),
+                Err(e) => {
+                    warn!(route = %rc.name, err = %format!("{e:#}"), gas = GAS_FALLBACK,
+                          "could not measure gas yet; using the fallback");
+                    GAS_FALLBACK
+                }
+            };
+            info!(route = %rc.name, gas_limit, "gas measured");
+
             plans.insert(
                 trigger,
                 Plan {
                     route,
                     cooldown: Duration::from_secs(rc.cooldown_secs),
+                    gas_limit: AtomicU64::new(gas_limit),
+                    yield_ppm: AtomicU64::new(0),
+                    state: Mutex::new(None),
                 },
             );
         }
 
-        Ok(Some(Arc::new(Self {
+        // Started before the first signal, so the first buy already prices off a
+        // header rather than off a lookup.
+        let fees = Arc::new(swap::FeeWatch::default());
+        fees.watch(cfg.ws_url.clone(), http.clone());
+
+        let me = Arc::new(Self {
             http: http.clone(),
             router,
+            manager,
+            calibrate_secs: cfg.calibrate_secs,
+            model_pricing: cfg.fast_quote,
             wallet,
             owner,
             execute,
             plans,
+            fees,
             last_fire: Mutex::new(HashMap::new()),
-            sending: Mutex::new(()),
-        })))
+            next_nonce: Mutex::new(None),
+        });
+        me.calibrate();
+        Ok(Some(me))
+    }
+
+    /// Keep measuring what each armed route really pays against what the local
+    /// model expects.
+    ///
+    /// The two numbers should agree: the tick walk knows every pool's stated
+    /// fee and crosses the same ticks. Where they do not, the difference is a
+    /// hook taking a cut the PoolKey does not mention - and that is worth
+    /// watching, because it is a term of the trade that can change without any
+    /// visible transaction. It runs in the background and touches nothing in
+    /// the path of a buy.
+    fn calibrate(self: &Arc<Self>) {
+        if self.calibrate_secs == 0 {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let every = Duration::from_secs(me.calibrate_secs);
+            loop {
+                for plan in me.plans.values() {
+                    if let Err(e) = me.measure_yield(plan).await {
+                        warn!(route = %plan.route.name, err = %format!("{e:#}"),
+                              "could not measure route yield");
+                    }
+                }
+                tokio::time::sleep(every).await;
+            }
+        });
+    }
+
+    async fn measure_yield(&self, plan: &Plan) -> Result<()> {
+        let route = &plan.route;
+        // Both readings are pinned to one block. Taken at the head they would
+        // land on different ones whenever the pool is busy, and the difference
+        // between them would then be the price moving rather than a fee: that
+        // is exactly how a 1% cut first measured as 2.46%.
+        let at = self
+            .http
+            .get_block_number()
+            .await
+            .context("eth_blockNumber")?
+            .as_u64();
+        let local = route
+            .quote(&self.http, self.manager, Some(at))
+            .await
+            .context("local tick walk")?;
+        let onchain = execute::verify(
+            &self.http,
+            self.router,
+            self.owner,
+            route,
+            local.amount_out,
+            execute::deadline_in(600),
+            Some(at),
+        )
+        .await
+        .context("router quote")?;
+
+        let expected = local.amount_out;
+        anyhow::ensure!(!expected.is_zero(), "the local quote is zero");
+        // Both sides are raw token units of the same token, so the ratio is
+        // exact in integer arithmetic - no float round trip in the number that
+        // would later be used to price a trade.
+        let ppm = (onchain.amount_out * U256::from(PPM) / expected)
+            .min(U256::from(u64::MAX))
+            .as_u64();
+
+        // The same pass records what every pool looked like at that block, so
+        // a fast quote has something to price the hops the signal says nothing
+        // about. The pool that drops brings its own state with the signal.
+        *plan.state.lock().await = Some(RouteState {
+            at: Instant::now(),
+            hops: local
+                .hops
+                .iter()
+                .map(|h| HopState {
+                    sqrt_p: h.sqrt_p,
+                    liquidity: h.liquidity,
+                    lp_fee: h.lp_fee,
+                })
+                .collect(),
+        });
+
+        let previous = plan.yield_ppm.swap(ppm, Ordering::Relaxed);
+        let taken_pct = (PPM.saturating_sub(ppm.min(PPM))) as f64 / 10_000.0;
+        let moved = previous != 0 && previous.abs_diff(ppm) > YIELD_ALERT_PPM;
+        if moved {
+            warn!(
+                route = %route.name,
+                was_pct = (PPM.saturating_sub(previous.min(PPM))) as f64 / 10_000.0,
+                now_pct = taken_pct,
+                "the route's unstated fee CHANGED"
+            );
+        } else {
+            info!(
+                route = %route.name,
+                unstated_fee_pct = format!("{taken_pct:.4}"),
+                yield_ppm = ppm,
+                "route yield measured"
+            );
+        }
+        Ok(())
     }
 
     /// React to one big-sell signal.
-    pub async fn on_drop(&self, pool: &Pool, drop_pct: f64) -> Result<()> {
-        let fell = pool.base_symbol.clone().unwrap_or_else(|| "?".into());
+    /// React to one big-sell signal: decide, price, sign, send.
+    pub async fn on_drop(self: &Arc<Self>, pool: &Pool, sig: &Signal) -> Result<()> {
+        let Some((key, plan)) = self.armed_for(pool) else {
+            return Ok(());
+        };
+        if !self.claim_turn(key, plan, pool).await {
+            return Ok(());
+        }
+
+        let route = &plan.route;
+        let started = Instant::now();
+        let deadline = execute::deadline_in(120);
+        let quoted = self.quote(plan, key, sig, deadline).await?;
+
+        let min_out = execute::apply_slippage(quoted.amount_out, route.max_slippage_pct);
+        anyhow::ensure!(
+            !min_out.is_zero(),
+            "route '{}': amountOutMinimum rounds to zero",
+            route.name
+        );
+        let tx = execute::pending_swap(self.router, route, min_out, deadline)?;
+
+        let amount = |v: U256, t: &crate::route::Token| {
+            format!("{} {}", format_units(v, t.decimals), t.symbol)
+        };
+        info!(
+            pool = %pool.name,
+            route = %route.name,
+            drop_pct = format!("-{:.3}%", sig.drop_pct),
+            spend = amount(route.amount_in, &route.input),
+            quoted = amount(quoted.amount_out, &route.output),
+            priced_by = quoted.by,
+            min_out = amount(min_out, &route.output),
+            slippage_pct = route.max_slippage_pct,
+            took_ms = started.elapsed().as_millis(),
+            "BUY THE DIP"
+        );
+
+        if !self.execute {
+            info!(route = %route.name, "dry run - not sent; start with --execute to buy for real");
+            return Ok(());
+        }
+        self.broadcast(key, plan, &tx, quoted).await
+    }
+
+    /// The route armed against this pool, if it is one this signal should act
+    /// on at all. Everything it turns down, it says why.
+    fn armed_for(&self, pool: &Pool) -> Option<(PoolRef, &Plan)> {
+        let fell = pool.base_symbol.as_deref().unwrap_or("?");
         let key = pool.pool_ref();
         let Some(plan) = self.plans.get(&key) else {
             warn!(
                 pool = %pool.name, token = %fell, id = %key,
                 "big sell, but no auto_buy route buys through this pool - not buying"
             );
-            return Ok(());
+            return None;
         };
-
         // The route has to buy what actually fell. A route armed against a pool
         // whose base side is the other token would buy on someone else's dip.
         if let Some(base) = pool.base_currency() {
@@ -181,72 +431,208 @@ impl AutoBuy {
                     "route buys a different token than the one that fell here - not buying; \
                      check base_token on the pool, or trigger_pool on the route"
                 );
-                return Ok(());
+                return None;
             }
         }
+        Some((key, plan))
+    }
 
-        // Claim the cooldown before doing any work, and keep it claimed even if
-        // the buy then fails: a route that reverts every block should not retry
-        // every block.
-        {
-            let mut last = self.last_fire.lock().await;
-            if let Some(prev) = last.get(&key) {
-                let waited = prev.elapsed();
-                if waited < plan.cooldown {
-                    info!(
-                        pool = %pool.name,
-                        route = %plan.route.name,
-                        again_in_s = (plan.cooldown - waited).as_secs(),
-                        "drop seen, still cooling down"
-                    );
-                    return Ok(());
+    /// Claim this route's turn to buy, or report how long is left.
+    ///
+    /// The turn is claimed before any work and stays claimed even if the buy
+    /// then fails: a route that reverts every block should not retry every
+    /// block.
+    async fn claim_turn(&self, key: PoolRef, plan: &Plan, pool: &Pool) -> bool {
+        let mut last = self.last_fire.lock().await;
+        if let Some(waited) = last.get(&key).map(Instant::elapsed) {
+            if waited < plan.cooldown {
+                info!(
+                    pool = %pool.name,
+                    route = %plan.route.name,
+                    again_in_s = (plan.cooldown - waited).as_secs(),
+                    "drop seen, still cooling down"
+                );
+                return false;
+            }
+        }
+        last.insert(key, Instant::now());
+        true
+    }
+
+    /// Everything a buy needs that could not be worked out from memory alone.
+    ///
+    /// All three are asked for at once, so the slowest of them sets the pace
+    /// rather than their sum. The gas price usually answers from the last block
+    /// header without going anywhere, and the quote is skipped entirely when
+    /// the model can price the route itself.
+    async fn quote(
+        &self,
+        plan: &Plan,
+        key: PoolRef,
+        sig: &Signal,
+        deadline: U256,
+    ) -> Result<Quoted> {
+        let modelled = match self.model_pricing {
+            true => self.model_quote(plan, key, sig).await,
+            false => None,
+        };
+        // A nonce is only spent by a real send, so a dry run does not ask.
+        let want_nonce = self.execute;
+        let (amount, fees, nonce_seen) = tokio::join!(
+            async {
+                match modelled {
+                    Some(a) => Ok((a, "model")),
+                    None => execute::verify(
+                        &self.http, self.router, self.owner, &plan.route,
+                        U256::zero(), deadline, None,
+                    )
+                    .await
+                    .map(|q| (q.amount_out, "router")),
                 }
+            },
+            self.fees.params(&self.http),
+            async {
+                match want_nonce {
+                    true => swap::pending_nonce(&self.http, self.owner).await.ok(),
+                    false => None,
+                }
+            },
+        );
+        let (amount_out, by) = amount.context("quoting the route")?;
+        Ok(Quoted {
+            amount_out,
+            by,
+            fees,
+            nonce_seen,
+        })
+    }
+
+    /// Sign and broadcast, then let go: the receipt and the next gas figure are
+    /// both reports about a transaction that is already on its way.
+    async fn broadcast(
+        self: &Arc<Self>,
+        key: PoolRef,
+        plan: &Plan,
+        tx: &crate::swap::PendingTx,
+        quoted: Quoted,
+    ) -> Result<()> {
+        let name = plan.route.name.clone();
+        let fees = quoted.fees.context("reading the gas price")?;
+        let gas_limit = U256::from(plan.gas_limit.load(Ordering::Relaxed));
+        let nonce = self.claim_nonce(quoted.nonce_seen).await?;
+        match swap::send_nowait(&self.http, &self.wallet, tx, nonce.into(), fees, gas_limit).await {
+            Ok(hash) => {
+                info!(route = %name, ?hash, nonce, %gas_limit, "sent");
+                tokio::spawn(swap::report_receipt(self.http.clone(), hash, name));
+                self.remeasure_gas(key);
+                Ok(())
             }
-            last.insert(key, Instant::now());
+            Err(e) => {
+                // The number was taken but never used, and every later
+                // transaction would queue behind the hole it leaves.
+                *self.next_nonce.lock().await = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// Re-measure a route's gas in the background, so the next buy signs with a
+    /// figure that reflects the pool as it is now.
+    fn remeasure_gas(self: &Arc<Self>, key: PoolRef) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let Some(plan) = me.plans.get(&key) else { return };
+            let probe = match execute::pending_swap(
+                me.router,
+                &plan.route,
+                U256::one(),
+                execute::deadline_in(600),
+            ) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            if let Ok(g) = swap::measure_gas(&me.http, me.owner, &probe).await {
+                plan.gas_limit
+                    .store(g.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Price the route without asking anyone, or say why not.
+    ///
+    /// The pool that just dropped needs no lookup at all: its price, its
+    /// liquidity and the fee it actually charged all arrive in the log that
+    /// raised the signal, and they describe the pool as of that very swap. The
+    /// other pools come from the last calibration pass, which is fair because
+    /// they are not the ones that just moved. What the model cannot see - a
+    /// hook taking its own cut - is exactly what `yield_ppm` measures, so it is
+    /// applied on top.
+    ///
+    /// Returns `None` whenever anything is missing or out of range, and the
+    /// caller then asks the router as before. Being slow is recoverable;
+    /// signing a wrong minimum is not.
+    async fn model_quote(&self, plan: &Plan, trigger: PoolRef, sig: &Signal) -> Option<U256> {
+        let yield_ppm = plan.yield_ppm.load(Ordering::Relaxed);
+        if yield_ppm == 0 {
+            return None;
+        }
+        let guard = plan.state.lock().await;
+        let state = guard.as_ref()?;
+        if state.at.elapsed() > STATE_STALE_AFTER || state.hops.len() != plan.route.hops.len() {
+            return None;
         }
 
-        let route = &plan.route;
-        let started = Instant::now();
-        let deadline = execute::deadline_in(120);
-        let quote = execute::verify(
-            &self.http,
-            self.router,
-            self.owner,
-            route,
-            U256::zero(),
-            deadline,
-        )
-        .await
-        .context("quoting the route against the router")?;
-
-        let min_out = execute::apply_slippage(quote.amount_out, route.max_slippage_pct);
-        anyhow::ensure!(
-            !min_out.is_zero(),
-            "route '{}': amountOutMinimum rounds to zero",
-            route.name
-        );
-
-        let tx = execute::pending_swap(self.router, route, min_out, deadline)?;
-
-        info!(
-            pool = %pool.name,
-            route = %route.name,
-            drop_pct = format!("-{drop_pct:.3}%"),
-            spend = format!("{} {}", format_units(route.amount_in, route.input.decimals), route.input.symbol),
-            quoted = format!("{} {}", format_units(quote.amount_out, route.output.decimals), route.output.symbol),
-            min_out = format!("{} {}", format_units(min_out, route.output.decimals), route.output.symbol),
-            slippage_pct = route.max_slippage_pct,
-            took_ms = started.elapsed().as_millis(),
-            "BUY THE DIP"
-        );
-
-        if !self.execute {
-            info!(route = %route.name, "dry run - not sent; start with --execute to buy for real");
-            return Ok(());
+        let mut amount = crate::route::u256_to_f64(plan.route.amount_in);
+        for (hop, cached) in plan.route.hops.iter().zip(&state.hops) {
+            // Prefer the signal over the cache wherever it speaks: it is both
+            // fresher and about the pool whose price is the reason we are here.
+            let here = if hop.pool_ref() == trigger {
+                HopState {
+                    sqrt_p: crate::pool::sqrt_to_f64(sig.sqrt),
+                    liquidity: sig.liquidity,
+                    lp_fee: sig.lp_fee.unwrap_or(cached.lp_fee),
+                }
+            } else {
+                *cached
+            };
+            let (out, after) = crate::depth::in_range_out(
+                here.sqrt_p,
+                here.liquidity,
+                here.lp_fee,
+                hop.zero_for_one(),
+                amount,
+            )?;
+            // Past a tick boundary the arithmetic stops being exact and starts
+            // being optimistic, so it is not used there.
+            let impact = ((after / here.sqrt_p).powi(2) - 1.0).abs();
+            if !impact.is_finite() || impact > MAX_MODELLED_IMPACT {
+                return None;
+            }
+            amount = out;
         }
 
-        let _one_at_a_time = self.sending.lock().await;
-        swap::send_all(&self.http, self.wallet.clone(), std::slice::from_ref(&tx)).await
+        let raw = crate::route::f64_to_u256_pub(amount);
+        let corrected = raw * U256::from(yield_ppm) / U256::from(PPM);
+        (!corrected.is_zero()).then_some(corrected)
+    }
+
+    /// Take the next nonce.
+    ///
+    /// `observed` is what the node said a moment ago, fetched beside the quote.
+    /// The higher of the two wins: the node knows about transactions this
+    /// process did not send, and the counter knows about one it sent so
+    /// recently that the node may not have counted it yet. Either alone is
+    /// wrong, and being wrong here costs the whole buy.
+    async fn claim_nonce(&self, observed: Option<u64>) -> Result<u64> {
+        let mut slot = self.next_nonce.lock().await;
+        let n = match (*slot, observed) {
+            (Some(local), Some(seen)) => local.max(seen),
+            (Some(local), None) => local,
+            (None, Some(seen)) => seen,
+            (None, None) => swap::pending_nonce(&self.http, self.owner).await?,
+        };
+        *slot = Some(n + 1);
+        Ok(n)
     }
 }
 
