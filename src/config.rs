@@ -57,12 +57,16 @@ pub struct Config {
     pub tokens: HashMap<String, String>,
     /// How often (seconds) to re-measure what an armed route's pools take on
     /// top of their stated fees - a hook charging its own cut shows up here and
-    /// nowhere else. The figure is a check, not a term in the price: a route
-    /// never measured is not traded, and one found keeping more than a quarter
-    /// of a swap is refused (see `executor::unstated_fee_acceptable`). The same
-    /// pass snapshots every pool on the route, which is what the hops a signal
-    /// says nothing about are priced from. So 0 here means no armed route is
-    /// ever bought. Only armed routes are measured, and only in the background.
+    /// nowhere else. The figure is both a term in the price and a check: a
+    /// route never measured is not traded, and one found keeping more than 5%
+    /// of a swap is refused (see `executor::unstated_fee_acceptable`). So 0
+    /// here means no armed route is ever bought. Only armed routes are
+    /// measured, and only in the background.
+    ///
+    /// This also paces the pool snapshot the hops a signal says nothing about
+    /// are priced from, because the same pass writes it - and the snapshot is
+    /// trusted for twice this interval, so raising this makes buys price off
+    /// older state as well as measuring the fee less often.
     #[serde(default = "default_calibrate")]
     pub calibrate_secs: u64,
     /// Where to keep what the chain has already told us about pools and

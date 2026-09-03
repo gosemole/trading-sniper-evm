@@ -17,7 +17,10 @@
 //! safe reading of it.
 //!
 //! One round trip stands between a signal and a signed transaction, and it is
-//! the send. The buy is priced entirely from memory: the pool that dropped
+//! the send - not almost, but exactly: the price comes from memory, the gas
+//! price from the block stream, and the nonce from this process's own counter,
+//! which is the whole answer as long as nothing else signs with this key while
+//! the bot runs. The buy is priced entirely from memory: the pool that dropped
 //! brought its own price, liquidity and fee in the very log that raised the
 //! signal, the other pools on the route come from the last calibration pass,
 //! and what a hook takes on top is the correction that pass measured. See
@@ -123,6 +126,11 @@ pub struct Fill {
 /// not have to reach back for any of it.
 struct Quoted {
     amount_out: U256,
+    /// How old the calibration snapshot was when this was priced, in seconds,
+    /// or `None` when there is no snapshot at all. Logged on every buy so that
+    /// the state ageing is visible while it is still pricing trades, rather
+    /// than only once it has stopped pricing them.
+    state_age_s: Option<u64>,
     /// How long the asking took, so the log separates the network from
     /// everything else - which is otherwise invisible and dominates.
     took: Duration,
@@ -135,10 +143,22 @@ struct Quoted {
 /// Fixed-point scale for `yield_ppm`.
 const PPM: u64 = 1_000_000;
 
+/// The least a snapshot may be trusted for, whatever the calibration interval
+/// is. Pools other than the one that just dropped move slowly enough that two
+/// minutes is fine.
+const STATE_STALE_MIN: Duration = Duration::from_secs(120);
+
 /// How stale the cached pool state may be before a fast quote is refused.
-/// Pools other than the one that just dropped move slowly enough that a few
-/// minutes is fine; past that, asking the router is cheaper than being wrong.
-const STATE_STALE_AFTER: Duration = Duration::from_secs(120);
+///
+/// This CANNOT be a constant: the snapshot is written by the calibration pass
+/// and by nothing else, so a window shorter than the interval between passes
+/// leaves a stretch of every cycle in which no route can be priced at all -
+/// with `calibrate_secs` at its default of 300 against a fixed two minutes,
+/// that was three minutes dead in every five. Two intervals, so one missed
+/// pass is survivable and only a second one stops trading.
+fn state_stale_after(calibrate_secs: u64) -> Duration {
+    Duration::from_secs(calibrate_secs.saturating_mul(2)).max(STATE_STALE_MIN)
+}
 
 /// How far a fast-quoted swap may move a pool's own price before the model is
 /// no longer trusted. Inside a tick range the arithmetic is exact; past one it
@@ -470,6 +490,7 @@ impl Executor {
             quoted = amount(quoted.amount_out, &route.output),
             priced_by = "model",
             quote_ms = quoted.took.as_millis(),
+            state_age_s = quoted.state_age_s,
             min_out = amount(min_out, &route.output),
             slippage_pct = route.max_slippage_pct,
             took_ms = started.elapsed().as_millis(),
@@ -673,10 +694,14 @@ impl Executor {
     /// is why nothing here reads a balance either: the caller already checked
     /// the wallet can cover this against its own tracked figure before this was
     /// ever called, and a second read here would be the very round trip that
-    /// tracking it locally exists to avoid. Fees and nonce are asked for
-    /// together, so the slower of the two sets the pace rather than their sum -
-    /// and the gas price usually answers from the last block header without
-    /// going anywhere at all.
+    /// tracking it locally exists to avoid.
+    ///
+    /// In the steady state this asks the network for nothing at all: the gas
+    /// price answers from the last block header the `newHeads` watcher stored,
+    /// and the nonce answers from this process's own counter. The two are still
+    /// joined rather than sequenced, because the cases where one of them does
+    /// have to go and look - a stale header, an empty counter - should cost the
+    /// slower of the two rather than their sum.
     async fn quote(
         &self,
         plan: &Plan,
@@ -729,15 +754,21 @@ impl Executor {
         // nothing but this one drop, and there will be another.
         let Some(amount_out) = modelled else {
             anyhow::bail!(
-                "route '{}': the model could not price this trade right now (state too \
-                 stale, a hop's pool changed count, or the move too large to trust the \
-                 in-range formula) - skipping rather than guessing",
+                "route '{}': the model could not price this trade - see the reason logged \
+                 just above; skipping rather than guessing",
                 plan.route.name
             );
         };
 
-        // A nonce is only spent by a real send, so a dry run does not ask.
-        let want_nonce = self.execute;
+        // A nonce is only spent by a real send, so a dry run does not ask -
+        // and neither does a send that already knows the answer. This process
+        // is the only thing signing with this key while it runs, so once it
+        // has a counter, the counter IS the nonce; asking again would spend
+        // the last network wait left between a drop and a broadcast on
+        // confirming something we already know. The counter is empty exactly
+        // twice: at the first buy after a start, and after a failed send
+        // cleared it - and those are the two cases that must ask.
+        let want_nonce = self.execute && self.next_nonce.lock().await.is_none();
         let (fees, nonce_seen) = tokio::join!(
             self.fees.params(&self.http),
             async {
@@ -747,8 +778,19 @@ impl Executor {
                 }
             },
         );
+        // Read back rather than returned from `model_quote`, which has two
+        // callers and no use for it: one uncontended lock, off the critical
+        // arithmetic and before the send.
+        let state_age_s = plan
+            .state
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| s.at.elapsed().as_secs());
+
         Ok(Quoted {
             amount_out,
+            state_age_s,
             took: started.elapsed(),
             fees,
             nonce_seen,
@@ -931,17 +973,25 @@ impl Executor {
         // Never priced by a measurement that does not exist. The callers check
         // this too, and both of them refusing is the point.
         if yield_ppm == 0 {
+            warn!(
+                route = %route.name,
+                "not priced: this direction has never been measured (see calibrate_secs)"
+            );
             return None;
         }
         let guard = plan.state.lock().await;
+        // Kept rather than collapsed into the filter below, because every one
+        // of the refusals in this function used to arrive as the same sentence
+        // listing three possible causes, and a log that makes the reader guess
+        // between three is worth about as much as no log.
+        let stale_after = state_stale_after(self.calibrate_secs);
+        let age = guard.as_ref().map(|s| s.at.elapsed());
         // Keyed by pool rather than by position, so the same state serves a
         // route walked in either order. Absent or stale, it simply is not
         // there to fall back on.
         let known: Option<HashMap<PoolRef, HopState>> = guard
             .as_ref()
-            .filter(|s| {
-                s.at.elapsed() <= STATE_STALE_AFTER && s.hops.len() == plan.route.hops.len()
-            })
+            .filter(|s| s.at.elapsed() <= stale_after && s.hops.len() == plan.route.hops.len())
             .map(|s| {
                 plan.route
                     .hops
@@ -955,7 +1005,22 @@ impl Executor {
         for hop in &route.hops {
             let mut here = match fresh {
                 Some((p, s)) if p == hop.pool_ref() => s,
-                _ => *known.as_ref()?.get(&hop.pool_ref())?,
+                _ => match known.as_ref().and_then(|k| k.get(&hop.pool_ref())) {
+                    Some(s) => *s,
+                    None => {
+                        warn!(
+                            route = %route.name,
+                            pool = %hop.pool_ref(),
+                            snapshot_age_s = age.map(|a| a.as_secs()),
+                            usable_for_s = stale_after.as_secs(),
+                            calibrate_secs = self.calibrate_secs,
+                            "not priced: no usable state for this hop - the signal does not \
+                             cover it, and the calibration snapshot is missing, too old, or \
+                             describes a different number of hops"
+                        );
+                        return None;
+                    }
+                },
             };
             // The one thing about the log the chain gets to overrule. A log fee
             // landing exactly on the pool's stored LP fee while slot0 says a
@@ -980,17 +1045,37 @@ impl Executor {
                     here.protocol_fee_1for0 = snap.protocol_fee_1for0;
                 }
             }
-            let (out, after) = crate::depth::in_range_out(
+            let fee_pips = here.swap_fee(hop.zero_for_one());
+            let stepped = crate::depth::in_range_out(
                 here.sqrt_p,
                 here.liquidity,
-                here.swap_fee(hop.zero_for_one()),
+                fee_pips,
                 hop.zero_for_one(),
                 amount,
-            )?;
+            );
+            let Some((out, after)) = stepped else {
+                warn!(
+                    route = %route.name,
+                    pool = %hop.pool_ref(),
+                    fee_pips,
+                    liquidity = here.liquidity,
+                    amount_in = amount,
+                    "not priced: the in-range step returned nothing for this hop"
+                );
+                return None;
+            };
             // Past a tick boundary the arithmetic stops being exact and starts
             // being optimistic, so it is not used there.
             let impact = ((after / here.sqrt_p).powi(2) - 1.0).abs();
             if !impact.is_finite() || impact > MAX_MODELLED_IMPACT {
+                warn!(
+                    route = %route.name,
+                    pool = %hop.pool_ref(),
+                    impact_pct = format!("{:.4}", impact * 100.0),
+                    limit_pct = MAX_MODELLED_IMPACT * 100.0,
+                    "not priced: this size moves the pool further than the in-range formula \
+                     stays exact for"
+                );
                 return None;
             }
             amount = out;
@@ -1006,11 +1091,15 @@ impl Executor {
 
     /// Take the next nonce.
     ///
-    /// `observed` is what the node said a moment ago, fetched beside the quote.
-    /// The higher of the two wins: the node knows about transactions this
-    /// process did not send, and the counter knows about one it sent so
-    /// recently that the node may not have counted it yet. Either alone is
-    /// wrong, and being wrong here costs the whole buy.
+    /// `observed` is what the node said a moment ago, and it is only fetched
+    /// when this process has no counter of its own - see `quote`. The higher of
+    /// the two still wins where both exist: the counter can know about a
+    /// transaction sent so recently that the node has not counted it yet, and
+    /// signing a nonce that is already spent costs the whole buy.
+    ///
+    /// The premise is that nothing else signs with this key while the bot runs.
+    /// If something did, its transaction would be missed until the next send
+    /// failed and cleared the counter - which is what makes that reset matter.
     async fn claim_nonce(&self, observed: Option<u64>) -> Result<u64> {
         let mut slot = self.next_nonce.lock().await;
         let n = match (*slot, observed) {
