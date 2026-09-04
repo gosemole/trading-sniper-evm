@@ -559,6 +559,17 @@ pub fn received(logs: &[ethers::types::Log], token: Address, to: Address) -> Opt
     seen.then_some(total)
 }
 
+/// How often to ask whether a transaction has landed. Inclusion on this chain
+/// was measured at three to five blocks - four hundred milliseconds or so - so
+/// the first question is asked when the answer is due rather than on a timer
+/// that knows nothing about the chain.
+const RECEIPT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long to keep asking. Six questions at most, and in the ordinary case
+/// one: a transaction that has not landed in three seconds - thirty blocks -
+/// is not merely slow.
+const RECEIPT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// A transaction that has stopped being pending.
 pub struct Landed {
     pub outcome: Outcome,
@@ -569,7 +580,47 @@ pub struct Landed {
 /// Follow a broadcast transaction to its receipt, saying how it ended and
 /// carrying the logs so a caller can read what actually moved.
 pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> Landed {
-    match ethers::providers::PendingTransaction::new(hash, http).await {
+    // Asked directly rather than through `PendingTransaction`, which polls at
+    // the provider's interval whatever the transport - a websocket provider
+    // polls identically - and whose default of seven seconds meant a revert was
+    // learnt about seventy blocks after it happened, with the position reserved
+    // and the pool held busy throughout.
+    let mut waited = std::time::Duration::ZERO;
+    let mut receipt = None;
+    while waited < RECEIPT_GRACE {
+        tokio::time::sleep(RECEIPT_POLL).await;
+        waited += RECEIPT_POLL;
+        match http.get_transaction_receipt(hash).await {
+            Ok(Some(r)) => {
+                receipt = Some(r);
+                break;
+            }
+            // No receipt yet, or the node could not say. Neither is an answer,
+            // and both wait: an endpoint that errors once is not evidence that
+            // a transaction failed.
+            Ok(None) => {}
+            Err(e) => tracing::debug!(tx = ?hash, err = %e, label, "no answer yet"),
+        }
+    }
+
+    // Nothing landed inside the grace. Whether that is a transaction the chain
+    // never had or one still waiting its turn decides whether the caller may
+    // roll its position back, and the two must not be reported as one: rolling
+    // back a transaction that is still going to land is how a position comes to
+    // exist on chain and not on the books. So it is worth one more question.
+    let outcome = match receipt {
+        Some(r) => Ok(Some(r)),
+        None => match http.get_transaction(hash).await {
+            Ok(None) => Ok(None),
+            Ok(Some(_)) => Err(anyhow::anyhow!(
+                "still pending after {}s and may yet land - NOT known to have failed",
+                RECEIPT_GRACE.as_secs()
+            )),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        },
+    };
+
+    match outcome {
         Ok(Some(r)) if r.status == Some(1u64.into()) => {
             tracing::info!(
                 tx = ?hash, block = ?r.block_number, gas_used = ?r.gas_used, label,
