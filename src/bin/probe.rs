@@ -35,6 +35,7 @@
 //!   probe --watch [--feed WSS] [--ws WSS] [--address 0x..] [--seconds 300] [--warmup 10]
 //!   probe --offset [--feed WSS] [--read URL] [--samples 10]
 //!   probe --heads  [--feed WSS] [--ws WSS] [--seconds 300] [--warmup 10]
+//!   probe --extsload [--address 0x..] [--read URL]
 //!
 //! Takes what it needs from the environment, the same names the bot itself
 //! reads over its config file: `SUBMIT_URLS` (comma separated) for what to
@@ -75,9 +76,18 @@ struct Cfg {
     #[serde(default)]
     pool_manager: Option<String>,
     #[serde(default)]
+    pools: Vec<PoolCfg>,
+    #[serde(default)]
     submit_urls: Vec<String>,
     #[serde(default)]
     private_key: Option<String>,
+}
+
+/// Only what `--extsload` needs to find a slot that is not zero.
+#[derive(Default, serde::Deserialize)]
+struct PoolCfg {
+    #[serde(default)]
+    pool_id: Option<String>,
 }
 
 /// A non-empty environment variable, trimmed - `config::env_var`'s rule, so
@@ -673,6 +683,149 @@ async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
     Ok(())
 }
 
+/// Does this PoolManager expose v4's batch storage read, and does it agree with
+/// `eth_getStorageAt`?
+///
+/// It matters because every tick walk here reads storage one slot at a time -
+/// up to thirty-two bitmap words plus a read per crossed tick, all sequential
+/// round trips. `extsload(bytes32[])` would collapse that into two calls. A
+/// generic Multicall would not: these are raw storage reads, not contract
+/// calls, and only the manager itself can serve them in bulk.
+///
+/// The router here is a fork, so this is asked rather than assumed. Both halves
+/// are checked: that the call answers at all, and that what it answers matches
+/// what the node reports for the same slot - a method that exists but reads
+/// something else would be worse than one that is missing.
+async fn extsload(args: &[String], cfg: &Cfg) -> Result<()> {
+    let value = |name: &str| -> Option<String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let read_url = value("--read")
+        .or_else(|| env_var("HTTP_URL"))
+        .or_else(|| cfg.http_url.clone())
+        .context("nowhere to ask: pass --read URL or set HTTP_URL")?;
+    let manager: ethers::types::Address = value("--address")
+        .or_else(|| cfg.pool_manager.clone())
+        .context("no pool manager: pass --address 0x... or set pool_manager in the config")?
+        .parse()
+        .context("--address is not an address")?;
+    let read = Provider::<Http>::try_from(read_url.clone()).context("bad read endpoint")?;
+    // Every read here is pinned to one block, and this is not a detail. A
+    // pool's slot0 is rewritten by every swap, and this chain produces ten
+    // blocks a second: two unpinned requests land on different blocks and
+    // disagree about a value that was never wrong. Two behind the head, because
+    // a block the node has just announced is not always readable yet.
+    let at = read
+        .get_block_number()
+        .await
+        .context("eth_blockNumber")?
+        .as_u64()
+        .saturating_sub(2);
+    println!("asking {manager:?} via {}, all reads at block {at}\n", label(&read_url));
+
+    // Slots of a real pool, not of the manager's own header. A pool's `slot0`
+    // and `liquidity` are non-zero on a live pool, and that is the point: two
+    // zero slots would be matched by a method that answers zero to everything,
+    // which is exactly the failure this check exists to catch.
+    //
+    // `_pools[poolId]` lives at keccak(poolId . POOLS_SLOT), with liquidity
+    // three words in - the same arithmetic `depth::TickReader` uses.
+    const POOLS_SLOT: u64 = 6;
+    let pool_id: H256 = cfg
+        .pools
+        .iter()
+        .find_map(|p| p.pool_id.as_ref())
+        .context("no pool_id in the config to test against - add one, or test another way")?
+        .parse()
+        .context("pool_id is not a 32-byte hash")?;
+    let mut preimage = [0u8; 64];
+    preimage[..32].copy_from_slice(&pool_id.0);
+    U256::from(POOLS_SLOT).to_big_endian(&mut preimage[32..]);
+    let base = U256::from_big_endian(&ethers::utils::keccak256(preimage));
+    let slots: [U256; 2] = [base, base + U256::from(3)];
+    println!("testing against pool {pool_id:?}, slot0 and liquidity\n");
+    let mut truth = Vec::new();
+    for slot in slots {
+        let mut b = [0u8; 32];
+        slot.to_big_endian(&mut b);
+        let w: H256 = read
+            .request(
+                "eth_getStorageAt",
+                (format!("{manager:?}"), format!("0x{:064x}", slot), format!("0x{at:x}")),
+            )
+            .await
+            .context("eth_getStorageAt")?;
+        println!("eth_getStorageAt 0x{slot:064x}: {w:?}");
+        anyhow::ensure!(
+            !w.is_zero(),
+            "that slot reads zero, so matching it would prove nothing - is this pool live?"
+        );
+        truth.push(w);
+    }
+
+    let sel = |sig: &str| ethers::utils::keccak256(sig.as_bytes())[..4].to_vec();
+    let word = |v: U256| {
+        let mut b = [0u8; 32];
+        v.to_big_endian(&mut b);
+        b
+    };
+
+    // extsload(bytes32) - one slot, one word back.
+    let mut one = sel("extsload(bytes32)");
+    one.extend_from_slice(&word(slots[0]));
+
+    // extsload(bytes32,uint256) - a run of consecutive slots from a start.
+    let mut run = sel("extsload(bytes32,uint256)");
+    run.extend_from_slice(&word(slots[0]));
+    run.extend_from_slice(&word(U256::from(2)));
+
+    // extsload(bytes32[]) - an arbitrary set, which is the one the tick walk
+    // needs: bitmap words and tick slots are scattered, not consecutive.
+    let mut many = sel("extsload(bytes32[])");
+    many.extend_from_slice(&word(U256::from(0x20)));
+    many.extend_from_slice(&word(U256::from(slots.len())));
+    for slot in slots {
+        many.extend_from_slice(&word(slot));
+    }
+
+    println!();
+    for (name, data, expect_words) in [
+        ("extsload(bytes32)", one, 1usize),
+        ("extsload(bytes32,uint256)", run, 2),
+        ("extsload(bytes32[])", many, 2),
+    ] {
+        let tx = ethers::types::TransactionRequest::new()
+            .to(manager)
+            .data(ethers::types::Bytes::from(data));
+        match read.call(&tx.into(), Some(ethers::types::BlockId::from(at))).await {
+            Ok(out) => {
+                // The dynamic forms return an offset and a length before the
+                // words; the fixed one returns the word alone. Rather than
+                // decode each shape, look for the expected words anywhere in
+                // the return - if they are there, the method reads what the
+                // node reads.
+                let hay = out.0.as_ref();
+                let found = truth
+                    .iter()
+                    .take(expect_words)
+                    .filter(|w| hay.windows(32).any(|c| c == w.as_bytes()))
+                    .count();
+                println!(
+                    "{name:28} OK, {} bytes back, {found} of {expect_words} slot(s) match \
+                     eth_getStorageAt",
+                    hay.len()
+                );
+            }
+            Err(e) => println!("{name:28} unavailable: {e}"),
+        }
+    }
+    println!(
+        "\nthe one that matters is extsload(bytes32[]): the tick walk needs scattered slots, \
+         not a consecutive run."
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -704,6 +857,9 @@ async fn main() -> Result<()> {
     }
     if args.iter().any(|a| a == "--heads") {
         return heads(&args, &cfg).await;
+    }
+    if args.iter().any(|a| a == "--extsload") {
+        return extsload(&args, &cfg).await;
     }
 
     // Every `--endpoint` given, else what the bot itself broadcasts through -

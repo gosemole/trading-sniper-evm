@@ -14,6 +14,8 @@ use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::{Address, Bytes, TransactionRequest, H256, U256};
 use ethers::utils::keccak256;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// `PoolManager._pools` lives at storage slot 6, and within `Pool.State` the
 /// `ticks` mapping is member 4 and `tickBitmap` member 5. Verified against the
@@ -26,6 +28,12 @@ const POOLS_SLOT: u64 = 6;
 const MAX_BITMAP_WORDS: u32 = 32;
 const TICKS_OFFSET: u64 = 4;
 const BITMAP_OFFSET: u64 = 5;
+
+/// How many slots to ask for in one `extsload`. The whole scan window is 32
+/// words plus a slot per initialized tick found in them, which fits comfortably;
+/// the cap exists so an unusually dense pool cannot build a request an endpoint
+/// refuses.
+const SLOTS_PER_CALL: usize = 128;
 
 /// Where to read tick state from.
 #[derive(Debug, Clone)]
@@ -68,6 +76,20 @@ pub struct TickReader<'a> {
     http: &'a Provider<Http>,
     source: Source,
     spacing: i32,
+    /// Storage words already read, so a walk asks for each slot once.
+    ///
+    /// This is a cache, but its first job is consistency rather than speed: an
+    /// unpinned walk used to spread thirty reads across three or four blocks of
+    /// a chain that produces ten a second, and could combine a bitmap from one
+    /// block with the liquidity from another. Reading each slot once means a
+    /// walk sees one version of the pool even when no block was pinned.
+    words: Mutex<HashMap<(Address, U256), H256>>,
+    /// Scan windows already fetched, so a walk that crosses many ticks inside
+    /// one window does not re-derive the same request on every crossing.
+    windows: Mutex<std::collections::HashSet<(i32, bool)>>,
+    /// Whether to fetch storage in batches through the manager's `extsload`.
+    /// Only ever turned off to check that batching changed no answers.
+    batched: bool,
     /// Block to read at, or `None` for the head. Pinning it matters whenever a
     /// reading is compared against another: a pool that moves between two
     /// "latest" reads turns the difference between them into price movement
@@ -78,12 +100,28 @@ pub struct TickReader<'a> {
 impl<'a> TickReader<'a> {
     pub fn new(http: &'a Provider<Http>, source: Source, spacing: i32) -> Result<Self> {
         anyhow::ensure!(spacing > 0, "tick spacing must be > 0, got {spacing}");
-        Ok(Self { http, source, spacing, at: None })
+        Ok(Self {
+            http,
+            source,
+            spacing,
+            words: Mutex::new(HashMap::new()),
+            windows: Mutex::new(std::collections::HashSet::new()),
+            batched: true,
+            at: None,
+        })
     }
 
     /// Read every value at one fixed block.
     pub fn at_block(mut self, block: Option<u64>) -> Self {
         self.at = block;
+        self
+    }
+
+    /// Read storage one slot at a time, the way this did before `extsload`.
+    /// Exists so the two can be run against each other on the same block and
+    /// shown to produce identical numbers; nothing in the bot turns it off.
+    pub fn unbatched(mut self) -> Self {
+        self.batched = false;
         self
     }
 
@@ -96,6 +134,9 @@ impl<'a> TickReader<'a> {
     }
 
     async fn storage(&self, addr: Address, slot: U256) -> Result<H256> {
+        if let Some(w) = self.cached(addr, slot) {
+            return Ok(w);
+        }
         let word: H256 = self
             .http
             .request(
@@ -108,7 +149,173 @@ impl<'a> TickReader<'a> {
             )
             .await
             .context("eth_getStorageAt")?;
+        self.remember(addr, &[slot], &[word]);
         Ok(word)
+    }
+
+    fn cached(&self, addr: Address, slot: U256) -> Option<H256> {
+        self.words.lock().ok()?.get(&(addr, slot)).copied()
+    }
+
+    fn remember(&self, addr: Address, slots: &[U256], words: &[H256]) {
+        if let Ok(mut map) = self.words.lock() {
+            for (s, w) in slots.iter().zip(words) {
+                map.insert((addr, *s), *w);
+            }
+        }
+    }
+
+    /// Read a set of slots in as few requests as the manager allows.
+    ///
+    /// v4's PoolManager serves `extsload(bytes32[])`, which returns a word per
+    /// slot in one call - verified against `eth_getStorageAt` on this chain,
+    /// same block, same values. That is what turns a tick walk from thirty-odd
+    /// sequential round trips into two: the slots a walk needs are scattered
+    /// across hash maps, so a generic multicall or a consecutive-range read
+    /// cannot serve them, but this can.
+    ///
+    /// Anything it cannot batch - a v3 pool, or a manager that does not answer -
+    /// falls back to reading one slot at a time, which is what this did before
+    /// and is never wrong, only slower.
+    async fn prefetch(&self, slots: &[U256]) {
+        let Source::V4 { manager, .. } = self.source else { return };
+        if !self.batched {
+            return;
+        }
+        let wanted: Vec<U256> = {
+            let Ok(map) = self.words.lock() else { return };
+            let mut seen = std::collections::HashSet::new();
+            slots
+                .iter()
+                .filter(|s| !map.contains_key(&(manager, **s)) && seen.insert(**s))
+                .copied()
+                .collect()
+        };
+        for chunk in wanted.chunks(SLOTS_PER_CALL) {
+            match self.extsload(manager, chunk).await {
+                Ok(words) => self.remember(manager, chunk, &words),
+                // Not an error: every one of these slots is still read
+                // individually by whoever asked for it. Said once per walk at
+                // debug level rather than warned about per slot.
+                Err(e) => {
+                    tracing::debug!(err = %format!("{e:#}"), "batch storage read unavailable");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `extsload(bytes32[])`: one word back per slot, in order.
+    async fn extsload(&self, manager: Address, slots: &[U256]) -> Result<Vec<H256>> {
+        let mut data = selector("extsload(bytes32[])");
+        let mut push = |v: U256| {
+            let mut b = [0u8; 32];
+            v.to_big_endian(&mut b);
+            data.extend_from_slice(&b);
+        };
+        // One dynamic array: the offset to it, its length, then its contents.
+        push(U256::from(0x20));
+        push(U256::from(slots.len()));
+        for s in slots {
+            push(*s);
+        }
+        let res = self.call(manager, data).await?;
+        let body = res.0.get(64..).context("short extsload return")?;
+        anyhow::ensure!(
+            body.len() >= slots.len() * 32,
+            "extsload returned {} bytes for {} slots",
+            res.0.len(),
+            slots.len()
+        );
+        Ok((0..slots.len()).map(|i| H256::from_slice(&body[i * 32..(i + 1) * 32])).collect())
+    }
+
+    /// Fetch everything one scan could need, in two requests instead of thirty.
+    ///
+    /// The scan reads bitmap words one at a time until it finds a set bit, and
+    /// then the caller reads that tick's `liquidityNet` before scanning on - so
+    /// walking a busy pool used to be dozens of sequential round trips, each
+    /// one waiting on the last. Both halves are knowable in advance: the window
+    /// of words is fixed by where the scan starts and which way it goes, and
+    /// the ticks worth reading are exactly the set bits in those words.
+    ///
+    /// So: one call for the window, then one for the ticks it revealed. The
+    /// scan itself is unchanged and still reads word by word - it just finds
+    /// every answer already in hand.
+    ///
+    /// Ticks are capped because a dense pool can have hundreds of initialized
+    /// ticks in one window while a swap crosses two or three; reading them all
+    /// would trade round trips for bandwidth without being asked to.
+    async fn prefetch_scan(&self, start_word: i32, up: bool, max_words: u32) {
+        let Source::V4 { manager, .. } = self.source else { return };
+        /// Ticks read ahead per scan. Comfortably past what a swap sized by
+        /// this bot crosses, and bounded so an unusual pool cannot blow the
+        /// request up.
+        const TICKS_AHEAD: usize = 32;
+        if !self.batched {
+            return;
+        }
+        // Already fetched, or the lock is poisoned - either way the reads below
+        // still work one slot at a time, which is what this did before.
+        let fresh = match self.windows.lock() {
+            Ok(mut seen) => seen.insert((start_word, up)),
+            Err(_) => false,
+        };
+        if !fresh {
+            return;
+        }
+        let positions: Vec<i32> =
+            (0..max_words as i32).map(|i| start_word + if up { i } else { -i }).collect();
+        let window: Vec<U256> = positions.iter().filter_map(|w| self.bitmap_slot(*w)).collect();
+        self.prefetch(&window).await;
+
+        // Set bits, in the order the scan will meet them, so the cap keeps the
+        // ticks that are actually about to be crossed.
+        let mut ticks = Vec::new();
+        for (pos, slot) in positions.iter().zip(&window) {
+            let Some(w) = self.cached(manager, *slot) else { continue };
+            let word = U256::from_big_endian(w.as_bytes());
+            let bits: Box<dyn Iterator<Item = u32>> = match up {
+                true => Box::new(0..256u32),
+                false => Box::new((0..256u32).rev()),
+            };
+            for b in bits {
+                if word.bit(b as usize) {
+                    if let Some(ts) = self.tick_slot(((pos << 8) + b as i32) * self.spacing) {
+                        ticks.push(ts);
+                        if ticks.len() >= TICKS_AHEAD {
+                            break;
+                        }
+                    }
+                }
+            }
+            if ticks.len() >= TICKS_AHEAD {
+                break;
+            }
+        }
+        self.prefetch(&ticks).await;
+    }
+
+    /// The storage slot of one bitmap word, for the batch reader.
+    fn bitmap_slot(&self, word_pos: i32) -> Option<U256> {
+        match &self.source {
+            Source::V4 { pool_id, .. } => {
+                let base = Self::v4_base(*pool_id) + U256::from(BITMAP_OFFSET);
+                Some(mapping_slot(&signed_word(word_pos as i64), base))
+            }
+            Source::V3 { .. } => None,
+        }
+    }
+
+    /// The storage slot of one tick's `TickInfo`, for the batch reader.
+    fn tick_slot(&self, tick: i32) -> Option<U256> {
+        match &self.source {
+            Source::V4 { pool_id, .. } => {
+                let base = Self::v4_base(*pool_id) + U256::from(TICKS_OFFSET);
+                Some(mapping_slot(&signed_word(tick as i64), base))
+            }
+            Source::V3 { .. } => None,
+        }
     }
 
     async fn call(&self, to: Address, data: Vec<u8>) -> Result<Bytes> {
@@ -170,6 +377,7 @@ impl<'a> TickReader<'a> {
     /// Getting that backwards silently skips a tick and understates the cost.
     async fn next_initialized(&self, from: i32, up: bool, max_words: u32) -> Result<Option<i32>> {
         let compressed = compress(from, self.spacing);
+        self.prefetch_scan(compressed >> 8, up, max_words).await;
         let mut word_pos = compressed >> 8;
         let mut bit = compressed & 255;
         let mut first = true;
@@ -385,6 +593,8 @@ pub async fn read_state(reader: &TickReader<'_>) -> Result<PoolState> {
     match &reader.source {
         Source::V4 { manager, pool_id } => {
             let base = TickReader::v4_base(*pool_id);
+            // Both words in one request: slot0 and, three along, liquidity.
+            reader.prefetch(&[base, base + U256::from(3)]).await;
             let s0 = reader.storage(*manager, base).await?;
             anyhow::ensure!(!s0.is_zero(), "pool is not initialized");
             let (sqrt_x96, _tick, protocol_fee, lp_fee) = decode_slot0(s0);

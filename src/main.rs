@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let check_routes = args.iter().any(|a| a == "--check-routes");
     let execute = args.iter().any(|a| a == "--execute");
+    let depth_check = args.iter().any(|a| a == "--depth-check");
     let quote_route = flag_value("--quote");
     let swap_route = flag_value("--swap");
     let sell_token = flag_value("--sell-all");
@@ -81,6 +82,9 @@ async fn main() -> anyhow::Result<()> {
 
     if check_routes {
         return check_all_routes(&http, &cfg).await;
+    }
+    if depth_check {
+        return depth_check_cmd(&http, &cfg).await;
     }
     if let Some(name) = quote_route {
         return quote_route_cmd(&http, &cfg, &name, amount.as_deref()).await;
@@ -208,6 +212,83 @@ async fn main() -> anyhow::Result<()> {
 /// Resolve every configured route and print what was recovered, without
 /// touching a wallet. Every PoolKey is verified against its pool id, so a wrong
 /// id or a broken chain fails here rather than at swap time.
+/// Prove that reading storage in batches changed no number.
+///
+/// `TickReader` now pulls a whole scan window through the manager's
+/// `extsload(bytes32[])` instead of asking for one slot at a time. The
+/// arithmetic is untouched, but "untouched" is a claim, and this is a
+/// financial system - so both paths are run against the SAME pinned block and
+/// their answers compared. A pinned block is the whole point: unpinned, the two
+/// walks would read a pool that moved between them and disagree for a reason
+/// that has nothing to do with batching.
+async fn depth_check_cmd(
+    http: &ethers::providers::Provider<ethers::providers::Http>,
+    cfg: &config::Config,
+) -> anyhow::Result<()> {
+    use ethers::providers::Middleware;
+    // Two behind the head: a block the node has just announced is not always
+    // readable yet, which is the `header not found` calibration keeps hitting.
+    let at = http.get_block_number().await?.as_u64().saturating_sub(2);
+    println!("comparing batched and unbatched tick walks at block {at}\n");
+
+    let mut checked = 0;
+    let mut differed = 0;
+    for pc in &cfg.pools {
+        let pool = match pool::Pool::resolve(http, pc, &cfg.tokens).await {
+            Ok(p) => p,
+            Err(e) => {
+                println!("{:24} skipped: {e:#}", pc.name);
+                continue;
+            }
+        };
+        let (Some(spacing), Some(source)) = (pool.tick_spacing, pool.tick_source()) else {
+            println!("{:24} skipped: no tick source", pool.name);
+            continue;
+        };
+        let move_pct = pc.max_move_pct.unwrap_or(cfg.max_move_pct);
+
+        let mut answers = Vec::new();
+        for batched in [true, false] {
+            let reader = depth::TickReader::new(http, source.clone(), spacing)?.at_block(Some(at));
+            let reader = if batched { reader } else { reader.unbatched() };
+            let state = depth::read_state(&reader).await?;
+            let started = std::time::Instant::now();
+            let pay = depth::pay_to_move(
+                &reader,
+                state.sqrt_p,
+                state.liquidity,
+                pool.base_token,
+                move_pct,
+                state.swap_fee(pool.base_token == 0),
+            )
+            .await?;
+            answers.push((pay, started.elapsed().as_millis()));
+        }
+
+        let (batched, t_batched) = answers[0];
+        let (plain, t_plain) = answers[1];
+        // Exact equality is the right test: the same slots read the same way
+        // feed the same f64 arithmetic in the same order. Anything else means
+        // the batch read a different pool state, and "close enough" would be
+        // exactly the wrong thing to accept.
+        let same = batched == plain;
+        checked += 1;
+        if !same {
+            differed += 1;
+        }
+        println!(
+            "{:24} {}  batched {batched:.6} in {t_batched:>5} ms   one slot at a time \
+             {plain:.6} in {t_plain:>5} ms",
+            pool.name,
+            if same { "same " } else { "DIFFER" },
+        );
+    }
+
+    println!("\n{checked} pool(s) checked, {differed} differed");
+    anyhow::ensure!(differed == 0, "batched reads changed an answer - do not ship this");
+    Ok(())
+}
+
 async fn check_all_routes(
     http: &ethers::providers::Provider<ethers::providers::Http>,
     cfg: &config::Config,
