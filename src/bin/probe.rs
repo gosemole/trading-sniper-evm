@@ -70,6 +70,7 @@
 
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider, StreamExt, Ws};
+use futures_util::FutureExt;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Eip1559TransactionRequest, Filter, H256, U256};
@@ -922,16 +923,38 @@ async fn selftest(t: SelfTest) -> Result<()> {
         }
     );
 
+    // One uncounted call, the same warm-up the endpoint table does: the first
+    // request to a cold endpoint pays a TLS handshake, and round one would
+    // otherwise report it as latency. An endpoint that refuses to be read has
+    // still opened the connection by the time it says so.
+    let _ = t.submit.get_block_number().await;
+
     let mut nonce = t.nonce;
     let mut send_ms: Vec<i64> = Vec::new();
     let mut seen_ms: Vec<i64> = Vec::new();
     let mut blocks: Vec<i64> = Vec::new();
+    let mut from_tip: Vec<i64> = Vec::new();
     for round in 1..=t.rounds {
+        // Whatever piled up while the last round was waiting is history, and
+        // dropped unread. A round triggered by a buffered head would send
+        // against a block the chain has already left behind, and would be
+        // stamped with the time it was READ rather than the time it arrived -
+        // both of which make the loop look later the longer the run goes on.
+        while heads.next().now_or_never().flatten().is_some() {}
         let Some(head) = heads.next().await else {
             anyhow::bail!("the head stream ended after {} round(s)", round - 1);
         };
         let at_head = Instant::now();
         let height = head.number.map(|n| n.as_u64()).unwrap_or_default();
+        // Where the SEQUENCER was when this round began, which is not where the
+        // rpc says the head is: a block has to be executed and indexed before
+        // `newHeads` mentions it, and the sequencer is already past it by then.
+        // Counted from the rpc head alone, a transaction that was next in line
+        // still looks several blocks late.
+        let tip = match t.feed_url.is_some() {
+            true => seen.lock().await.values().map(|(_, seq)| *seq).max().unwrap_or_default(),
+            false => 0,
+        };
 
         let req = Eip1559TransactionRequest::new()
             .from(t.wallet.address())
@@ -991,14 +1014,20 @@ async fn selftest(t: SelfTest) -> Result<()> {
         };
 
         let delta = block as i64 - height as i64;
+        // A zero tip is "the feed has said nothing yet", not "block zero".
+        let behind_tip = (tip != 0).then(|| block as i64 - tip as i64);
         send_ms.push(sent.as_millis() as i64);
         seen_ms.push(back.as_millis() as i64);
         blocks.push(delta);
+        if let Some(d) = behind_tip {
+            from_tip.push(d);
+        }
         println!(
             "round {round} head {height}  send {:>4} ms   seen {:>4} ms   in block {block} \
-             (+{delta})",
+             (+{delta} from the rpc head{})",
             sent.as_millis(),
-            back.as_millis()
+            back.as_millis(),
+            behind_tip.map(|d| format!(", +{d} from the sequencer at {tip}")).unwrap_or_default()
         );
         nonce += U256::one();
     }
@@ -1016,15 +1045,21 @@ async fn selftest(t: SelfTest) -> Result<()> {
         v[v.len() / 2]
     };
     println!(
-        "\n{} round(s): median head->send {} ms, head->seen {} ms, {} blocks late",
+        "\n{} round(s): median head->send {} ms, head->seen {} ms, {} blocks late from the rpc \
+         head{}",
         send_ms.len(),
         median(&mut send_ms),
         median(&mut seen_ms),
-        median(&mut blocks)
+        median(&mut blocks),
+        match from_tip.is_empty() {
+            true => String::new(),
+            false => format!(", {} from the sequencer", median(&mut from_tip)),
+        }
     );
     println!(
-        "head->seen is the whole loop the bot lives in. `+blocks` is the same answer in the \
-         unit the chain uses, and is the one to trust if the two disagree."
+        "head->seen is the whole loop the bot lives in. The count from the SEQUENCER is the \
+         honest one: the rpc head is a block already executed and indexed, so counting from it \
+         charges this loop for blocks it was never in a position to reach."
     );
     Ok(())
 }
