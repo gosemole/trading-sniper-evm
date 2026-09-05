@@ -30,11 +30,19 @@
 //! difference is how much earlier the feed knows about a swap, which is the
 //! whole of what a faster signal would buy.
 //!
+//! Given `--ws` twice and no feed, `--watch` and `--heads` ask the same question
+//! of two RPC websockets instead: which of two providers hears a swap, or a
+//! block, first. Both sides are then read by the same code and stamped against
+//! one `Instant` in one process - two runs against two endpoints would be
+//! comparing their clocks rather than their endpoints.
+//!
 //! Usage:
 //!   probe [--endpoint URL]... [--read URL] [--rounds 5] [--send] [--config PATH]
 //!   probe --watch [--feed WSS] [--ws WSS] [--address 0x..] [--seconds 300] [--warmup 10]
+//!   probe --watch --ws WSS --ws WSS [--address 0x..] [--seconds 300] [--warmup 10]
 //!   probe --offset [--feed WSS] [--read URL] [--samples 10]
 //!   probe --heads  [--feed WSS] [--ws WSS] [--seconds 300] [--warmup 10]
+//!   probe --heads  --ws WSS --ws WSS [--seconds 300] [--warmup 10]
 //!   probe --extsload [--address 0x..] [--read URL]
 //!
 //! Takes what it needs from the environment, the same names the bot itself
@@ -94,6 +102,21 @@ struct PoolCfg {
 /// the probe answers to exactly the names the bot does.
 fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Every value given for a repeated flag, in the order the flags appear.
+///
+/// A flag whose next argument is another flag contributes nothing: `--ws
+/// --seconds 60` is a missing url, and taking `--seconds` for it would connect
+/// to nonsense and report it as an endpoint.
+fn values(args: &[String], name: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| *a == name)
+        .filter_map(|(i, _)| args.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+        .collect()
 }
 
 /// A self-send costs exactly this and cannot cost more: no call, no storage.
@@ -257,56 +280,77 @@ fn tx_hashes(l2: &[u8], depth: u8, out: &mut Vec<H256>) {
     }
 }
 
-/// How much earlier the sequencer feed knows about a swap than the RPC does.
-async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
-    let value = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
-    };
-    let seconds: u64 = value("--seconds")
-        .map(|v| v.parse())
-        .transpose()
-        .context("--seconds is not a number")?
-        .unwrap_or(300);
-    // Small now that `connect_feed` asks for the head: what is left to settle is
-    // a connection warming up, not four minutes of history being replayed.
-    let warmup: u64 = value("--warmup")
-        .map(|v| v.parse())
-        .transpose()
-        .context("--warmup is not a number")?
-        .unwrap_or(10);
-    anyhow::ensure!(warmup < seconds, "--warmup must be shorter than --seconds");
-    let feed_url = value("--feed")
+/// Which two streams to compare: a feed against one websocket, or two
+/// websockets against each other.
+///
+/// `--ws` twice is the whole switch. A feed asked for at the same time is a
+/// contradiction rather than a third side and is refused, as is a third `--ws`:
+/// silently keeping the first of them would measure something other than what
+/// was asked for and say nothing about it.
+fn sides(args: &[String], cfg: &Cfg) -> Result<(Option<String>, Vec<String>)> {
+    let ws_urls = values(args, "--ws");
+    anyhow::ensure!(ws_urls.len() <= 2, "at most two --ws: one per side of the comparison");
+    if ws_urls.len() == 2 {
+        anyhow::ensure!(
+            !args.iter().any(|a| a == "--feed"),
+            "pass either --feed with one --ws, or two --ws - not both"
+        );
+        if ws_urls[0] == ws_urls[1] {
+            println!(
+                "note: both --ws are the same endpoint, so this measures the spread between two \
+                 connections to one host - a noise floor, not a difference between providers."
+            );
+        }
+        return Ok((None, ws_urls));
+    }
+    let feed = args
+        .iter()
+        .position(|a| a == "--feed")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
         .or_else(|| env_var("FEED_URL"))
-        .context("no feed to listen to: pass --feed wss://... or set FEED_URL")?;
-    let ws_url = value("--ws")
+        .context(
+            "nothing to compare against: pass --feed wss://... or set FEED_URL, or give --ws \
+             twice to compare two websockets"
+        )?;
+    let ws = ws_urls
+        .into_iter()
+        .next()
         .or_else(|| env_var("WS_URL"))
         .or_else(|| cfg.ws_url.clone())
         .context("no rpc websocket: pass --ws wss://... or set WS_URL")?;
-    // Filtered to one contract on purpose. Unfiltered, the RPC would report
-    // every log on the chain and the two streams would be compared on traffic
-    // this bot never looks at; filtered, the matched set IS the set of swaps it
-    // trades on, which is the population the answer is about.
-    let address = value("--address").or_else(|| cfg.pool_manager.clone());
-    let filter = match &address {
-        Some(a) => Filter::new().address(a.parse::<ethers::types::Address>().context("--address")?),
-        None => Filter::new(),
-    };
+    Ok((Some(feed), vec![ws]))
+}
 
-    let started = Instant::now();
-    let from_feed: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
-    let from_rpc: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+/// A name for each side of a two-websocket run. `label` is host only, so two
+/// connections to one host would otherwise print the same name twice and the
+/// summary would not say which line is which.
+fn two_labels(urls: &[String]) -> (String, String) {
+    let (a, b) = (label(&urls[0]), label(&urls[1]));
+    match a == b {
+        true => (format!("{a} #1"), format!("{b} #2")),
+        false => (a, b),
+    }
+}
 
-    // Reading and decoding are separate tasks on purpose, and this is the whole
-    // correctness of the measurement. The feed carries about a thousand
-    // transactions a second, each needing base64, a JSON walk and a keccak; a
-    // loop that decodes before returning to `next()` leaves the following frame
-    // sitting in the socket until it is done, and stamps it with the time it
-    // got round to it rather than the time it arrived. The backlog compounds,
-    // and the feed ends up looking seconds SLOWER than a stream it is in fact
-    // ahead of. So the reader does nothing but stamp and hand off.
+/// Every transaction hash the sequencer feed announces, stamped on arrival.
+///
+/// Reading and decoding are separate tasks on purpose, and this is the whole
+/// correctness of the measurement. The feed carries about a thousand
+/// transactions a second, each needing base64, a JSON walk and a keccak; a
+/// loop that decodes before returning to `next()` leaves the following frame
+/// sitting in the socket until it is done, and stamps it with the time it
+/// got round to it rather than the time it arrived. The backlog compounds,
+/// and the feed ends up looking seconds SLOWER than a stream it is in fact
+/// ahead of. So the reader does nothing but stamp and hand off.
+fn feed_hashes(
+    url: String,
+    started: Instant,
+    seen: Arc<Mutex<HashMap<H256, Duration>>>,
+) -> (tokio::task::JoinHandle<Result<()>>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Duration, String)>();
     let reader = tokio::spawn(async move {
-        let stream = connect_feed(&feed_url).await?;
+        let stream = connect_feed(&url).await?;
         println!("feed open");
         let (_w, mut r) = stream.split();
         while let Some(msg) = r.next().await {
@@ -325,8 +369,6 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     });
-
-    let feed_seen = Arc::clone(&from_feed);
     let decoder = tokio::spawn(async move {
         while let Some((at, text)) = rx.recv().await {
             let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
@@ -336,7 +378,7 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
                 let Ok(raw) = base64_decode(b64) else { continue };
                 tx_hashes(&raw, 0, &mut hashes);
             }
-            let mut seen = feed_seen.lock().await;
+            let mut seen = seen.lock().await;
             for h in hashes {
                 // First sighting only: the feed replays recent history when a
                 // connection opens, and a transaction announced twice is not
@@ -345,45 +387,140 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
             }
         }
     });
+    (reader, decoder)
+}
 
-    let rpc_seen = Arc::clone(&from_rpc);
-    let rpc_task = tokio::spawn(async move {
-        let provider = Provider::<Ws>::connect(&ws_url).await.context("connecting to the rpc")?;
-        println!("rpc open");
+/// Every transaction hash one websocket's log subscription reports, stamped on
+/// arrival. Both sides of a two-websocket run go through this same function, so
+/// a difference between them is a difference between the endpoints rather than
+/// between two ways of reading one.
+fn ws_hashes(
+    url: String,
+    filter: Filter,
+    started: Instant,
+    seen: Arc<Mutex<HashMap<H256, Duration>>>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let provider = Provider::<Ws>::connect(&url).await.context("connecting to the rpc")?;
+        println!("{} open", label(&url));
         let mut logs = provider.subscribe_logs(&filter).await.context("eth_subscribe(logs)")?;
         while let Some(log) = logs.next().await {
             let at = started.elapsed();
             if let Some(h) = log.transaction_hash {
-                rpc_seen.lock().await.entry(h).or_insert(at);
+                seen.lock().await.entry(h).or_insert(at);
             }
         }
-        Ok::<(), anyhow::Error>(())
-    });
+        Ok(())
+    })
+}
+
+/// End the run, and fail if a side ended it first.
+///
+/// A task that has already finished did not finish because the run is over: it
+/// is a websocket that could not connect, or a stream that dropped. Its map is
+/// then empty or short, and reporting that as "the other side was faster" is
+/// the worst answer this tool could give - so the error is raised instead of
+/// the numbers. A task still running is simply stopped.
+async fn settle(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> Result<()> {
+    for t in tasks {
+        if !t.is_finished() {
+            t.abort();
+            continue;
+        }
+        match t.await {
+            Ok(inner) => inner?,
+            Err(e) => anyhow::bail!("a stream task ended early: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// How much earlier one stream knows about a swap than the other does: the
+/// sequencer feed against an rpc's log subscription, or - with `--ws` twice -
+/// one rpc against another.
+async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
+    let value = |name: &str| -> Option<String> {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let seconds: u64 = value("--seconds")
+        .map(|v| v.parse())
+        .transpose()
+        .context("--seconds is not a number")?
+        .unwrap_or(300);
+    // Small now that `connect_feed` asks for the head: what is left to settle is
+    // a connection warming up, not four minutes of history being replayed.
+    let warmup: u64 = value("--warmup")
+        .map(|v| v.parse())
+        .transpose()
+        .context("--warmup is not a number")?
+        .unwrap_or(10);
+    anyhow::ensure!(warmup < seconds, "--warmup must be shorter than --seconds");
+    let (feed_url, ws_urls) = sides(args, cfg)?;
+    // Filtered to one contract on purpose. Unfiltered, the RPC would report
+    // every log on the chain and the two streams would be compared on traffic
+    // this bot never looks at; filtered, the matched set IS the set of swaps it
+    // trades on, which is the population the answer is about.
+    let address = value("--address").or_else(|| cfg.pool_manager.clone());
+    let filter = match &address {
+        Some(a) => Filter::new().address(a.parse::<ethers::types::Address>().context("--address")?),
+        None => Filter::new(),
+    };
+
+    let started = Instant::now();
+    let from_a: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+    let from_b: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // `a` is the side a positive number says was first, and both sides are
+    // spawned before either is awaited: a connection opened after the other has
+    // been streaming for a second would be behind by that second.
+    let mut decoder = None;
+    let mut tasks = Vec::new();
+    let (first, second) = match &feed_url {
+        Some(url) => {
+            let (reader, decode) = feed_hashes(url.clone(), started, Arc::clone(&from_a));
+            decoder = Some(decode);
+            tasks.push(reader);
+            tasks.push(ws_hashes(ws_urls[0].clone(), filter, started, Arc::clone(&from_b)));
+            ("feed".to_string(), "rpc".to_string())
+        }
+        None => {
+            let f = filter.clone();
+            tasks.push(ws_hashes(ws_urls[0].clone(), f, started, Arc::clone(&from_a)));
+            tasks.push(ws_hashes(ws_urls[1].clone(), filter, started, Arc::clone(&from_b)));
+            two_labels(&ws_urls)
+        }
+    };
 
     println!(
         "watching for {seconds}s, ignoring the first {warmup}s while both connections settle: \
-         feed against the rpc log stream{}",
-        address.map(|a| format!(" for {a}")).unwrap_or_default()
+         {first} against {second}{}",
+        address.map(|a| format!(", logs for {a}")).unwrap_or_default()
     );
     tokio::time::sleep(Duration::from_secs(seconds)).await;
-    reader.abort();
-    decoder.abort();
-    rpc_task.abort();
+    settle(tasks).await?;
+    if let Some(decoder) = decoder {
+        decoder.abort();
+    }
 
-    let feed = from_feed.lock().await;
-    let rpc = from_rpc.lock().await;
+    let a = from_a.lock().await;
+    let b = from_b.lock().await;
     let after = Duration::from_secs(warmup);
-    let mut lead: Vec<i64> = rpc
+    // Kept in arrival order first, because a measurement that drifts is a
+    // measurement that is wrong, and the only way to see drift is to look at
+    // when each comparison was made rather than at the sorted middle of them.
+    let mut over_time: Vec<(Duration, i64)> = b
         .iter()
-        .filter(|(_, t_rpc)| **t_rpc >= after)
-        .filter_map(|(h, t_rpc)| {
-            feed.get(h).map(|t_feed| t_rpc.as_millis() as i64 - t_feed.as_millis() as i64)
+        .filter(|(_, t_b)| **t_b >= after)
+        .filter_map(|(h, t_b)| {
+            a.get(h).map(|t_a| (*t_b, t_b.as_millis() as i64 - t_a.as_millis() as i64))
         })
         .collect();
+    over_time.sort_by_key(|(t, _)| *t);
+    let mut lead: Vec<i64> = over_time.iter().map(|(_, d)| *d).collect();
     println!(
-        "\nfeed saw {} transactions, the rpc reported {} matching logs, {} in both",
-        feed.len(),
-        rpc.len(),
+        "\n{first} saw {} transactions, {second} saw {}, {} in both after the warmup",
+        a.len(),
+        b.len(),
         lead.len()
     );
     if lead.is_empty() {
@@ -393,33 +530,34 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
         );
         return Ok(());
     }
-    // Kept in arrival order first, because a measurement that drifts is a
-    // measurement that is wrong, and the only way to see drift is to look at
-    // when each comparison was made rather than at the sorted middle of them.
-    let mut over_time: Vec<(Duration, i64)> = rpc
-        .iter()
-        .filter(|(_, t_rpc)| **t_rpc >= after)
-        .filter_map(|(h, t_rpc)| {
-            feed.get(h).map(|t_feed| (*t_rpc, t_rpc.as_millis() as i64 - t_feed.as_millis() as i64))
-        })
-        .collect();
-    over_time.sort_by_key(|(t, _)| *t);
-    report_lead(&mut lead, &mut over_time, "swaps");
-    println!(
-        "\nthe median is the head start a feed-driven signal would have. Only the swaps both \
-         streams saw are counted, so a transaction the rpc never reported cannot flatter it."
-    );
+    report_lead(&mut lead, &mut over_time, "swaps", &first, &second);
+    match feed_url.is_some() {
+        true => println!(
+            "\nthe median is the head start a feed-driven signal would have. Only the swaps both \
+             streams saw are counted, so a transaction the rpc never reported cannot flatter it."
+        ),
+        false => println!(
+            "\nthe median is how much later {second} reports a swap than {first}. Only the swaps \
+             both endpoints reported are counted, so one that dropped a log cannot flatter itself."
+        ),
+    }
     Ok(())
 }
 
-/// The same summary for either comparison: how far behind the rpc was, whether
-/// the feed won, and - the part that decides whether any of it may be believed -
-/// whether the answer had stopped moving by the end of the run.
-fn report_lead(lead: &mut [i64], over_time: &mut [(Duration, i64)], unit: &str) {
+/// The same summary for either comparison: how far behind the second side was,
+/// whether the first won, and - the part that decides whether any of it may be
+/// believed - whether the answer had stopped moving by the end of the run.
+fn report_lead(
+    lead: &mut [i64],
+    over_time: &mut [(Duration, i64)],
+    unit: &str,
+    first: &str,
+    second: &str,
+) {
     lead.sort_unstable();
     let q = |p: f64| lead[((lead.len() as f64 * p) as usize).min(lead.len() - 1)];
     println!(
-        "rpc behind the feed, ms:  min {}  p25 {}  median {}  p75 {}  max {}",
+        "{second} behind {first}, ms:  min {}  p25 {}  median {}  p75 {}  max {}",
         lead[0],
         q(0.25),
         q(0.5),
@@ -428,7 +566,7 @@ fn report_lead(lead: &mut [i64], over_time: &mut [(Duration, i64)], unit: &str) 
     );
     let behind = lead.iter().filter(|d| **d <= 0).count();
     println!(
-        "the feed was first for {} of {} {unit} ({:.0}%)",
+        "{first} was first for {} of {} {unit} ({:.0}%)",
         lead.len() - behind,
         lead.len(),
         (lead.len() - behind) as f64 * 100.0 / lead.len() as f64
@@ -568,7 +706,60 @@ async fn offset(args: &[String], cfg: &Cfg) -> Result<()> {
     Ok(())
 }
 
-/// Who says "block N exists" first: the sequencer feed or the RPC's `newHeads`.
+/// Every block height the sequencer feed announces, stamped on arrival. No
+/// decoding: `--offset` established that a feed message's sequence number IS the
+/// block number, so the transactions in the frame are left alone.
+fn feed_heights(
+    url: String,
+    started: Instant,
+    seen: Arc<Mutex<HashMap<u64, Duration>>>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let stream = connect_feed(&url).await?;
+        println!("feed open");
+        let (_w, mut r) = stream.split();
+        while let Some(msg) = r.next().await {
+            let at = started.elapsed();
+            let text = match msg.context("reading the feed")? {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t,
+                tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                    String::from_utf8_lossy(&b).into_owned()
+                }
+                _ => continue,
+            };
+            let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
+            let mut seen = seen.lock().await;
+            for m in &frame.messages {
+                seen.entry(m.sequence_number).or_insert(at);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Every block height one websocket announces on `newHeads`, stamped on
+/// arrival. As with `ws_hashes`, both sides of a two-websocket run share it.
+fn ws_heights(
+    url: String,
+    started: Instant,
+    seen: Arc<Mutex<HashMap<u64, Duration>>>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let provider = Provider::<Ws>::connect(&url).await.context("connecting to the rpc")?;
+        println!("{} open", label(&url));
+        let mut heads = provider.subscribe_blocks().await.context("eth_subscribe(newHeads)")?;
+        while let Some(head) = heads.next().await {
+            let at = started.elapsed();
+            if let Some(n) = head.number {
+                seen.lock().await.entry(n.as_u64()).or_insert(at);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Who says "block N exists" first: the sequencer feed or the RPC's `newHeads`
+/// - or, with `--ws` given twice, which of two RPCs.
 ///
 /// Both are pushed, so this costs no requests at all - and needs no decoding
 /// either, because `--offset` established that a feed message's sequence number
@@ -595,90 +786,67 @@ async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
         .context("--warmup is not a number")?
         .unwrap_or(10);
     anyhow::ensure!(warmup < seconds, "--warmup must be shorter than --seconds");
-    let feed_url = value("--feed")
-        .or_else(|| env_var("FEED_URL"))
-        .context("no feed to listen to: pass --feed wss://... or set FEED_URL")?;
-    let ws_url = value("--ws")
-        .or_else(|| env_var("WS_URL"))
-        .or_else(|| cfg.ws_url.clone())
-        .context("no rpc websocket: pass --ws wss://... or set WS_URL")?;
+    let (feed_url, ws_urls) = sides(args, cfg)?;
 
     let started = Instant::now();
-    let from_feed: Arc<Mutex<HashMap<u64, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
-    let from_rpc: Arc<Mutex<HashMap<u64, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+    let from_a: Arc<Mutex<HashMap<u64, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+    let from_b: Arc<Mutex<HashMap<u64, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let feed_seen = Arc::clone(&from_feed);
-    let feed_task = tokio::spawn(async move {
-        let stream = connect_feed(&feed_url).await?;
-        println!("feed open");
-        let (_w, mut r) = stream.split();
-        while let Some(msg) = r.next().await {
-            let at = started.elapsed();
-            let text = match msg.context("reading the feed")? {
-                tokio_tungstenite::tungstenite::Message::Text(t) => t,
-                tokio_tungstenite::tungstenite::Message::Binary(b) => {
-                    String::from_utf8_lossy(&b).into_owned()
-                }
-                _ => continue,
-            };
-            let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
-            let mut seen = feed_seen.lock().await;
-            for m in &frame.messages {
-                seen.entry(m.sequence_number).or_insert(at);
-            }
+    let mut tasks = Vec::new();
+    let (first, second) = match &feed_url {
+        Some(url) => {
+            tasks.push(feed_heights(url.clone(), started, Arc::clone(&from_a)));
+            tasks.push(ws_heights(ws_urls[0].clone(), started, Arc::clone(&from_b)));
+            ("feed".to_string(), "rpc".to_string())
         }
-        Ok::<(), anyhow::Error>(())
-    });
-
-    let rpc_seen = Arc::clone(&from_rpc);
-    let rpc_task = tokio::spawn(async move {
-        let provider = Provider::<Ws>::connect(&ws_url).await.context("connecting to the rpc")?;
-        println!("rpc open");
-        let mut heads = provider.subscribe_blocks().await.context("eth_subscribe(newHeads)")?;
-        while let Some(head) = heads.next().await {
-            let at = started.elapsed();
-            if let Some(n) = head.number {
-                rpc_seen.lock().await.entry(n.as_u64()).or_insert(at);
-            }
+        None => {
+            tasks.push(ws_heights(ws_urls[0].clone(), started, Arc::clone(&from_a)));
+            tasks.push(ws_heights(ws_urls[1].clone(), started, Arc::clone(&from_b)));
+            two_labels(&ws_urls)
         }
-        Ok::<(), anyhow::Error>(())
-    });
+    };
 
-    println!("watching for {seconds}s, ignoring the first {warmup}s while both connections settle");
+    println!(
+        "watching for {seconds}s, ignoring the first {warmup}s while both connections settle: \
+         {first} against {second}"
+    );
     tokio::time::sleep(Duration::from_secs(seconds)).await;
-    feed_task.abort();
-    rpc_task.abort();
+    settle(tasks).await?;
 
-    let feed = from_feed.lock().await;
-    let rpc = from_rpc.lock().await;
+    let a = from_a.lock().await;
+    let b = from_b.lock().await;
     let after = Duration::from_secs(warmup);
-    let mut over_time: Vec<(Duration, i64)> = rpc
+    let mut over_time: Vec<(Duration, i64)> = b
         .iter()
         .filter(|(_, t)| **t >= after)
-        .filter_map(|(n, t_rpc)| {
-            feed.get(n).map(|t_feed| (*t_rpc, t_rpc.as_millis() as i64 - t_feed.as_millis() as i64))
+        .filter_map(|(n, t_b)| {
+            a.get(n).map(|t_a| (*t_b, t_b.as_millis() as i64 - t_a.as_millis() as i64))
         })
         .collect();
+    over_time.sort_by_key(|(t, _)| *t);
     let mut lead: Vec<i64> = over_time.iter().map(|(_, d)| *d).collect();
     println!(
-        "\nfeed announced {} blocks, the rpc {}, {} counted after the warmup",
-        feed.len(),
-        rpc.len(),
+        "\n{first} announced {} blocks, {second} {}, {} counted after the warmup",
+        a.len(),
+        b.len(),
         lead.len()
     );
     // The heights each stream ended on. A difference here is the same story the
     // milliseconds tell, in the unit that matters for trading.
-    if let (Some(f), Some(r)) = (feed.keys().max(), rpc.keys().max()) {
-        println!("last height: feed {f}, rpc {r} (feed ahead by {})", *f as i64 - *r as i64);
+    if let (Some(x), Some(y)) = (a.keys().max(), b.keys().max()) {
+        println!(
+            "last height: {first} {x}, {second} {y} ({first} ahead by {})",
+            *x as i64 - *y as i64
+        );
     }
     if lead.is_empty() {
         println!("nothing to compare: no block was announced by both within the counted window");
         return Ok(());
     }
-    report_lead(&mut lead, &mut over_time, "blocks");
+    report_lead(&mut lead, &mut over_time, "blocks", &first, &second);
     println!(
         "\nboth sides are pushed, so this cost no requests. A positive median is how much \
-         earlier the feed knows a block exists than the rpc admits it."
+         earlier {first} knows a block exists than {second} admits it."
     );
     Ok(())
 }
