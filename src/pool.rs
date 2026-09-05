@@ -451,70 +451,141 @@ fn derive_pool_id(cfg: &PoolConfig, tokens: &HashMap<String, String>) -> Result<
     ))
 }
 
-/// One 32-byte storage word, optionally at a historical block.
-async fn storage_at(
-    http: &Provider<Http>,
-    address: Address,
-    slot: U256,
-    block: Option<u64>,
-) -> Result<H256> {
-    let at = match block {
-        Some(b) => format!("0x{b:x}"),
-        None => "latest".to_string(),
-    };
-    let word: H256 = http
-        .request(
-            "eth_getStorageAt",
-            (format!("0x{address:x}"), format!("0x{slot:064x}"), at),
-        )
-        .await
-        .context("eth_getStorageAt")?;
-    Ok(word)
+/// How far back one `eth_getLogs` reaches. Measured on chain 4663: a window of
+/// ten million blocks is answered, fifty million is not - and the refusal there
+/// is `fullnode unavailable`, which is the backend's retention rather than a
+/// limit on the request. Ten million blocks is about eleven days at this
+/// chain's block time, so a pool created in the last week and a half is found
+/// by the very first query and the whole chain by six.
+const LOG_WINDOW: u64 = 10_000_000;
+
+/// Where halving stops. A provider that refuses even this is one the walk
+/// cannot finish against in any sensible number of requests, and saying so
+/// beats making thousands of them.
+const MIN_LOG_WINDOW: u64 = 10_000;
+
+/// Hard cap on queries, so no combination of a small window and a long chain
+/// can turn one pool's resolution into an unbounded loop.
+const MAX_LOG_QUERIES: u32 = 64;
+
+/// Why an `eth_getLogs` was refused, which decides what to do about it.
+enum Refused {
+    /// The range was too wide for this provider. Ask for less.
+    TooWide,
+    /// The node does not keep logs this far back. Asking for less will not
+    /// help; asking again for the same thing will not either.
+    TooOld,
 }
 
-/// Absolute slot of `_pools[poolId].slot0` (member 0 of the State struct).
-fn v4_slot0(pool_id: H256) -> U256 {
-    let mut key = pool_id.as_bytes().to_vec();
-    let mut w = [0u8; 32];
-    U256::from(6u64).to_big_endian(&mut w); // _pools is storage slot 6
-    key.extend_from_slice(&w);
-    U256::from_big_endian(&keccak256(&key))
+/// Read a provider's complaint. Anything not recognised is a real error and is
+/// returned as one - guessing that an unfamiliar failure means "narrow the
+/// window" would turn one broken endpoint into sixty-four requests.
+fn classify(msg: &str) -> Option<Refused> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("too large")
+        || m.contains("too wide")
+        || m.contains("exceed")
+        || m.contains("range is too")
+        // "query returned more than N results" - the same refusal counted the
+        // other way round, and answered the same way.
+        || (m.contains("more than") && m.contains("results"))
+    {
+        return Some(Refused::TooWide);
+    }
+    if m.contains("unavailable") || m.contains("not available") || m.contains("pruned")
+        || m.contains("missing trie") || m.contains("too old")
+    {
+        return Some(Refused::TooOld);
+    }
+    None
 }
 
-/// Block at which the pool was initialized, found by binary search on the
-/// first block where slot0 stops being zero.
+/// The pool's `Initialize` log, found by walking back from the head in windows.
 ///
-/// This exists because the Initialize log is the only place a v4 PoolKey is
-/// published, and finding it otherwise needs an unbounded `eth_getLogs` range
-/// that most RPC tiers refuse. ~26 archive reads, once, at startup.
-async fn find_init_block(http: &Provider<Http>, manager: Address, pool_id: H256) -> Result<u64> {
-    let slot = v4_slot0(pool_id);
+/// This used to bisect `eth_getStorageAt` over the whole chain to pin the block
+/// down to one, and then ask for that single block's logs - about 26 reads of
+/// HISTORICAL STATE. That is the one thing an ordinary node does not keep: the
+/// bisection failed outright against a non-archive endpoint, with
+/// `historical state is not available`, which is a message that tells the
+/// operator nothing about what to do.
+///
+/// Old *logs*, unlike old *state*, are kept almost everywhere - they are two
+/// unrelated capabilities, and the bisection was spending the rare one to save
+/// the common one. So the search asks for logs directly, newest window first,
+/// and stops at the first hit. A pool created recently - which is every pool
+/// worth trading here - costs one request. No archive, at any point.
+///
+/// The window narrows itself against a stricter provider and gives up cleanly
+/// against one whose history simply does not reach, saying how far it got.
+async fn find_init_log(http: &Provider<Http>, manager: Address, pool_id: H256) -> Result<Log> {
     let head = http.get_block_number().await?.as_u64();
-    anyhow::ensure!(
-        !storage_at(http, manager, slot, Some(head)).await?.is_zero(),
-        "pool is not initialized at head"
-    );
-    let (mut lo, mut hi) = (1u64, head);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if storage_at(http, manager, slot, Some(mid)).await?.is_zero() {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+    let mut window = LOG_WINDOW;
+    let mut to = head;
+    let mut queries = 0u32;
+
+    loop {
+        anyhow::ensure!(
+            queries < MAX_LOG_QUERIES,
+            "gave up looking for the Initialize log after {queries} queries; searched back \
+             to block {to} of {head} in windows of {window}"
+        );
+        // Inclusive on both ends, so consecutive windows neither overlap nor
+        // skip the block between them.
+        let from = to.saturating_sub(window.saturating_sub(1));
+        queries += 1;
+        let filter = Filter::new()
+            .address(manager)
+            .topic0(ValueOrArray::Value(v4_init_topic()))
+            .topic1(ValueOrArray::Value(pool_id))
+            .from_block(from)
+            .to_block(to);
+        match http.get_logs(&filter).await {
+            Ok(logs) => {
+                if let Some(log) = logs.into_iter().next() {
+                    tracing::debug!(?pool_id, from, to, queries, "found the Initialize log");
+                    return Ok(log);
+                }
+                anyhow::ensure!(
+                    from > 0,
+                    "no Initialize log for this pool anywhere in the chain's logs - the id is \
+                     wrong, or the pool belongs to a different PoolManager than {manager:?}"
+                );
+                to = from - 1;
+            }
+            Err(e) => match classify(&e.to_string()) {
+                Some(Refused::TooWide) => {
+                    let narrower = window / 2;
+                    anyhow::ensure!(
+                        narrower >= MIN_LOG_WINDOW,
+                        "this endpoint refuses a log range of even {window} blocks, so the \
+                         Initialize log cannot be reached from here: {e}"
+                    );
+                    tracing::debug!(window, narrower, "log range refused as too wide, narrowing");
+                    window = narrower;
+                }
+                // The floor of what this endpoint keeps. Nothing about asking
+                // differently gets underneath it.
+                Some(Refused::TooOld) => anyhow::bail!(
+                    "this endpoint's log history stops above block {from}, and the pool was \
+                     initialized below it - searched back from {head} without finding it. \
+                     Write the pool's token0/token1/fee/tick_spacing/hooks into [[pools]], or \
+                     point HTTP_URL at an endpoint that keeps more history: {e}"
+                ),
+                None => return Err(anyhow::anyhow!("{e}")).context("eth_getLogs Initialize"),
+            },
         }
     }
-    Ok(lo)
 }
 
-/// Full PoolKey from the pool's Initialize log: (currency0, currency1, fee,
-/// tickSpacing, hooks). The log is fetched from the single block the binary
-/// search identified, so the range stays within any provider's limit.
 /// Recover a v4 PoolKey: the five fields the pool id is the hash of.
 ///
 /// A pool id cannot be reversed, but the key was published once in the pool's
-/// `Initialize` log. Finding that log costs a bisection over archive reads, so
-/// the answer is cached - and a cached one is only used when it still hashes to
-/// the id it was filed under, which makes a wrong cache impossible to act on.
+/// `Initialize` log - see `find_init_log` for how that log is reached. The
+/// answer is cached, and a cached one is only used when it still hashes to the
+/// id it was filed under, which makes a wrong cache impossible to act on. What
+/// comes off the chain is held to exactly the same test before it is returned
+/// or written: a matching hash proves all five fields at once, and it is the
+/// only thing that can catch a misread of the log's own layout.
 pub async fn v4_pool_key(
     http: &Provider<Http>,
     manager: Address,
@@ -537,20 +608,8 @@ pub async fn v4_pool_key(
             k.hooks.unwrap_or_default(),
         ));
     }
-    let block = find_init_block(http, manager, pool_id).await?;
-    let filter = Filter::new()
-        .address(manager)
-        .topic0(ValueOrArray::Value(v4_init_topic()))
-        .topic1(ValueOrArray::Value(pool_id))
-        .from_block(block)
-        .to_block(block);
-    let log = http
-        .get_logs(&filter)
-        .await
-        .context("eth_getLogs Initialize")?
-        .into_iter()
-        .next()
-        .with_context(|| format!("no Initialize log at block {block}"))?;
+    let log = find_init_log(http, manager, pool_id).await?;
+    let block = log.block_number.map(|b| b.as_u64()).unwrap_or_default();
     anyhow::ensure!(log.topics.len() >= 4, "Initialize log missing currency topics");
     let c0 = Address::from_slice(&log.topics[2].as_bytes()[12..]);
     let c1 = Address::from_slice(&log.topics[3].as_bytes()[12..]);
@@ -564,6 +623,16 @@ pub async fn v4_pool_key(
         ts_raw as i32
     };
     let hooks = Address::from_slice(&d[76..96]);
+    // The filter already guarantees this log belongs to this pool, so what
+    // this catches is not the wrong log but the right one read wrongly - a
+    // field taken from the wrong offset, or a tick spacing whose sign was
+    // rebuilt incorrectly. Nothing downstream would notice either.
+    let rederived = pool_id_from_key(c0, c1, fee, tick_spacing, hooks);
+    anyhow::ensure!(
+        rederived == pool_id,
+        "the Initialize log at block {block} decodes to a PoolKey hashing to {rederived:?}, \
+         not to {pool_id:?} - refusing to use it"
+    );
     tracing::info!(
         block, ?c0, ?c1, fee, tick_spacing, ?hooks,
         "recovered v4 PoolKey from Initialize log"
@@ -777,6 +846,48 @@ async fn call_u8(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two refusals mean opposite things and the walk answers them in
+    /// opposite ways: a range that is too wide is retried narrower, and history
+    /// the node does not keep is not retried at all. Reading one as the other
+    /// either abandons a pool that was findable, or halves the window sixty
+    /// times against a wall.
+    ///
+    /// Both strings below are verbatim from the endpoint this runs against.
+    #[test]
+    fn a_refusal_is_read_for_which_kind_it_is() {
+        assert!(matches!(
+            classify("Block range is too large"),
+            Some(Refused::TooWide)
+        ));
+        assert!(matches!(
+            classify("(code: -32000, message: fullnode unavailable, data: None)"),
+            Some(Refused::TooOld)
+        ));
+        // Counted the other way round by some providers, same meaning.
+        assert!(matches!(
+            classify("query returned more than 10000 results"),
+            Some(Refused::TooWide)
+        ));
+
+        // Anything unrecognised must stay unrecognised: guessing "narrow the
+        // window" at a broken endpoint would spend MAX_LOG_QUERIES finding out.
+        assert!(classify("connection reset by peer").is_none());
+        assert!(classify("invalid api key").is_none());
+        assert!(classify("").is_none());
+    }
+
+    /// The walk has to be able to cover the chain it runs on in a sane number
+    /// of requests, or it is a different kind of failure than the bisection it
+    /// replaced rather than a fix for it.
+    #[test]
+    fn the_window_covers_the_chain_in_few_enough_queries() {
+        // Chain 4663 was 55.4M blocks deep when this was written.
+        let chain = 55_429_928u64;
+        let windows = chain.div_ceil(LOG_WINDOW);
+        assert!(windows <= 6, "{windows} windows to cover the whole chain");
+        assert!(u64::from(MAX_LOG_QUERIES) > windows);
+    }
 
     fn pool(base_token: u8, decimals: (u8, u8)) -> Pool {
         Pool {

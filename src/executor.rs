@@ -37,9 +37,9 @@
 //! `--sell-all`, where nobody is racing, still run the real rehearsal through
 //! `execute::verify` before sending.
 //!
-//! Routes are resolved once at startup: recovering a PoolKey takes a couple of
-//! dozen archive reads, which is fine before the stream opens and far too slow
-//! between a drop and a buy.
+//! Routes are resolved once at startup: recovering a PoolKey means finding the
+//! one log that ever published it, which is fine before the stream opens and
+//! far too slow between a drop and a buy.
 
 use crate::config::Config;
 use crate::execute;

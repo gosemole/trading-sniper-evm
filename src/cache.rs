@@ -1,9 +1,10 @@
 //! What the chain has already told us and cannot un-tell.
 //!
-//! Recovering one v4 PoolKey costs about two dozen archive reads: the block it
-//! was created in is found by bisection, and only then can its `Initialize` log
-//! be fetched. Doing that for every pool and every hop on every start is most
-//! of the time between launching the bot and it watching anything.
+//! Recovering one v4 PoolKey means finding the single `Initialize` log that
+//! ever published it, by walking the chain's logs backwards from the head in
+//! windows - see `pool::find_init_log`. One query for a pool created recently
+//! and a handful for an old one, but paid for every pool AND every hop of every
+//! route, on every start.
 //!
 //! Everything kept here is immutable by construction, which is what makes
 //! caching it honest rather than merely convenient:

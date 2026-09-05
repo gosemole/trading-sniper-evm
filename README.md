@@ -168,7 +168,7 @@ and said so, with the position still held and still recorded.
 | | |
 |---|---|
 | `inventory.json` | positions, trades in flight, and the tracked spendable balance of whatever a route spends. Deleting it loses the entry prices (and with them the take-profit targets) and the tracked balance - the next start just re-reads the real one |
-| `pools.json` | recovered PoolKeys, decimals, symbols. All immutable; deleting it only costs a slow start (about 5s instead of 0.2s) |
+| `pools.json` | recovered PoolKeys, decimals, symbols. All immutable; deleting it only costs a slower start - each v4 pool's PoolKey is found again by walking the chain's logs back from the head, one `eth_getLogs` per ten million blocks until its `Initialize` turns up |
 
 Both are gitignored and written through a temporary file, so a crash mid-write
 leaves the previous state rather than half of the new one.
