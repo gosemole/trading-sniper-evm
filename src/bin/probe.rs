@@ -43,7 +43,16 @@
 //!   probe --offset [--feed WSS] [--read URL] [--samples 10]
 //!   probe --heads  [--feed WSS] [--ws WSS] [--seconds 300] [--warmup 10]
 //!   probe --heads  --ws WSS --ws WSS [--seconds 300] [--warmup 10]
+//!   probe --selftest --send [--ws WSS] [--endpoint URL] [--feed WSS] [--rounds 5]
 //!   probe --extsload [--address 0x..] [--read URL]
+//!
+//! `--selftest` closes the loop the bot actually runs, end to end and in the
+//! order it happens: a head arrives on the websocket, a transaction goes out
+//! through the submit endpoint, the sequencer takes it, and the feed says when
+//! it came back. Sending starts on the head rather than at an arbitrary moment
+//! because that is when the bot sends, and a round trip begun mid-block would
+//! flatter the part that waits for inclusion. It needs `--send`: every round is
+//! a real signed transaction.
 //!
 //! Takes what it needs from the environment, the same names the bot itself
 //! reads over its config file: `SUBMIT_URLS` (comma separated) for what to
@@ -333,7 +342,10 @@ fn two_labels(urls: &[String]) -> (String, String) {
     }
 }
 
-/// Every transaction hash the sequencer feed announces, stamped on arrival.
+/// Every transaction hash the sequencer feed announces: when it arrived, and
+/// the sequence number of the message that carried it - which `--offset`
+/// established is the block it belongs to, so `--selftest` can say which block
+/// took a transaction without asking anyone.
 ///
 /// Reading and decoding are separate tasks on purpose, and this is the whole
 /// correctness of the measurement. The feed carries about a thousand
@@ -346,7 +358,7 @@ fn two_labels(urls: &[String]) -> (String, String) {
 fn feed_hashes(
     url: String,
     started: Instant,
-    seen: Arc<Mutex<HashMap<H256, Duration>>>,
+    seen: Arc<Mutex<HashMap<H256, (Duration, u64)>>>,
 ) -> (tokio::task::JoinHandle<Result<()>>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Duration, String)>();
     let reader = tokio::spawn(async move {
@@ -373,17 +385,20 @@ fn feed_hashes(
         while let Some((at, text)) = rx.recv().await {
             let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
             let mut hashes = Vec::new();
+            let mut of_message = Vec::new();
             for m in &frame.messages {
                 let Some(b64) = &m.message.message.l2_msg else { continue };
                 let Ok(raw) = base64_decode(b64) else { continue };
-                tx_hashes(&raw, 0, &mut hashes);
+                of_message.clear();
+                tx_hashes(&raw, 0, &mut of_message);
+                hashes.extend(of_message.iter().map(|h| (*h, m.sequence_number)));
             }
             let mut seen = seen.lock().await;
-            for h in hashes {
+            for (h, seq) in hashes {
                 // First sighting only: the feed replays recent history when a
                 // connection opens, and a transaction announced twice is not
                 // news the second time.
-                seen.entry(h).or_insert(at);
+                seen.entry(h).or_insert((at, seq));
             }
         }
     });
@@ -398,7 +413,7 @@ fn ws_hashes(
     url: String,
     filter: Filter,
     started: Instant,
-    seen: Arc<Mutex<HashMap<H256, Duration>>>,
+    seen: Arc<Mutex<HashMap<H256, (Duration, u64)>>>,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let provider = Provider::<Ws>::connect(&url).await.context("connecting to the rpc")?;
@@ -407,7 +422,8 @@ fn ws_hashes(
         while let Some(log) = logs.next().await {
             let at = started.elapsed();
             if let Some(h) = log.transaction_hash {
-                seen.lock().await.entry(h).or_insert(at);
+                let block = log.block_number.map(|b| b.as_u64()).unwrap_or_default();
+                seen.lock().await.entry(h).or_insert((at, block));
             }
         }
         Ok(())
@@ -467,8 +483,8 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     };
 
     let started = Instant::now();
-    let from_a: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
-    let from_b: Arc<Mutex<HashMap<H256, Duration>>> = Arc::new(Mutex::new(HashMap::new()));
+    let from_a: Arc<Mutex<HashMap<H256, (Duration, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let from_b: Arc<Mutex<HashMap<H256, (Duration, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // `a` is the side a positive number says was first, and both sides are
     // spawned before either is awaited: a connection opened after the other has
@@ -510,9 +526,9 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     // when each comparison was made rather than at the sorted middle of them.
     let mut over_time: Vec<(Duration, i64)> = b
         .iter()
-        .filter(|(_, t_b)| **t_b >= after)
-        .filter_map(|(h, t_b)| {
-            a.get(h).map(|t_a| (*t_b, t_b.as_millis() as i64 - t_a.as_millis() as i64))
+        .filter(|(_, (t_b, _))| *t_b >= after)
+        .filter_map(|(h, (t_b, _))| {
+            a.get(h).map(|(t_a, _)| (*t_b, t_b.as_millis() as i64 - t_a.as_millis() as i64))
         })
         .collect();
     over_time.sort_by_key(|(t, _)| *t);
@@ -851,6 +867,168 @@ async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
     Ok(())
 }
 
+/// Everything `--selftest` needs, gathered by `main` from the same flags,
+/// config and key that `--send` already reads.
+struct SelfTest {
+    ws_url: String,
+    feed_url: Option<String>,
+    submit: Provider<Http>,
+    submit_label: String,
+    read: Provider<Http>,
+    read_label: String,
+    wallet: LocalWallet,
+    chain_id: u64,
+    max_fee: U256,
+    tip: U256,
+    nonce: U256,
+    rounds: usize,
+}
+
+/// The bot's own loop, measured end to end: head -> send -> sequencer -> seen.
+///
+/// Three numbers per round, and they divide the budget between the parts that
+/// can be fixed separately:
+///
+/// * `send` - from the head landing on the websocket to `eth_sendRawTransaction`
+///   returning. This is the endpoint's, and it is what `--endpoint` changes.
+/// * `seen` - from the head to the transaction coming back. With a feed this is
+///   a pushed sighting, so it is a real latency; without one it is polled
+///   `eth_getTransactionByHash` and can never be finer than a round trip to the
+///   reading endpoint, which is why the feed is the honest version.
+/// * `+blocks` - how many blocks passed between the head that triggered the
+///   round and the block that took the transaction. The one figure no polling
+///   interval can distort, and the one that says whether a dip is still there.
+///
+/// One transaction is in flight at a time and each round waits for its own to
+/// come back, so the local nonce and the chain never disagree.
+async fn selftest(t: SelfTest) -> Result<()> {
+    let started = Instant::now();
+    let seen: Arc<Mutex<HashMap<H256, (Duration, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let feed_tasks =
+        t.feed_url.as_ref().map(|url| feed_hashes(url.clone(), started, Arc::clone(&seen)));
+
+    // Subscribed before the first send, so no round is triggered by a head that
+    // arrived while this was still connecting.
+    let provider =
+        Provider::<Ws>::connect(&t.ws_url).await.context("connecting to the rpc websocket")?;
+    let mut heads = provider.subscribe_blocks().await.context("eth_subscribe(newHeads)")?;
+    println!(
+        "heads from {}, sending through {}, sightings {}",
+        label(&t.ws_url),
+        t.submit_label,
+        match t.feed_url.is_some() {
+            true => "from the feed".to_string(),
+            false => format!("polled from {} - no --feed given", t.read_label),
+        }
+    );
+
+    let mut nonce = t.nonce;
+    let mut send_ms: Vec<i64> = Vec::new();
+    let mut seen_ms: Vec<i64> = Vec::new();
+    let mut blocks: Vec<i64> = Vec::new();
+    for round in 1..=t.rounds {
+        let Some(head) = heads.next().await else {
+            anyhow::bail!("the head stream ended after {} round(s)", round - 1);
+        };
+        let at_head = Instant::now();
+        let height = head.number.map(|n| n.as_u64()).unwrap_or_default();
+
+        let req = Eip1559TransactionRequest::new()
+            .from(t.wallet.address())
+            .to(t.wallet.address())
+            .value(U256::zero())
+            .chain_id(t.chain_id)
+            .nonce(nonce)
+            .gas(U256::from(SELF_SEND_GAS))
+            .max_fee_per_gas(t.max_fee)
+            .max_priority_fee_per_gas(t.tip);
+        let typed: TypedTransaction = req.into();
+        let sig = t.wallet.sign_transaction(&typed).await.context("signing")?;
+        let bytes = typed.rlp_signed(&sig);
+        let hash = H256::from(ethers::utils::keccak256(&bytes));
+
+        if let Err(e) = t.submit.send_raw_transaction(bytes).await {
+            // Signing is local and the nonce is fresh every round, so a refusal
+            // is the endpoint's answer and worth stopping on rather than
+            // averaging over.
+            println!("round {round} head {height}  REFUSED by {}: {e}", t.submit_label);
+            break;
+        }
+        let sent = at_head.elapsed();
+
+        // Waiting on the feed costs nothing: the sighting is already in memory
+        // and this only looks. The polled fallback is the one that talks.
+        let mut landed = None;
+        let waited = Instant::now();
+        while waited.elapsed() < INCLUSION_TIMEOUT {
+            match t.feed_url.is_some() {
+                true => {
+                    if let Some((at, seq)) = seen.lock().await.get(&hash).copied() {
+                        landed = Some(((started + at).saturating_duration_since(at_head), seq));
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                false => {
+                    if let Ok(Some(tx)) = t.read.get_transaction(hash).await {
+                        if let Some(b) = tx.block_number {
+                            landed = Some((at_head.elapsed(), b.as_u64()));
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(POLL_EVERY).await;
+                }
+            }
+        }
+        let Some((back, block)) = landed else {
+            println!(
+                "round {round} head {height}  send {:>4} ms, then NOT SEEN in {}s - stopping, \
+                 the nonce is stuck",
+                sent.as_millis(),
+                INCLUSION_TIMEOUT.as_secs()
+            );
+            break;
+        };
+
+        let delta = block as i64 - height as i64;
+        send_ms.push(sent.as_millis() as i64);
+        seen_ms.push(back.as_millis() as i64);
+        blocks.push(delta);
+        println!(
+            "round {round} head {height}  send {:>4} ms   seen {:>4} ms   in block {block} \
+             (+{delta})",
+            sent.as_millis(),
+            back.as_millis()
+        );
+        nonce += U256::one();
+    }
+
+    if let Some((reader, decoder)) = feed_tasks {
+        reader.abort();
+        decoder.abort();
+    }
+    if send_ms.is_empty() {
+        println!("\nnothing completed a round");
+        return Ok(());
+    }
+    let median = |v: &mut Vec<i64>| -> i64 {
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+    println!(
+        "\n{} round(s): median head->send {} ms, head->seen {} ms, {} blocks late",
+        send_ms.len(),
+        median(&mut send_ms),
+        median(&mut seen_ms),
+        median(&mut blocks)
+    );
+    println!(
+        "head->seen is the whole loop the bot lives in. `+blocks` is the same answer in the \
+         unit the chain uses, and is the one to trust if the two disagree."
+    );
+    Ok(())
+}
+
 /// Does this PoolManager expose v4's batch storage read, and does it agree with
 /// `eth_getStorageAt`?
 ///
@@ -1029,6 +1207,13 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--extsload") {
         return extsload(&args, &cfg).await;
     }
+    // Asked here, before a single request goes out: a self-test that cannot
+    // send is not a shorter measurement, it is no measurement, and finding that
+    // out after the endpoints have been read would be finding it out late.
+    anyhow::ensure!(
+        !args.iter().any(|a| a == "--selftest") || send,
+        "--selftest sends real transactions on every head: add --send to confirm"
+    );
 
     // Every `--endpoint` given, else what the bot itself broadcasts through -
     // so a bare run measures the status quo rather than nothing.
@@ -1181,6 +1366,36 @@ async fn main() -> Result<()> {
         rounds * targets.len()
     );
     println!("do not run this while the bot is running: one key, one nonce\n");
+
+    // After the key, the fees and the nonce, because the self-test needs every
+    // one of them and asking for them twice could disagree with itself.
+    if args.iter().any(|a| a == "--selftest") {
+        // One endpoint per run: the loop is a single transaction in flight
+        // against a single nonce, and splitting it across endpoints would
+        // measure the endpoints in different blocks rather than the loop.
+        if targets.len() > 1 {
+            println!("more than one endpoint given; sending through {} only\n", targets[0].label);
+        }
+        let ws_url = value("--ws")
+            .or_else(|| env_var("WS_URL"))
+            .or(cfg.ws_url)
+            .context("no rpc websocket to take heads from: pass --ws wss://... or set WS_URL")?;
+        return selftest(SelfTest {
+            ws_url,
+            feed_url: value("--feed").or_else(|| env_var("FEED_URL")),
+            submit: targets[0].http.clone(),
+            submit_label: targets[0].label.clone(),
+            read,
+            read_label: label(&read_url),
+            wallet,
+            chain_id,
+            max_fee,
+            tip,
+            nonce,
+            rounds,
+        })
+        .await;
+    }
 
     for round in 1..=rounds {
         for i in 0..targets.len() {
