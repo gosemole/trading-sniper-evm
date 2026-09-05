@@ -164,8 +164,24 @@ pub struct Fill {
 
 /// What one buy had to go and find out, gathered in one place so the send does
 /// not have to reach back for any of it.
+/// What the model made of a trade: the output it expects, and how hard the
+/// trade leaned on the one assumption it makes.
+///
+/// The impact travels with the answer rather than being recomputed or left
+/// behind, because it is the number that says how much to believe the other
+/// one - and it belongs in the log line of every trade, not only in the warning
+/// of the trades that were refused. A distribution nobody can see is one nobody
+/// can tighten `max_slippage_pct` against.
+struct Modelled {
+    amount_out: U256,
+    /// Fraction, not percent: the largest price move any single hop takes.
+    impact: f64,
+}
+
 struct Quoted {
     amount_out: U256,
+    /// The worst hop's price move, as `Modelled::impact`.
+    impact: f64,
     /// How old the calibration snapshot was when this was priced, in seconds,
     /// or `None` when there is no snapshot at all. Logged on every buy so that
     /// the state ageing is visible while it is still pricing trades, rather
@@ -201,10 +217,40 @@ fn state_stale_after(calibrate_secs: u64) -> Duration {
 }
 
 /// How far a fast-quoted swap may move a pool's own price before the model is
-/// no longer trusted. Inside a tick range the arithmetic is exact; past one it
-/// silently overstates the output, and this is what keeps it from getting
-/// there. Measured impact on the configured sizes is under 0.01%.
-const MAX_MODELLED_IMPACT: f64 = 0.005;
+/// no longer trusted - a share of the route's OWN slippage tolerance, not a
+/// number of its own.
+///
+/// Inside a tick range the arithmetic is exact. Past an initialized tick the
+/// liquidity it assumes is wrong and the output it reports can be too high, and
+/// too high is the direction that matters: `amountOutMinimum` is built from
+/// this figure, so an overstatement that eats the whole tolerance is a
+/// transaction which reverts on chain. That tolerance is therefore the only
+/// thing the cap can sensibly be measured against, and it used to be an
+/// unrelated constant sitting beside it - so a route whose slippage was
+/// tightened kept a modelling cap sized for the old one.
+///
+/// A third of it, because the error is a FRACTION of the impact rather than the
+/// impact itself. The in-range step is `out = net / (sqrt_p * sqrt_new)` with
+/// `sqrt_new = sqrt_p * (1 + x)`, so an impact of `2x` modelled at liquidity
+/// `L` against a pool really holding `L/2` from the very first wei overstates
+/// by `(1 + 2x)/(1 + x) - 1`, which is about `x`. A 1% impact is thus misread
+/// by about half a percent even when liquidity halves across the entire swap;
+/// for it to spend a 3% tolerance outright, liquidity past the tick would have
+/// to fall roughly sevenfold and do it immediately.
+///
+/// The 1% ceiling is not about reverting. Past there the question stops being
+/// how wrong the model is and becomes whether a tick is crossed at all, and no
+/// tolerance makes that knowable from a swap log.
+fn modelled_impact_cap(max_slippage_pct: f64) -> f64 {
+    // Config validates this, but the value decides whether a trade is priced at
+    // all: a NaN reaching the comparison in `model_quote` would pass every
+    // impact instead of failing it, because every comparison against NaN is
+    // false. Fall back to what this was before it was derived from anything.
+    if !max_slippage_pct.is_finite() || max_slippage_pct <= 0.0 {
+        return 0.005;
+    }
+    (max_slippage_pct / 100.0 / 3.0).min(0.01)
+}
 
 /// How far the measured yield has to move before it is worth saying out loud,
 /// in parts per million. A hook that changes its cut is a change of terms, not
@@ -564,6 +610,12 @@ impl Executor {
             spend = amount(route.amount_in, &route.input),
             quoted = amount(quoted.amount_out, &route.output),
             priced_by = "model",
+            // How hard this trade leaned on the in-range assumption, against
+            // what it was allowed to. Logged on every buy and not only on the
+            // refusals, because a cap is only tunable against a distribution
+            // somebody can see.
+            impact_pct = format!("{:.4}", quoted.impact * 100.0),
+            impact_limit_pct = format!("{:.4}", modelled_impact_cap(route.max_slippage_pct) * 100.0),
             quote_ms = quoted.took.as_millis(),
             state_age_s = quoted.state_age_s,
             min_out = amount(min_out, &route.output),
@@ -716,8 +768,10 @@ impl Executor {
             }
             None => None,
         };
-        let (amount_out, priced_by) = match modelled {
-            Some(a) => (a, "model"),
+        // The router's answer has no impact to report: it is not a model, so
+        // there is no assumption to say how hard this leaned on.
+        let (amount_out, priced_by, impact) = match modelled {
+            Some(m) => (m.amount_out, "model", Some(m.impact)),
             None => (
                 execute::verify(
                     &self.http, self.router, self.owner, &sell, U256::zero(), deadline, None,
@@ -726,6 +780,7 @@ impl Executor {
                 .context("quoting the sale")?
                 .amount_out,
                 "router",
+                None,
             ),
         };
         let min_out = execute::apply_slippage(amount_out, slippage_pct);
@@ -737,6 +792,9 @@ impl Executor {
             sell = format!("{} {}", format_units(size, sell.input.decimals), sell.input.symbol),
             quoted = format!("{} {}", format_units(amount_out, sell.output.decimals), sell.output.symbol),
             priced_by,
+            impact_pct = impact
+                .map(|i| format!("{:.4}", i * 100.0))
+                .unwrap_or_else(|| "-".into()),
             // Whether this was priced against the pool as the feed last saw it
             // or against a snapshot. A sale priced from a snapshot in a falling
             // market is how an amountOutMinimum gets signed that the pool can
@@ -905,7 +963,7 @@ impl Executor {
         // The model prices every buy or none does: there is no router
         // fallback on this path. Skip the buy instead of guessing; it costs
         // nothing but this one drop, and there will be another.
-        let Some(amount_out) = modelled else {
+        let Some(Modelled { amount_out, impact }) = modelled else {
             anyhow::bail!(
                 "route '{}': the model could not price this trade - see the reason logged \
                  just above; skipping rather than guessing",
@@ -943,6 +1001,7 @@ impl Executor {
 
         Ok(Quoted {
             amount_out,
+            impact,
             state_age_s,
             took: started.elapsed(),
             fees,
@@ -1191,7 +1250,11 @@ impl Executor {
         route: &Route,
         fresh: Option<(PoolRef, HopState)>,
         yield_ppm: u64,
-    ) -> Option<U256> {
+    ) -> Option<Modelled> {
+        // Measured against this route's own tolerance, so the two cannot drift
+        // apart - see `modelled_impact_cap`.
+        let cap = modelled_impact_cap(route.max_slippage_pct);
+        let mut worst_impact = 0.0f64;
         // Never priced by a measurement that does not exist. The callers check
         // this too, and both of them refusing is the point.
         if yield_ppm == 0 {
@@ -1289,17 +1352,21 @@ impl Executor {
             // Past a tick boundary the arithmetic stops being exact and starts
             // being optimistic, so it is not used there.
             let impact = ((after / here.sqrt_p).powi(2) - 1.0).abs();
-            if !impact.is_finite() || impact > MAX_MODELLED_IMPACT {
+            if !impact.is_finite() || impact > cap {
                 warn!(
                     route = %route.name,
                     pool = %hop.pool_ref(),
                     impact_pct = format!("{:.4}", impact * 100.0),
-                    limit_pct = MAX_MODELLED_IMPACT * 100.0,
+                    limit_pct = format!("{:.4}", cap * 100.0),
+                    slippage_pct = route.max_slippage_pct,
                     "not priced: this size moves the pool further than the in-range formula \
                      stays exact for"
                 );
                 return None;
             }
+            // The worst hop, not the last: the whole quote is only as trustworthy
+            // as the pool it strained most.
+            worst_impact = worst_impact.max(impact);
             amount = out;
         }
 
@@ -1308,7 +1375,10 @@ impl Executor {
         let amount = amount * yield_ppm.min(PPM) as f64 / PPM as f64;
 
         let raw = crate::route::f64_to_u256_pub(amount);
-        (!raw.is_zero()).then_some(raw)
+        (!raw.is_zero()).then_some(Modelled {
+            amount_out: raw,
+            impact: worst_impact,
+        })
     }
 
     /// Take the next nonce.
@@ -1494,6 +1564,56 @@ impl Approver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cap is a share of the route's own tolerance, so the two cannot be
+    /// tightened apart from each other.
+    #[test]
+    fn the_impact_cap_follows_the_route_tolerance() {
+        assert!((modelled_impact_cap(0.3) - 0.001).abs() < 1e-12);
+        assert!((modelled_impact_cap(1.5) - 0.005).abs() < 1e-12);
+        // Up to the ceiling, past which the question stops being how wrong the
+        // model is and starts being whether a tick is crossed at all.
+        assert_eq!(modelled_impact_cap(3.0), 0.01);
+        assert_eq!(modelled_impact_cap(50.0), 0.01);
+        // Nonsense falls back rather than passing everything: `impact > NaN` is
+        // false, so a NaN cap would price every trade instead of refusing them.
+        assert_eq!(modelled_impact_cap(f64::NAN), 0.005);
+        assert_eq!(modelled_impact_cap(0.0), 0.005);
+        assert_eq!(modelled_impact_cap(-1.0), 0.005);
+    }
+
+    /// The arithmetic `modelled_impact_cap` is argued from, run rather than
+    /// asserted in prose: at the ceiling impact, a pool holding half what the
+    /// model assumed - from the very first wei, which is the worst an unseen
+    /// initialized tick can do short of a liquidity cliff - overstates the
+    /// output by about half the impact, not by the impact and nothing like the
+    /// tolerance.
+    #[test]
+    fn the_cap_leaves_room_for_the_error_it_guards_against() {
+        let sqrt_p = 1.0f64;
+        let l: u128 = 1_000_000_000;
+        // x = amount / (L * sqrt_p) = 0.5%, so the price impact is about 1% -
+        // the most any route can ever be allowed.
+        let amount_in = 5_000_000.0;
+
+        let (modelled, after) =
+            crate::depth::in_range_out(sqrt_p, l, 0, false, amount_in).expect("in range");
+        let impact = (after / sqrt_p).powi(2) - 1.0;
+        assert!((impact - 0.01).abs() < 0.001, "impact {impact}");
+
+        let (actual, _) =
+            crate::depth::in_range_out(sqrt_p, l / 2, 0, false, amount_in).expect("in range");
+        let overstated = modelled / actual - 1.0;
+
+        assert!(overstated > 0.0, "halving liquidity must overstate, not understate");
+        assert!(
+            overstated < impact,
+            "the error {overstated} should be a fraction of the impact {impact}"
+        );
+        // The tolerance a route like this carries is 3%. The gap is what makes
+        // a third of it a cap with room rather than a coin toss.
+        assert!(overstated < 0.01, "{overstated} is too close to the tolerance");
+    }
 
     /// The bar that decides whether a token gets approved at startup has to sit
     /// above anything a position could ever reach and below what `--approve`

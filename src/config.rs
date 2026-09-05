@@ -124,8 +124,22 @@ pub struct RouteConfig {
     /// Human units of the input token, e.g. "1.0".
     pub amount_in: String,
     /// Tolerated shortfall against the quote, used for amountOutMinimum. It is
-    /// applied to a quote taken from the router at the moment of the buy, not
-    /// to anything measured earlier, so it caps the slippage of this pair alone.
+    /// applied to the quote this trade was actually priced from and to nothing
+    /// measured earlier, so it caps the slippage of this pair alone - but WHICH
+    /// quote that is differs by path, and so does what this number is covering:
+    ///
+    /// - an auto-buy is priced by the model, which never asks the router (see
+    ///   `executor::model_quote`), so this covers both the market moving before
+    ///   the swap lands AND the model being wrong;
+    /// - `--swap`, `--sell-all` and a sale the model declines are priced by the
+    ///   router itself, where only the first of those two is left to cover.
+    ///
+    /// Because the model shares this budget, it is also measured against it:
+    /// `executor::modelled_impact_cap` allows a modelled trade to move a pool
+    /// by up to a third of this, so raising the tolerance widens what the model
+    /// is willing to price and lowering it narrows it. The two used to be
+    /// unrelated numbers, and tightening this one silently left the modelling
+    /// cap sized for the old one.
     pub max_slippage_pct: f64,
     /// v4 pool ids, in swap order.
     pub pools: Vec<String>,

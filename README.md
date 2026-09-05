@@ -129,7 +129,7 @@ Per route:
 |---|---|
 | `input`, `amount_in` | what to spend and how much |
 | `pools` | ordered list; a 32-byte v4 pool id or a 20-byte v3 pool address, mixed freely |
-| `max_slippage_pct` | percent, not basis points |
+| `max_slippage_pct` | percent, not basis points. Sets `amountOutMinimum`, and with it how far the model may be trusted: an auto-buy is priced from memory rather than by the router, so this budget covers the model being wrong as well as the market moving, and a trade is only modelled at all while it moves its pool by less than a third of it |
 | `auto_buy` | arm the route |
 | `trigger_pool` | which pool's drop fires it; defaults to the last pool in `pools` |
 | `cooldown_secs` | shortest gap between buys; `0` means every signal buys |
