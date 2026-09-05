@@ -125,6 +125,42 @@ impl<'a> TickReader<'a> {
         self
     }
 
+    /// Whether this reader can really fetch many slots in one request.
+    ///
+    /// Not the same question as `self.batched`, which only says whether it was
+    /// asked to: a v3 pool has no `extsload` to ask, so every word of it is an
+    /// `eth_call` of its own however this is configured. Confusing the two is
+    /// how a scan sized for one batched request turns into a thousand separate
+    /// ones.
+    fn can_batch(&self) -> bool {
+        self.batched && matches!(self.source, Source::V4 { .. })
+    }
+
+    /// Every one of these bitmap words, in one batch, or an error.
+    ///
+    /// Deliberately WITHOUT the per-slot fallback that `storage` has. That
+    /// fallback is right for a tick walk, which wants a handful of slots and
+    /// wants them whatever happens. A window scan wants a thousand, and reading
+    /// a thousand slots one at a time is not a slower version of this - it is a
+    /// background task flooding the endpoint the trades go through, and then
+    /// everything else fails too. So this batches or it gives up.
+    async fn bitmap_words_batched(&self, positions: &[i32]) -> Result<Vec<U256>> {
+        let Source::V4 { manager, .. } = self.source else {
+            anyhow::bail!("only a v4 pool's bitmap can be read in one batch");
+        };
+        let slots: Vec<U256> = positions.iter().filter_map(|w| self.bitmap_slot(*w)).collect();
+        anyhow::ensure!(slots.len() == positions.len(), "not every word has a slot");
+        self.prefetch(&slots).await;
+        let mut out = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            let word = self
+                .cached(manager, *slot)
+                .context("the batched read did not return this slot")?;
+            out.push(U256::from_big_endian(word.as_bytes()));
+        }
+        Ok(out)
+    }
+
     /// The block tag every read in this reader uses.
     fn tag(&self) -> String {
         match self.at {
@@ -133,9 +169,30 @@ impl<'a> TickReader<'a> {
         }
     }
 
+    /// One 32-byte storage word.
+    ///
+    /// A v4 pool's word goes through the manager's own `extsload`, even when it
+    /// is the only word wanted. Both are a single `eth_call`, so nothing is
+    /// saved by asking the other way - and only one of the two is a method
+    /// every endpoint is willing to serve. `eth_getStorageAt` is the one this
+    /// chain's endpoints answer least reliably: it is what recovering a PoolKey
+    /// used to fail on, and what a background scan quietly falling back to it
+    /// flooded them with. It survives here for `--depth-check`, which turns
+    /// batching off precisely to prove the two return identical words.
     async fn storage(&self, addr: Address, slot: U256) -> Result<H256> {
         if let Some(w) = self.cached(addr, slot) {
             return Ok(w);
+        }
+        if let Source::V4 { manager, .. } = self.source {
+            if self.batched && addr == manager {
+                let word = *self
+                    .extsload(manager, &[slot])
+                    .await?
+                    .first()
+                    .context("extsload returned nothing for a single slot")?;
+                self.remember(addr, &[slot], &[word]);
+                return Ok(word);
+            }
         }
         let word: H256 = self
             .http
@@ -551,19 +608,32 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
     );
     let spacing = reader.spacing;
     let centre = compress(tick_at_sqrt(sqrt_p), spacing) >> 8;
-    let words = window_words(spacing, reader.batched);
-
-    // Only the bitmap, and all of it at once. `prefetch_scan` would do this too
-    // but would also fetch each found tick's liquidity, which a walk needs and
-    // this does not: the question here is only WHERE liquidity changes, never
-    // by how much.
+    let batched = reader.can_batch();
+    let words = window_words(spacing, batched);
     let positions: Vec<i32> = (centre - words..=centre + words).collect();
-    let slots: Vec<U256> = positions.iter().filter_map(|w| reader.bitmap_slot(*w)).collect();
-    reader.prefetch(&slots).await;
+
+    // Only the bitmap, and all of it at once. `prefetch_scan` would fetch each
+    // found tick's liquidity too, which a walk needs and this does not: the
+    // question here is only WHERE liquidity changes, never by how much.
+    //
+    // The width is chosen for the way the words will actually be fetched, and
+    // the fetch then refuses to be anything else. A batched scan reads the
+    // whole tick range and fails outright if the batch does not come back; an
+    // unbatched one is capped low enough that one request per word is a few
+    // dozen rather than a flood.
+    let raw: Vec<U256> = match batched {
+        true => reader.bitmap_words_batched(&positions).await?,
+        false => {
+            let mut out = Vec::with_capacity(positions.len());
+            for w in &positions {
+                out.push(reader.bitmap_word(*w).await?);
+            }
+            out
+        }
+    };
 
     let mut edges = Vec::new();
-    for w in positions {
-        let word = reader.bitmap_word(w).await?;
+    for (w, word) in positions.iter().copied().zip(raw) {
         for bit in 0..256u32 {
             if !word.bit(bit as usize) {
                 continue;

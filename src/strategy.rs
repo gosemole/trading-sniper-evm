@@ -1021,12 +1021,16 @@ async fn report_depth(pool: &Pool, http: &Provider<Http>, sig: &Signal, max_move
                         method = "ticks";
                     }
                     Err(e) => warn!(
-                        pool = %pool.name, err = %e,
+                        // The whole chain, not just the outermost context:
+                        // `{e}` on an anyhow error prints "eth_getStorageAt"
+                        // and drops the sentence that says what went wrong
+                        // with it, which is the only part worth reading.
+                        pool = %pool.name, err = %format!("{e:#}"),
                         "tick walk failed, falling back to in-range estimate"
                     ),
                 }
             }
-            Err(e) => warn!(pool = %pool.name, err = %e, "bad tick spacing"),
+            Err(e) => warn!(pool = %pool.name, err = %format!("{e:#}"), "bad tick spacing"),
         }
     }
     if pay.is_none() {
@@ -1035,7 +1039,7 @@ async fn report_depth(pool: &Pool, http: &Provider<Http>, sig: &Signal, max_move
                 pay = Some(v);
                 method = "in-range";
             }
-            Err(e) => warn!(pool = %pool.name, err = %e, "depth quote failed"),
+            Err(e) => warn!(pool = %pool.name, err = %format!("{e:#}"), "depth quote failed"),
         }
     }
     let depth = match pay {

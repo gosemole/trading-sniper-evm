@@ -18,9 +18,10 @@
 //!
 //! One round trip stands between a signal and a signed transaction, and it is
 //! the send - not almost, but exactly: the price comes from memory, the gas
-//! price from the block stream, and the nonce from this process's own counter,
-//! which is the whole answer as long as nothing else signs with this key while
-//! the bot runs. The buy is priced entirely from memory: the pool that dropped
+//! price from the block stream, and the nonce from this process's own counter -
+//! filled at startup and carried forward from there, which is the whole answer
+//! as long as nothing else signs with this key while the bot runs, and so the
+//! FIRST buy costs no more than any later one. The buy is priced entirely from memory: the pool that dropped
 //! brought its own price, liquidity and fee in the very log that raised the
 //! signal, the other pools on the route come from the last calibration pass,
 //! and what a hook takes on top is the correction that pass measured. See
@@ -244,8 +245,27 @@ impl TickBook {
         entry.window.as_ref()?.crosses(from, to)
     }
 
+    /// File a window, saying so out loud when a pool starts or stops having one.
+    ///
+    /// On the transition and not on every pass: a pool whose ticks cannot be
+    /// read prices every trade by the percentage instead of by its own
+    /// liquidity, which is a degradation worth exactly one line - and a line
+    /// repeated twice a minute for as long as it lasts is a line nobody reads.
+    /// Without this the only trace was `exact=false` on a buy, which says a
+    /// trade was affected but not that anything is wrong.
     async fn put(&self, key: PoolRef, window: Option<crate::depth::TickWindow>) {
-        self.inner.lock().await.insert(key, Entry { window, at: Instant::now() });
+        let mut book = self.inner.lock().await;
+        let had = book.get(&key).is_some_and(|e| e.window.is_some());
+        match (had, window.is_some()) {
+            (true, false) => warn!(
+                pool = %key,
+                "TICK WINDOW LOST - trades through this pool are priced by the impact \
+                 percentage again until it comes back"
+            ),
+            (false, true) => info!(pool = %key, "tick window available"),
+            _ => {}
+        }
+        book.insert(key, Entry { window, at: Instant::now() });
     }
 }
 
@@ -516,6 +536,31 @@ impl Executor {
             submit.width()
         );
 
+        // Taken here, after the approvals above have moved it and while nobody
+        // is waiting, so the first buy does not spend its one network wait on a
+        // number this process could already have known. It cost 44 ms of a
+        // falling market to find that out once.
+        //
+        // Only when there is something to sign with. A dry run never sends, so
+        // it never needs one, and asking would be a round trip for a number
+        // nothing will use.
+        let next_nonce = match execute {
+            true => match swap::pending_nonce(http, owner).await {
+                Ok(n) => {
+                    info!(nonce = n, "next nonce taken at startup");
+                    Some(n)
+                }
+                // Not fatal: the first buy asks for itself, exactly as it did
+                // before this was taken in advance.
+                Err(e) => {
+                    warn!(err = %format!("{e:#}"), "could not read the nonce yet; the first \
+                          trade will ask for it");
+                    None
+                }
+            },
+            false => None,
+        };
+
         let me = Arc::new(Self {
             http: http.clone(),
             router,
@@ -530,7 +575,7 @@ impl Executor {
             fees,
             submit,
             last_fire: Mutex::new(HashMap::new()),
-            next_nonce: Mutex::new(None),
+            next_nonce: Mutex::new(next_nonce),
         });
         me.calibrate();
         me.watch_ticks();
@@ -612,7 +657,7 @@ impl Executor {
         ) {
             Ok(r) => r,
             Err(e) => {
-                tracing::debug!(pool = %key, err = %e, "no tick reader for this pool");
+                tracing::debug!(pool = %key, err = %format!("{e:#}"), "no tick reader for this pool");
                 self.ticks.put(key, None).await;
                 return;
             }
@@ -1155,9 +1200,13 @@ impl Executor {
         // is the only thing signing with this key while it runs, so once it
         // has a counter, the counter IS the nonce; asking again would spend
         // the last network wait left between a drop and a broadcast on
-        // confirming something we already know. The counter is empty exactly
-        // twice: at the first buy after a start, and after a failed send
-        // cleared it - and those are the two cases that must ask.
+        // confirming something we already know.
+        //
+        // The counter is filled at startup (see `build`), so in the ordinary
+        // case this asks for nothing at all - not even on the first buy, which
+        // used to be the one trade that paid for it. What is left is the send
+        // that failed and cleared the counter, which must ask because the gap
+        // it left is exactly what nobody knows the size of.
         let want_nonce = self.execute && self.next_nonce.lock().await.is_none();
         let (fees, nonce_seen) = tokio::join!(
             self.fees.params(&self.http),
