@@ -45,7 +45,7 @@ use crate::config::Config;
 use crate::execute;
 use crate::strategy::Signal;
 use crate::pool::Pool;
-use crate::route::{format_units, parse_pool_ref, PoolRef, Route, Token};
+use crate::route::{format_units, parse_pool_ref, Hop, PoolRef, Route, Token};
 use crate::swap;
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
@@ -176,12 +176,87 @@ struct Modelled {
     amount_out: U256,
     /// Fraction, not percent: the largest price move any single hop takes.
     impact: f64,
+    /// True when EVERY hop was cleared by its tick window - so the arithmetic
+    /// is exact rather than merely inside a percentage. One hop falling back
+    /// makes the whole quote an estimate, which is why this is an `and` and not
+    /// a count.
+    exact: bool,
+}
+
+/// Where every armed route's pools change liquidity, read in the background so
+/// that no trade ever waits for it.
+///
+/// This is the answer to the question `modelled_impact_cap` can only guess at.
+/// The model is exact while liquidity holds across the swap, and a scanned
+/// window of initialized ticks says whether it does - so a swap that crosses
+/// nothing is priced however far it moves the pool, and one that crosses
+/// something is refused however little it moves it. The percentage stays as the
+/// fallback for a pool nothing is on file for, which is the only case left.
+#[derive(Default)]
+struct TickBook {
+    inner: Mutex<HashMap<PoolRef, Entry>>,
+}
+
+struct Entry {
+    /// `None` after a read that failed, so a pool whose ticks cannot be read
+    /// is remembered as such rather than retried by every signal.
+    window: Option<crate::depth::TickWindow>,
+    at: Instant,
+}
+
+/// How often each armed pool's window is read again. Cheap - two batched scans
+/// per pool - and the point is to be ahead of the dip rather than to notice it
+/// afterwards, so this is far shorter than the calibration interval.
+const TICK_WINDOW_REFRESH: Duration = Duration::from_secs(30);
+
+/// How old a window may be before it stops being believed. Three missed
+/// refreshes.
+///
+/// A window does not go wrong because the price moved: it covers a span of
+/// price, and for any ordinary spacing that span is the whole tick range. What
+/// it can go wrong about is the pool changing shape underneath it.
+///
+/// TODO: a position MINTED inside a scanned window puts an initialized tick
+/// where the scan saw none, and nothing here watches for that - so between two
+/// refreshes a swap can be told it crosses nothing when it now crosses
+/// something, which is exactly the answer that makes the model trusted outright.
+/// This age limit is the only thing standing in for that, and it is a timer
+/// rather than an answer: it bounds the exposure to a minute and a half, it
+/// does not detect anything. The real fix is to subscribe to the pool's
+/// `ModifyLiquidity` and drop the window on one, the same way the feed already
+/// turns every `Swap` into a tick - then a window is invalidated by the event
+/// that invalidates it rather than by the clock. Worth doing before this runs
+/// on a pool whose liquidity is actively managed by someone else.
+const TICK_WINDOW_STALE_AFTER: Duration = Duration::from_secs(90);
+
+impl TickBook {
+    /// Whether this swap crosses a price where the pool's liquidity changes.
+    ///
+    /// `None` is "nothing on file", never "no". The caller falls back to the
+    /// percentage on it, and reading it as "no" would trust the model on
+    /// exactly the pools nothing is known about.
+    async fn crosses(&self, key: PoolRef, from: f64, to: f64) -> Option<bool> {
+        let book = self.inner.lock().await;
+        let entry = book.get(&key)?;
+        if entry.at.elapsed() > TICK_WINDOW_STALE_AFTER {
+            return None;
+        }
+        entry.window.as_ref()?.crosses(from, to)
+    }
+
+    async fn put(&self, key: PoolRef, window: Option<crate::depth::TickWindow>) {
+        self.inner.lock().await.insert(key, Entry { window, at: Instant::now() });
+    }
 }
 
 struct Quoted {
     amount_out: U256,
     /// The worst hop's price move, as `Modelled::impact`.
     impact: f64,
+    /// Whether every hop was judged against a real tick window rather than
+    /// against the percentage. Logged on each buy, because it is the difference
+    /// between a quote that is exact and one that is merely probably close.
+    exact: bool,
     /// How old the calibration snapshot was when this was priced, in seconds,
     /// or `None` when there is no snapshot at all. Logged on every buy so that
     /// the state ageing is visible while it is still pricing trades, rather
@@ -282,6 +357,9 @@ pub struct Executor {
     execute: bool,
     /// Trigger pool -> what to buy when it drops.
     plans: HashMap<PoolRef, Plan>,
+    /// Where each pool's liquidity changes, kept current in the background so
+    /// a quote can be exact instead of merely cautious. See `TickBook`.
+    ticks: TickBook,
     last_fire: Mutex<HashMap<PoolRef, Instant>>,
     /// The gas price, kept current from the block stream instead of asked for
     /// on every buy.
@@ -448,12 +526,14 @@ impl Executor {
             owner,
             execute,
             plans,
+            ticks: TickBook::default(),
             fees,
             submit,
             last_fire: Mutex::new(HashMap::new()),
             next_nonce: Mutex::new(None),
         });
         me.calibrate();
+        me.watch_ticks();
         Ok(Some(me))
     }
 
@@ -483,6 +563,93 @@ impl Executor {
                 tokio::time::sleep(every).await;
             }
         });
+    }
+
+    /// Keep reading where each armed route's pools change liquidity.
+    ///
+    /// The whole point of doing it here is that it is the one question the hot
+    /// path cannot afford to ask and cannot afford to guess at either. It is
+    /// also why the scan covers a SPAN of price rather than the two ticks
+    /// nearest the current one: by the time a dip fires, the price has moved,
+    /// and a pair of neighbours read beforehand would describe where the pool
+    /// used to be. See `depth::tick_window`.
+    ///
+    /// Separate from `calibrate` and much faster, because the two answer
+    /// different questions on different clocks: what a hook charges changes
+    /// when someone changes it, while where liquidity sits changes whenever
+    /// anybody mints or burns.
+    fn watch_ticks(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                // Every hop of every armed route, deduplicated: one pool shared
+                // by two routes is one window, and a route and its reverse are
+                // the same pools either way.
+                let mut done = std::collections::HashSet::new();
+                for plan in me.plans.values() {
+                    for hop in &plan.route.hops {
+                        if done.insert(hop.pool_ref()) {
+                            me.refresh_window(hop).await;
+                        }
+                    }
+                }
+                tokio::time::sleep(TICK_WINDOW_REFRESH).await;
+            }
+        });
+    }
+
+    /// Read one pool's tick window and file it.
+    ///
+    /// A failure is filed too, as an absence: a pool whose ticks cannot be read
+    /// should fall back to the percentage once and quietly, not have every
+    /// signal discover it again.
+    async fn refresh_window(&self, hop: &Hop) {
+        let key = hop.pool_ref();
+        let reader = match crate::depth::TickReader::new(
+            &self.http,
+            hop.tick_source(self.manager),
+            hop.tick_spacing,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(pool = %key, err = %e, "no tick reader for this pool");
+                self.ticks.put(key, None).await;
+                return;
+            }
+        };
+        // Around where the pool is NOW, not where the snapshot last saw it: the
+        // window is centred once and then has to cover wherever the price goes
+        // next, so it is worth centring on the truth.
+        let state = match crate::depth::read_state(&reader).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(pool = %key, err = %format!("{e:#}"), "could not read pool state");
+                self.ticks.put(key, None).await;
+                return;
+            }
+        };
+        match crate::depth::tick_window(&reader, state.sqrt_p).await {
+            Ok(w) => {
+                let (lo, hi) = w.span();
+                tracing::debug!(
+                    pool = %key,
+                    edges = w.edges(),
+                    // True means no price move can ever put this pool back on
+                    // the percentage: the scan read every tick it could have.
+                    whole_range = w.whole(),
+                    // As a factor on the current price, which is the form the
+                    // question is actually asked in.
+                    covers_down = format!("{:.1}%", ((lo / state.sqrt_p).powi(2) - 1.0) * 100.0),
+                    covers_up = format!("{:.1}%", ((hi / state.sqrt_p).powi(2) - 1.0) * 100.0),
+                    "tick window read"
+                );
+                self.ticks.put(key, Some(w)).await;
+            }
+            Err(e) => {
+                tracing::debug!(pool = %key, err = %format!("{e:#}"), "could not read tick window");
+                self.ticks.put(key, None).await;
+            }
+        }
     }
 
     async fn measure_yield(&self, plan: &Plan) -> Result<()> {
@@ -615,6 +782,11 @@ impl Executor {
             // refusals, because a cap is only tunable against a distribution
             // somebody can see.
             impact_pct = format!("{:.4}", quoted.impact * 100.0),
+            // Whether every hop was cleared against real tick data or against
+            // the percentage that stands in for it. The difference is between a
+            // quote that is exact and one that is probably close, and it is
+            // worth being able to tell them apart afterwards.
+            exact = quoted.exact,
             impact_limit_pct = format!("{:.4}", modelled_impact_cap(route.max_slippage_pct) * 100.0),
             quote_ms = quoted.took.as_millis(),
             state_age_s = quoted.state_age_s,
@@ -771,7 +943,14 @@ impl Executor {
         // The router's answer has no impact to report: it is not a model, so
         // there is no assumption to say how hard this leaned on.
         let (amount_out, priced_by, impact) = match modelled {
-            Some(m) => (m.amount_out, "model", Some(m.impact)),
+            Some(m) => (
+                m.amount_out,
+                match m.exact {
+                    true => "model (ticks)",
+                    false => "model (in-range)",
+                },
+                Some(m.impact),
+            ),
             None => (
                 execute::verify(
                     &self.http, self.router, self.owner, &sell, U256::zero(), deadline, None,
@@ -963,7 +1142,7 @@ impl Executor {
         // The model prices every buy or none does: there is no router
         // fallback on this path. Skip the buy instead of guessing; it costs
         // nothing but this one drop, and there will be another.
-        let Some(Modelled { amount_out, impact }) = modelled else {
+        let Some(Modelled { amount_out, impact, exact }) = modelled else {
             anyhow::bail!(
                 "route '{}': the model could not price this trade - see the reason logged \
                  just above; skipping rather than guessing",
@@ -1002,6 +1181,7 @@ impl Executor {
         Ok(Quoted {
             amount_out,
             impact,
+            exact,
             state_age_s,
             took: started.elapsed(),
             fees,
@@ -1255,6 +1435,8 @@ impl Executor {
         // apart - see `modelled_impact_cap`.
         let cap = modelled_impact_cap(route.max_slippage_pct);
         let mut worst_impact = 0.0f64;
+        // Cleared by a real tick window everywhere, until some hop is not.
+        let mut exact = true;
         // Never priced by a measurement that does not exist. The callers check
         // this too, and both of them refusing is the point.
         if yield_ppm == 0 {
@@ -1349,24 +1531,67 @@ impl Executor {
                 );
                 return None;
             };
-            // Past a tick boundary the arithmetic stops being exact and starts
-            // being optimistic, so it is not used there.
             let impact = ((after / here.sqrt_p).powi(2) - 1.0).abs();
-            if !impact.is_finite() || impact > cap {
-                warn!(
-                    route = %route.name,
-                    pool = %hop.pool_ref(),
-                    impact_pct = format!("{:.4}", impact * 100.0),
-                    limit_pct = format!("{:.4}", cap * 100.0),
-                    slippage_pct = route.max_slippage_pct,
-                    "not priced: this size moves the pool further than the in-range formula \
-                     stays exact for"
-                );
+            if !impact.is_finite() {
+                warn!(route = %route.name, pool = %hop.pool_ref(), "not priced: impact is not a number");
                 return None;
             }
-            // The worst hop, not the last: the whole quote is only as trustworthy
-            // as the pool it strained most.
+            // The worst hop, not the last: the whole quote is only as
+            // trustworthy as the pool it strained most.
             worst_impact = worst_impact.max(impact);
+
+            // The real question, asked of the real answer where there is one.
+            // `in_range_out` is exact for as long as liquidity holds, and
+            // liquidity holds exactly until an initialized tick is crossed - so
+            // a swap the window clears is not an estimate at all, and its size
+            // stops mattering. Read in the background; see `TickBook`.
+            match self.ticks.crosses(hop.pool_ref(), here.sqrt_p, after).await {
+                Some(true) => {
+                    warn!(
+                        route = %route.name,
+                        pool = %hop.pool_ref(),
+                        impact_pct = format!("{:.4}", impact * 100.0),
+                        "not priced: this swap crosses a tick where the pool's liquidity \
+                         changes, so the in-range formula does not describe it"
+                    );
+                    return None;
+                }
+                Some(false) => {
+                    // Exact - but a trade that moves a pool as far as its whole
+                    // slippage tolerance is a size to look at rather than a
+                    // model to trust, whatever the ticks say.
+                    let ceiling = route.max_slippage_pct / 100.0;
+                    if impact > ceiling {
+                        warn!(
+                            route = %route.name,
+                            pool = %hop.pool_ref(),
+                            impact_pct = format!("{:.4}", impact * 100.0),
+                            slippage_pct = route.max_slippage_pct,
+                            "not priced: the swap crosses no tick, but it moves the pool by \
+                             as much as the whole slippage tolerance - that is a size, not a \
+                             modelling question"
+                        );
+                        return None;
+                    }
+                }
+                // Nothing on file for this pool, or the window does not reach
+                // this far. Back to guessing by percentage, and saying so.
+                None => {
+                    exact = false;
+                    if impact > cap {
+                        warn!(
+                            route = %route.name,
+                            pool = %hop.pool_ref(),
+                            impact_pct = format!("{:.4}", impact * 100.0),
+                            limit_pct = format!("{:.4}", cap * 100.0),
+                            slippage_pct = route.max_slippage_pct,
+                            "not priced: no tick window covers this swap, and it moves the \
+                             pool further than the in-range formula is assumed exact for"
+                        );
+                        return None;
+                    }
+                }
+            }
             amount = out;
         }
 
@@ -1378,6 +1603,7 @@ impl Executor {
         (!raw.is_zero()).then_some(Modelled {
             amount_out: raw,
             impact: worst_impact,
+            exact,
         })
     }
 

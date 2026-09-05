@@ -410,6 +410,180 @@ fn scan_word(word: U256, bit: i32, up: bool, first: bool) -> Option<u32> {
     }
 }
 
+/// Every price at which a pool's liquidity changes, near where it is trading.
+///
+/// `in_range_out` assumes liquidity holds across the whole swap. That is true
+/// exactly when no initialized tick lies between where the price starts and
+/// where it ends - a question about a stretch of price, which a list of ticks
+/// read earlier answers off-line and for nothing. The percentage cap in
+/// `executor::modelled_impact_cap` is only ever a guess at the same question,
+/// and it guesses wrong in both directions: it refuses swaps that cross nothing
+/// and accepts swaps that cross something a tenth of a percent away.
+///
+/// A WINDOW rather than the two neighbouring ticks, and that is the whole
+/// design. A dip is precisely the moment the price jumps a long way, so a pair
+/// of neighbours read around the price ten seconds ago has been left behind by
+/// the price this is asked about - abandoning the model at the one moment it
+/// exists for. A window scanned wide enough still contains both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TickWindow {
+    /// Sqrt prices of the initialized ticks found, ascending. Every one of them
+    /// is a place liquidity changes; between any two it does not.
+    edges: Vec<f64>,
+    /// What the scan actually covered. Outside this the list means nothing: a
+    /// stretch with no edges INSIDE the window is a fact, the same stretch
+    /// outside it is merely unread, and the two must never be confused.
+    lo: f64,
+    hi: f64,
+    /// Whether the scan reached every tick the pool could possibly have, in
+    /// which case `crosses` can never come back unread however far the price
+    /// travels. True for any ordinary spacing on a batched pool.
+    whole: bool,
+}
+
+impl TickWindow {
+    /// Whether a swap from `from` to `to` passes a price where liquidity
+    /// changes.
+    ///
+    /// `None` means the scan did not reach one of the two ends, so the answer
+    /// is UNKNOWN rather than "no". Losing that distinction is the one way this
+    /// can do harm: "no" is what makes a caller trust the model outright.
+    ///
+    /// The interval is closed at both ends. A swap stopping exactly on an
+    /// initialized tick does not truly cross it, but answering "it does" costs
+    /// one trade priced the slow way, while answering "it does not" on a tick
+    /// that was in fact crossed costs a quote nobody checked.
+    pub fn crosses(&self, from: f64, to: f64) -> Option<bool> {
+        if !from.is_finite() || !to.is_finite() {
+            return None;
+        }
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        if lo < self.lo || hi > self.hi {
+            return None;
+        }
+        // First edge at or above the bottom of the move; it is crossed when it
+        // also sits at or below the top.
+        let i = self.edges.partition_point(|e| *e < lo);
+        Some(self.edges.get(i).is_some_and(|e| *e <= hi))
+    }
+
+    /// The sqrt prices the scan covered, for logs and tests.
+    pub fn span(&self) -> (f64, f64) {
+        (self.lo, self.hi)
+    }
+
+    /// How many places liquidity changes inside it.
+    pub fn edges(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// Whether the scan read the pool end to end. For logs: a window that did
+    /// can never be escaped by a price move, however violent.
+    pub fn whole(&self) -> bool {
+        self.whole
+    }
+}
+
+/// The furthest tick either protocol allows. A pool cannot have an initialized
+/// tick beyond it, so a scan reaching this far on both sides has read the pool
+/// entirely and can never answer "I did not look there".
+const MAX_TICK: i64 = 887_272;
+
+/// Most bitmap words a scan will read on each side when the manager batches
+/// them. The whole tick range fits well inside this for every ordinary spacing:
+/// one `extsload` call at spacing 60 or above, a handful at spacing 10. The cap
+/// only ever bites on a spacing-1 pool, where 512 words still spans a price
+/// factor of about half a million.
+const MAX_WINDOW_WORDS: i64 = 512;
+
+/// The same for a pool that cannot be batched - a v3 pool, where every word is
+/// its own `eth_call` and reading the range would be thousands of them.
+///
+/// The coverage this buys falls with the spacing, and that is not the problem
+/// it looks like: spacing is chosen to match how far the pair moves, so the
+/// pools this covers least are the pools that need it least. Sixteen words is
+/// a price factor of 200,000 at spacing 60 and still about 50% at spacing 1,
+/// which is a stable pair by construction.
+const MAX_UNBATCHED_WORDS: i64 = 16;
+
+/// Bitmap words to read on EACH side of the word the price sits in.
+///
+/// Aimed at the whole tick range, not at a percentage of price. An earlier
+/// version scanned a fixed +/-30% and left everything past it unanswerable -
+/// which is backwards, because at spacing 60 the entire range is 58 words a
+/// side and arrives in a single batched call. Paying one request to never have
+/// to guess again is not a trade-off worth thinking about.
+///
+/// The word the price sits in does not count towards coverage: the price can be
+/// hard against either of its edges, so only the words BEYOND it are guaranteed
+/// on both sides.
+fn window_words(spacing: i32, batched: bool) -> i32 {
+    let cap = if batched { MAX_WINDOW_WORDS } else { MAX_UNBATCHED_WORDS };
+    let whole_range = MAX_TICK / (spacing.max(1) as i64 * 256) + 1;
+    whole_range.clamp(1, cap) as i32
+}
+
+/// Whether a scan of this width reaches every tick the pool could have, in
+/// which case `TickWindow::crosses` can never answer "unread".
+fn covers_whole_range(words: i32, spacing: i32) -> bool {
+    (words as i64) * 256 * spacing.max(1) as i64 >= MAX_TICK
+}
+
+/// The sqrt prices a run of `2 * words + 1` bitmap words centred on `centre`
+/// covers, which is exactly what `TickWindow` may answer questions about.
+fn word_span(centre: i32, words: i32, spacing: i32) -> (f64, f64) {
+    let bound = |w: i32, plus: i64| {
+        let t = ((((w as i64) << 8) + plus) * spacing as i64).clamp(-MAX_TICK, MAX_TICK);
+        sqrt_at_tick(t as i32)
+    };
+    (bound(centre - words, 0), bound(centre + words, 256))
+}
+
+/// Read every initialized tick near `sqrt_p`, so a later swap from around there
+/// can be judged exactly instead of by a percentage.
+///
+/// Batched, and meant for the background: see `executor::TickBook`, which keeps
+/// the answer current so that no trade ever waits for this.
+pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWindow> {
+    anyhow::ensure!(
+        sqrt_p.is_finite() && sqrt_p > 0.0,
+        "cannot scan around a non-positive price"
+    );
+    let spacing = reader.spacing;
+    let centre = compress(tick_at_sqrt(sqrt_p), spacing) >> 8;
+    let words = window_words(spacing, reader.batched);
+
+    // Only the bitmap, and all of it at once. `prefetch_scan` would do this too
+    // but would also fetch each found tick's liquidity, which a walk needs and
+    // this does not: the question here is only WHERE liquidity changes, never
+    // by how much.
+    let positions: Vec<i32> = (centre - words..=centre + words).collect();
+    let slots: Vec<U256> = positions.iter().filter_map(|w| reader.bitmap_slot(*w)).collect();
+    reader.prefetch(&slots).await;
+
+    let mut edges = Vec::new();
+    for w in positions {
+        let word = reader.bitmap_word(w).await?;
+        for bit in 0..256u32 {
+            if !word.bit(bit as usize) {
+                continue;
+            }
+            let tick = (((w as i64) << 8) + bit as i64) * spacing as i64;
+            // A bit can only be set for a tick the pool really has, but the
+            // arithmetic above runs before that is known.
+            if !(-MAX_TICK..=MAX_TICK).contains(&tick) {
+                continue;
+            }
+            edges.push(sqrt_at_tick(tick as i32));
+        }
+    }
+
+    // Words ascend and bits within them ascend, and `sqrt_at_tick` rises with
+    // the tick, so this comes out sorted without sorting it.
+    let (lo, hi) = word_span(centre, words, spacing);
+    Ok(TickWindow { edges, lo, hi, whole: covers_whole_range(words, spacing) })
+}
+
 /// What a swap yields while it stays inside the current tick range, where
 /// liquidity is constant and no tick data is needed at all.
 ///
@@ -844,6 +1018,116 @@ mod tests_in_range {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(ticks: &[i32], lo: i32, hi: i32) -> TickWindow {
+        TickWindow {
+            edges: ticks.iter().map(|t| sqrt_at_tick(*t)).collect(),
+            lo: sqrt_at_tick(lo),
+            hi: sqrt_at_tick(hi),
+            whole: false,
+        }
+    }
+
+    /// The distinction the whole design rests on: a stretch the scan covered
+    /// and found empty is a FACT, the same stretch outside it is merely unread.
+    /// Answering "no" for the second would tell the model to trust arithmetic
+    /// nothing has checked.
+    #[test]
+    fn unread_is_not_the_same_answer_as_empty() {
+        let w = window(&[-600, 600], -6000, 6000);
+
+        // Inside the scan, between two edges: known, and known to cross nothing.
+        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(500)), Some(false));
+        // Inside the scan with no edges anywhere near: still a fact.
+        assert_eq!(w.crosses(sqrt_at_tick(1000), sqrt_at_tick(5000)), Some(false));
+        // One end past what was read: not known, and must not read as "no".
+        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(9000)), None);
+        assert_eq!(w.crosses(sqrt_at_tick(-9000), sqrt_at_tick(0)), None);
+        // A window that found nothing at all still answers inside its span.
+        assert_eq!(window(&[], -6000, 6000).crosses(sqrt_at_tick(0), sqrt_at_tick(100)), Some(false));
+    }
+
+    #[test]
+    fn a_swap_reaching_an_edge_is_a_crossing() {
+        let w = window(&[-600, 600], -6000, 6000);
+
+        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(700)), Some(true));
+        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(-700)), Some(true));
+        // Landing exactly on one counts, deliberately: saying "crossed" costs a
+        // trade priced the slow way, saying "did not" costs an unchecked quote.
+        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(600)), Some(true));
+        // Direction is not part of the question.
+        assert_eq!(
+            w.crosses(sqrt_at_tick(700), sqrt_at_tick(0)),
+            w.crosses(sqrt_at_tick(0), sqrt_at_tick(700))
+        );
+        // A price that is not a number is never an answer.
+        assert_eq!(w.crosses(f64::NAN, sqrt_at_tick(0)), None);
+    }
+
+    /// Every ordinary spacing reads the WHOLE tick range, so `crosses` can
+    /// never come back "unread" for it - and it does so in a request or two,
+    /// which is why aiming at a percentage of price was the wrong idea.
+    ///
+    /// The word the price sits in cannot count towards coverage: the price can
+    /// sit hard against either of its edges, so only the words beyond it are
+    /// guaranteed on both sides.
+    #[test]
+    fn an_ordinary_pool_is_scanned_end_to_end() {
+        for spacing in [10, 30, 60, 200, 2000] {
+            let words = window_words(spacing, true);
+            assert!(
+                covers_whole_range(words, spacing),
+                "spacing {spacing}: {words} words a side leaves part of the range unread"
+            );
+            // And it stays cheap enough to do every thirty seconds.
+            let calls = (2 * words as usize + 1).div_ceil(SLOTS_PER_CALL);
+            assert!(calls <= 6, "spacing {spacing}: {calls} extsload calls");
+        }
+    }
+
+    /// Where the range does not fit, the cap still has to leave a span nothing
+    /// this bot trades could walk out of. The floor is deliberately lower for
+    /// an unbatched pool at spacing 1: coverage falls with spacing, and so does
+    /// how far such a pair moves, so the least-covered pools are the ones that
+    /// need it least.
+    #[test]
+    fn a_capped_scan_still_covers_more_than_any_real_move() {
+        for (spacing, batched, least) in
+            [(1, true, 2.0), (60, false, 2.0), (1, false, 0.40)]
+        {
+            let words = window_words(spacing, batched);
+            let guaranteed = words as i64 * 256 * spacing as i64;
+            let factor = 1.0001f64.powf(guaranteed as f64) - 1.0;
+            assert!(
+                factor >= least,
+                "spacing {spacing} batched={batched}: covers only {:.1}%, wanted {:.0}%",
+                factor * 100.0,
+                least * 100.0
+            );
+        }
+        // An unbatched pool must not ask for hundreds of eth_calls.
+        assert!(window_words(1, false) <= MAX_UNBATCHED_WORDS as i32);
+    }
+
+    /// The span a window reports must be the span its words were read from, or
+    /// `crosses` would answer about prices nothing was scanned for.
+    #[test]
+    fn the_reported_span_matches_the_words_read() {
+        let (spacing, centre) = (60, 3);
+        let words = window_words(spacing, true);
+        let (lo, hi) = word_span(centre, words, spacing);
+
+        // Lowest tick of the lowest word read, highest of the highest, both
+        // clamped to the range a tick can actually be in.
+        let first = ((((centre - words) as i64) << 8) * spacing as i64).clamp(-MAX_TICK, MAX_TICK);
+        let last = (((((centre + words) as i64) << 8) + 256) * spacing as i64)
+            .clamp(-MAX_TICK, MAX_TICK);
+        assert_eq!(lo, sqrt_at_tick(first as i32));
+        assert_eq!(hi, sqrt_at_tick(last as i32));
+        assert!(lo < hi);
+    }
+
 
     #[test]
     fn compress_floors_towards_negative_infinity() {
