@@ -31,10 +31,11 @@
 //!
 //! Nothing here asks the router to rehearse the trade, so nothing proves the
 //! wallet can afford it except a balance check run for that purpose alone -
-//! see `quote`. Allowance is checked once, when the route is armed, and relies
-//! on the unlimited approval this bot's own `--approve` sets up; it is not
-//! re-proven per buy. `--swap` and `--sell-all`, where nobody is racing, still
-//! run the real rehearsal through `execute::verify` before sending.
+//! see `quote`. Allowance is dealt with once, when the route is armed: both
+//! ends of it are approved without limit if they are not already, and every
+//! buy afterwards relies on that rather than re-proving it. `--swap` and
+//! `--sell-all`, where nobody is racing, still run the real rehearsal through
+//! `execute::verify` before sending.
 //!
 //! Routes are resolved once at startup: recovering a PoolKey takes a couple of
 //! dozen archive reads, which is fine before the stream opens and far too slow
@@ -44,7 +45,7 @@ use crate::config::Config;
 use crate::execute;
 use crate::strategy::Signal;
 use crate::pool::Pool;
-use crate::route::{format_units, parse_pool_ref, PoolRef, Route};
+use crate::route::{format_units, parse_pool_ref, PoolRef, Route, Token};
 use crate::swap;
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
@@ -89,6 +90,11 @@ struct Plan {
     /// approval is left un-cached and re-checked every time, because a cached
     /// "yes" that was only ever true for a smaller size is how a sale comes to
     /// be signed against an allowance that cannot cover it.
+    ///
+    /// Seeded at arming time, where the same question is already asked and
+    /// answered - and, if the answer was no, acted on. See `Approver`: a route
+    /// armed with `--execute` starts with this true, so the first sale is not
+    /// the one that pays for the question.
     sell_approved: AtomicBool,
 }
 
@@ -248,10 +254,11 @@ pub struct Executor {
 impl Executor {
     /// Resolve every armed route, or `None` when none is armed.
     ///
-    /// Failing here rather than at the first drop is deliberate: a bad route,
-    /// a missing key or a missing approval should stop the process at startup,
-    /// while someone is watching, not silently do nothing at the one moment it
-    /// was supposed to act.
+    /// Failing here rather than at the first drop is deliberate: a bad route or
+    /// a missing key should stop the process at startup, while someone is
+    /// watching, not silently do nothing at the one moment it was supposed to
+    /// act. A missing approval is the one thing that does not stop it, because
+    /// it is the one thing that can be fixed from here - see `Approver`.
     pub async fn build(
         http: &Provider<Http>,
         cfg: &Config,
@@ -267,6 +274,17 @@ impl Executor {
         let permit2 = swap::resolve_addr(&cfg.permit2, Some(swap::PERMIT2_DEFAULT), "permit2")?;
         let wallet = swap::load_wallet(cfg, chain_id).context("auto_buy needs a signing key")?;
         let owner = wallet.address();
+        // Shared across every armed route, so two routes spending the same
+        // token approve it once between them rather than once each.
+        let mut approve = Approver {
+            http,
+            wallet: &wallet,
+            owner,
+            permit2,
+            router,
+            execute,
+            done: HashMap::new(),
+        };
 
         let mut plans = HashMap::new();
         for rc in armed {
@@ -304,7 +322,9 @@ impl Executor {
                 );
             }
 
-            preflight(http, &route, owner, permit2, router).await?;
+            // Also the answer to the question the first sale would otherwise
+            // have to stop and ask - see `Plan::sell_approved`.
+            let sell_approved = preflight(&mut approve, &route).await?;
             if rc.cooldown_secs == 0 {
                 warn!(
                     route = %rc.name,
@@ -345,7 +365,7 @@ impl Executor {
                     yield_ppm: AtomicU64::new(0),
                     sell_yield_ppm: AtomicU64::new(0),
                     sell_gas_limit: AtomicU64::new(0),
-                    sell_approved: AtomicBool::new(false),
+                    sell_approved: AtomicBool::new(sell_approved),
                     state: Mutex::new(None),
                 },
             );
@@ -1316,15 +1336,19 @@ impl Executor {
 }
 
 /// Everything that can be checked before the first drop: is there anything to
-/// spend, and may the router spend it.
-async fn preflight(
-    http: &Provider<Http>,
-    route: &Route,
-    owner: Address,
-    permit2: Address,
-    router: Address,
-) -> Result<()> {
-    let balance = swap::balance_of(http, route.input.address, owner).await?;
+/// spend, and may the router spend it - approving it here when it may not.
+///
+/// BOTH ends of the route, not only the token a buy spends. The token a sale
+/// hands back down the same pools is spent too, and an unapproved one is a
+/// position that can be opened and not closed - the worse half of the pair, and
+/// the half that used to be found out about at the first take-profit. Set up at
+/// the same moment as the other, while nobody is waiting.
+///
+/// Returns whether the token this route SELLS is now approved without limit, so
+/// the first sale can skip the two `eth_call`s that ask - see `Plan`'s
+/// `sell_approved`, which is what the answer is kept in.
+async fn preflight(approve: &mut Approver<'_>, route: &Route) -> Result<bool> {
+    let balance = swap::balance_of(approve.http, route.input.address, approve.owner).await?;
     if balance < route.amount_in {
         warn!(
             route = %route.name,
@@ -1334,17 +1358,165 @@ async fn preflight(
             "not enough to buy with; the first drop will fail unless this is topped up"
         );
     }
-    if route.input.address != Address::zero() {
-        let (erc20, p2) =
-            swap::check_approvals(http, route.input.address, owner, permit2, router).await?;
-        anyhow::ensure!(
-            erc20 >= route.amount_in && p2 >= route.amount_in,
-            "route '{}': {} is not approved for the router (erc20->permit2 {erc20}, \
-             permit2->router {p2}); run --approve {} --execute first",
-            route.name,
-            route.input.symbol,
-            route.input.symbol
-        );
+    approve
+        .ensure_spendable(&route.input)
+        .await
+        .with_context(|| format!("route '{}': the token it spends", route.name))?;
+    approve
+        .ensure_spendable(&route.output)
+        .await
+        .with_context(|| format!("route '{}': the token it sells back", route.name))
+}
+
+/// Who signs, and which contracts a token has to be approved to.
+///
+/// One value rather than a row of arguments, for the reason `inventory::Trade`
+/// is one: three addresses in a row are three addresses easy to hand over in
+/// the wrong order, and here the wrong order would approve the wrong spender.
+struct Approver<'a> {
+    http: &'a Provider<Http>,
+    wallet: &'a LocalWallet,
+    owner: Address,
+    permit2: Address,
+    router: Address,
+    /// Sign and send, rather than only printing what would have been sent.
+    execute: bool,
+    /// Tokens already dealt with this start, and what came of it. Two routes
+    /// sharing a token settle it once between them, and the second reads the
+    /// answer rather than the chain.
+    done: HashMap<Address, bool>,
+}
+
+impl Approver<'_> {
+    /// Make sure the router may spend `token` without a practical ceiling,
+    /// setting the approval up when it may not, and say whether it now may.
+    ///
+    /// A missing approval is not a condition to report and stop on: it is one
+    /// this bot already knows how to fix, and `--approve` fixes it with exactly
+    /// these two transactions. Doing it at startup costs one round of gas once
+    /// per token and removes the whole class of "armed, watching, and unable to
+    /// trade" - which was previously discovered either at startup as an error
+    /// telling the operator to go and run another command, or, on the selling
+    /// side, at the one moment a position needed closing.
+    ///
+    /// The bar is `effectively_unlimited`, the same one a sale's cached
+    /// approval uses and for the same reason: this bot only ever grants
+    /// unlimited, so anything short of it is a partial allowance that a large
+    /// enough trade runs through - and one that was only ever big enough for a
+    /// smaller size is how a sale comes to be signed against an allowance that
+    /// cannot cover it. Whatever is there is logged before it is replaced.
+    ///
+    /// Nothing is sent without `--execute`, as everywhere else: a dry run
+    /// prints the transactions it would have sent, says the token is still not
+    /// approved, and carries on arming - because a dry run has no trade to fail
+    /// at later.
+    async fn ensure_spendable(&mut self, token: &Token) -> Result<bool> {
+        // Native ETH is passed as msg.value: there is nothing to approve, and
+        // every caller skips the question for it anyway.
+        if token.address == Address::zero() {
+            return Ok(true);
+        }
+        if let Some(&known) = self.done.get(&token.address) {
+            return Ok(known);
+        }
+        let unlimited = self.approve_unlimited(token).await?;
+        self.done.insert(token.address, unlimited);
+        Ok(unlimited)
     }
-    Ok(())
+
+    /// The work itself. Memoised by `ensure_spendable`, which is the only
+    /// caller and the only thing that should ever ask twice.
+    async fn approve_unlimited(&self, token: &Token) -> Result<bool> {
+        let limit = effectively_unlimited();
+        let (erc20, p2) = self.allowances(token).await?;
+        if erc20 >= limit && p2 >= limit {
+            info!(token = %token.symbol, "approved without limit already");
+            return Ok(true);
+        }
+
+        let txs = swap::build_unlimited_approval(token.address, self.permit2, self.router)?;
+        warn!(
+            token = %token.symbol,
+            addr = ?token.address,
+            erc20_to_permit2 = %erc20,
+            permit2_to_router = %p2,
+            "NOT approved without limit - approving it now"
+        );
+        if !self.execute {
+            println!(
+                "\nwould approve {} ({:?}), {} transaction(s):",
+                token.symbol,
+                token.address,
+                txs.len()
+            );
+            for (i, tx) in txs.iter().enumerate() {
+                tx.print(i);
+            }
+            println!("  dry run - nothing sent; start with --execute to approve for real");
+            return Ok(false);
+        }
+
+        println!(
+            "\napproving {} ({:?}) from {:?}, {} transaction(s)",
+            token.symbol,
+            token.address,
+            self.owner,
+            txs.len()
+        );
+        swap::send_all(self.http, self.wallet.clone(), &txs)
+            .await
+            .with_context(|| format!("approving {} for the router", token.symbol))?;
+
+        // The receipts say the transactions succeeded. This says the allowance
+        // they were for is actually there - which is not the same claim, and is
+        // the only one that matters to the trade that will rely on it.
+        let (erc20, p2) = self.allowances(token).await?;
+        anyhow::ensure!(
+            erc20 >= limit && p2 >= limit,
+            "{} was approved but the allowance did not take (erc20->permit2 {erc20}, \
+             permit2->router {p2}); this token may not behave like a standard ERC-20",
+            token.symbol
+        );
+        info!(token = %token.symbol, "approved without limit");
+        Ok(true)
+    }
+
+    /// What the two allowances in the chain are now: the ERC-20's to Permit2,
+    /// and Permit2's to the router. Both have to be there; either alone spends
+    /// nothing.
+    async fn allowances(&self, token: &Token) -> Result<(U256, U256)> {
+        swap::check_approvals(self.http, token.address, self.owner, self.permit2, self.router)
+            .await
+            .with_context(|| format!("reading {}'s allowances", token.symbol))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bar that decides whether a token gets approved at startup has to sit
+    /// above anything a position could ever reach and below what `--approve`
+    /// actually grants. Too high and every start re-approves for ever; too low
+    /// and an allowance that a real trade runs through passes for unlimited.
+    #[test]
+    fn the_unlimited_bar_sits_between_a_real_size_and_a_real_approval() {
+        let bar = effectively_unlimited();
+
+        // What the approval this bot sends actually sets.
+        let permit2_max = (U256::one() << 160) - 1;
+        assert!(permit2_max > bar, "a full Permit2 approval must clear the bar");
+        assert!(U256::MAX > bar, "a full ERC20 approval must clear the bar");
+
+        // A billion tokens at 18 decimals - orders of magnitude past anything
+        // these routes trade, and still nowhere near the bar.
+        let absurd = U256::from(10u64).pow(U256::from(27u64));
+        assert!(absurd < bar, "no position this bot can build may reach the bar");
+
+        // And an approval sized for a trade, however generously, must NOT pass
+        // for unlimited: a million tokens at 18 decimals is still a ceiling,
+        // and startup has to replace it rather than accept it.
+        let generous = U256::from(10u64).pow(U256::from(24u64));
+        assert!(generous < bar, "a trade-sized allowance must not read as unlimited");
+    }
 }

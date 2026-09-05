@@ -83,6 +83,9 @@ One-time, two transactions: the ERC-20 approves Permit2, and Permit2 approves
 the router. Needed once per token you spend - including a token you intend to
 sell. Without `--execute` it only prints them.
 
+Running the bot with `--execute` does this by itself for every armed route, so
+this command is only needed for the manual ones (`--swap`, `--sell-all`).
+
 Running the bot:
 
 ```bash
@@ -95,6 +98,13 @@ buy. Add `--execute` to trade for real:
 ```bash
 ./target/release/trading-mm-fall --execute
 ```
+
+Arming a route checks both tokens it touches - the one it spends and the one it
+sells back down - and, with `--execute`, approves either of them that is not
+already approved without limit. That happens at startup, before the first log
+arrives, and costs two transactions once per token. Without `--execute` it
+prints those transactions and carries on, because a dry run has no trade to fail
+at later.
 
 `--config path/to/other.toml` points any command at a different config.
 
@@ -208,12 +218,13 @@ leaves the previous state rather than half of the new one.
   the signal - price, liquidity and the fee it actually charged; any other hop
   on the route from the last calibration snapshot. What calibration measures on
   top of that is only a check: an unmeasured route is not bought, one keeping
-  over 25% of a swap is refused. Nor is the wallet balance read from the chain
+  over 5% of a swap is refused. Nor is the wallet balance read from the chain
   per buy: it is read once at startup and kept as a running total from there,
   debited the moment a buy is decided and credited back if it never lands -
   accurate because nothing but this bot spends from the wallet while it runs.
-  Allowance is checked once when the route is armed and otherwise relies on the
-  unlimited approval `--approve` sets up. Selling and every manual command
+  Allowance is settled once when the route is armed - approved without limit
+  then if it is not already - and every buy after that relies on it. Selling and
+  every manual command
   (`--swap`, `--sell-all`, `--quote`) still ask the router when the model cannot
   answer, which is slower but proves the trade first.
 - `cooldown_secs = 0` buys on every signal, so a dip lasting ten blocks buys ten
