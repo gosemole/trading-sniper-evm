@@ -484,9 +484,9 @@ fn scan_word(word: U256, bit: i32, up: bool, first: bool) -> Option<u32> {
 /// exists for. A window scanned wide enough still contains both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TickWindow {
-    /// Sqrt prices of the initialized ticks found, ascending. Every one of them
-    /// is a place liquidity changes; between any two it does not.
-    edges: Vec<f64>,
+    /// The initialized ticks found, ascending. Every one of them is a place
+    /// liquidity changes; between any two it does not.
+    edges: Vec<Edge>,
     /// What the scan actually covered. Outside this the list means nothing: a
     /// stretch with no edges INSIDE the window is a fact, the same stretch
     /// outside it is merely unread, and the two must never be confused.
@@ -496,6 +496,29 @@ pub struct TickWindow {
     /// which case `crosses` can never come back unread however far the price
     /// travels. True for any ordinary spacing on a batched pool.
     whole: bool,
+    /// Prices between which EVERY edge's `liquidityNet` is known, so a walk
+    /// inside them can be run without touching the chain.
+    ///
+    /// Narrower than `lo`..`hi`, which only says where the ticks are. Knowing
+    /// where they are is one storage word per 256 of them; knowing what
+    /// crossing one does is a word EACH, and a dense pool has hundreds the walk
+    /// will never reach. So the ladder is read near the price and the bitmap
+    /// everywhere - two questions with two different costs and two different
+    /// answers.
+    ///
+    /// An empty range (`INFINITY`..`NEG_INFINITY`) means no ladder at all, and
+    /// every comparison against it fails, which is the answer wanted.
+    ladder_lo: f64,
+    ladder_hi: f64,
+}
+
+/// One initialized tick as the scan found it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Edge {
+    sqrt: f64,
+    /// `None` for a tick outside the ladder: the scan knows it is there, not
+    /// what crossing it does.
+    net: Option<i128>,
 }
 
 impl TickWindow {
@@ -520,8 +543,50 @@ impl TickWindow {
         }
         // First edge at or above the bottom of the move; it is crossed when it
         // also sits at or below the top.
-        let i = self.edges.partition_point(|e| *e < lo);
-        Some(self.edges.get(i).is_some_and(|e| *e <= hi))
+        let i = self.edges.partition_point(|e| e.sqrt < lo);
+        Some(self.edges.get(i).is_some_and(|e| e.sqrt <= hi))
+    }
+
+    /// The ticks a move from `from` to `to` crosses, ready for
+    /// `pay_to_move_along` - or `None` when the ladder does not reach that far.
+    ///
+    /// `None` is the whole point. Inside the walk, a truncated ladder handed
+    /// over as if it were complete reads as "no further tick changes
+    /// liquidity": a confident wrong answer rather than an absent one. So the
+    /// range is checked against what was actually read, and anything outside
+    /// it sends the caller to the chain instead.
+    ///
+    /// The ends are treated exactly as `TickReader::next_initialized` treats
+    /// them, because the two must select the same ticks: going up the starting
+    /// price is exclusive, going down it is inclusive. A walk that included one
+    /// tick the chain-read walk skipped would change `L` a segment early and
+    /// quietly price everything after it differently.
+    pub fn rungs_towards(&self, from: f64, to: f64) -> Option<Vec<Rung>> {
+        if !from.is_finite() || !to.is_finite() {
+            return None;
+        }
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        if lo < self.ladder_lo || hi > self.ladder_hi {
+            return None;
+        }
+        let up = to > from;
+        let selected = self.edges.iter().filter(|e| match up {
+            true => e.sqrt > from && e.sqrt < to,
+            false => e.sqrt <= from && e.sqrt > to,
+        });
+        // Collected through `Option` so a gap in the ladder comes back as "ask
+        // the chain" rather than as a walk with a tick silently missing.
+        let mut rungs: Vec<Rung> = match up {
+            true => selected
+                .map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net }))
+                .collect::<Option<_>>()?,
+            false => selected
+                .rev()
+                .map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net }))
+                .collect::<Option<_>>()?,
+        };
+        rungs.shrink_to_fit();
+        Some(rungs)
     }
 
     /// The sqrt prices the scan covered, for logs and tests.
@@ -534,12 +599,24 @@ impl TickWindow {
         self.edges.len()
     }
 
+    /// How many of those the scan also read the liquidity change of.
+    pub fn ladder(&self) -> usize {
+        self.edges.iter().filter(|e| e.net.is_some()).count()
+    }
+
     /// Whether the scan read the pool end to end. For logs: a window that did
     /// can never be escaped by a price move, however violent.
     pub fn whole(&self) -> bool {
         self.whole
     }
 }
+
+/// Initialized ticks on each side of the price whose `liquidityNet` is read.
+///
+/// A walk of the sizes this bot trades crosses a handful; this is generous past
+/// that and still one batched request. Beyond it the scan knows where the ticks
+/// are but not what they do, and a walk that reaches there asks the chain.
+const LADDER_TICKS: usize = 32;
 
 /// The furthest tick either protocol allows. A pool cannot have an initialized
 /// tick beyond it, so a scan reaching this far on both sides has read the pool
@@ -632,7 +709,9 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
         }
     };
 
-    let mut edges = Vec::new();
+    // Words ascend and bits within them ascend, and `sqrt_at_tick` rises with
+    // the tick, so this comes out sorted without sorting it.
+    let mut found: Vec<(i32, f64)> = Vec::new();
     for (w, word) in positions.iter().copied().zip(raw) {
         for bit in 0..256u32 {
             if !word.bit(bit as usize) {
@@ -644,14 +723,73 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
             if !(-MAX_TICK..=MAX_TICK).contains(&tick) {
                 continue;
             }
-            edges.push(sqrt_at_tick(tick as i32));
+            found.push((tick as i32, sqrt_at_tick(tick as i32)));
         }
     }
 
-    // Words ascend and bits within them ascend, and `sqrt_at_tick` rises with
-    // the tick, so this comes out sorted without sorting it.
+    // Now what crossing them does, but only near the price. A walk reaches a
+    // handful of ticks; a pool can have hundreds, and each one costs its own
+    // storage word rather than sharing a bitmap word with 255 others.
+    //
+    // Only when the reads can be batched. Unbatched this would be one
+    // `eth_call` per tick, which is the flood this whole scan is written to
+    // avoid - so a v3 pool keeps the bitmap and loses the ladder, and a walk
+    // through it goes to the chain as it always did.
+    let pivot = found.partition_point(|(_, s)| *s < sqrt_p);
+    let (first, last) = match batched {
+        true => (
+            pivot.saturating_sub(LADDER_TICKS),
+            (pivot + LADDER_TICKS).min(found.len()),
+        ),
+        false => (0, 0),
+    };
+    if first < last {
+        let slots: Vec<U256> =
+            found[first..last].iter().filter_map(|(t, _)| reader.tick_slot(*t)).collect();
+        reader.prefetch(&slots).await;
+    }
+    let mut nets = Vec::with_capacity(last.saturating_sub(first));
+    for (tick, _) in &found[first..last] {
+        // A tick whose word did not come back leaves a hole, and a hole makes
+        // `rungs_towards` refuse rather than walk past it.
+        nets.push(reader.liquidity_net(*tick).await.ok());
+    }
+
     let (lo, hi) = word_span(centre, words, spacing);
-    Ok(TickWindow { edges, lo, hi, whole: covers_whole_range(words, spacing) })
+    let edges: Vec<Edge> = found
+        .iter()
+        .enumerate()
+        .map(|(i, (_, sqrt))| Edge {
+            sqrt: *sqrt,
+            net: (i >= first && i < last).then(|| nets[i - first]).flatten(),
+        })
+        .collect();
+
+    // What the ladder really covers. Reading out to the edge of the window on a
+    // side means there is nothing further to cross on it, so the ladder can be
+    // said to reach the window's own bound; stopping short means it cannot.
+    let (ladder_lo, ladder_hi) = match (first < last, found.is_empty() && batched) {
+        (true, _) => (
+            if first == 0 { lo } else { found[first].1 },
+            if last == found.len() { hi } else { found[last - 1].1 },
+        ),
+        // No ticks anywhere in the window: nothing to cross, so any walk inside
+        // it is exact with an empty ladder.
+        (false, true) => (lo, hi),
+        // No ladder. An empty range, so every check against it fails - which is
+        // the answer wanted, and safer than a NaN, against which every
+        // comparison is false and every check would pass.
+        (false, false) => (f64::INFINITY, f64::NEG_INFINITY),
+    };
+
+    Ok(TickWindow {
+        edges,
+        lo,
+        hi,
+        whole: covers_whole_range(words, spacing),
+        ladder_lo,
+        ladder_hi,
+    })
 }
 
 /// What a swap yields while it stays inside the current tick range, where
@@ -734,30 +872,107 @@ pub async fn pay_to_move(
     anyhow::ensure!(sqrt_p_now > 0.0, "sqrt price must be > 0");
     anyhow::ensure!(lp_fee_pips < 1_000_000, "fee must be < 100%");
 
+    let target = move_target(sqrt_p_now, base_token, move_pct);
+    let rungs = rungs_towards(reader, sqrt_p_now, target).await?;
+    pay_to_move_along(sqrt_p_now, liquidity_now, base_token, move_pct, lp_fee_pips, &rungs)
+}
+
+/// Where a `move_pct` move of the base token's price ends, as a sqrt price.
+///
+/// Buying the base pushes the RAW price up when the base is token0 and down
+/// when it is token1, which is the only thing `base_token` decides here.
+pub fn move_target(sqrt_p_now: f64, base_token: u8, move_pct: f64) -> f64 {
     let k = (1.0 + move_pct / 100.0).sqrt();
-    // Buying the base pushes the RAW price up when base is token0, down when
-    // base is token1.
+    match base_token == 0 {
+        true => sqrt_p_now * k,
+        false => sqrt_p_now / k,
+    }
+}
+
+/// The initialized ticks between two prices, in the order a walk meets them.
+///
+/// Stops before the target: a tick sitting exactly at it is not crossed, and
+/// the walk clamps there anyway.
+async fn rungs_towards(
+    reader: &TickReader<'_>,
+    sqrt_from: f64,
+    sqrt_to: f64,
+) -> Result<Vec<Rung>> {
+    let up = sqrt_to > sqrt_from;
+    let mut tick = tick_at_sqrt(sqrt_from);
+    let mut out = Vec::new();
+    // The bound is generous: a 100% move at spacing 1 is ~6900 ticks, and
+    // initialized ticks are far sparser.
+    for _ in 0..1_000 {
+        let Some(t) = reader.next_initialized(tick, up, MAX_BITMAP_WORDS).await? else {
+            break;
+        };
+        let sqrt = sqrt_at_tick(t);
+        let past = if up { sqrt >= sqrt_to } else { sqrt <= sqrt_to };
+        if past {
+            break;
+        }
+        out.push(Rung { sqrt, net: reader.liquidity_net(t).await? });
+        tick = if up { t } else { t - 1 };
+    }
+    Ok(out)
+}
+
+/// One initialized tick as a walk meets it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rung {
+    /// Sqrt price of the tick.
+    pub sqrt: f64,
+    /// `liquidityNet`: added to `L` on crossing upward, subtracted going down.
+    pub net: i128,
+}
+
+/// Cost to move the price, given the ladder of ticks the move crosses.
+///
+/// The arithmetic lives here and ONLY here. `pay_to_move` reads its ladder off
+/// the chain and calls this; the cached ladder in `TickWindow` produces the
+/// same shape and calls this. Two implementations of a walk that decide what a
+/// trade is worth would be two chances to disagree, and the one that disagreed
+/// silently would be the one nobody checked.
+///
+/// `rungs` are in the order the walk meets them, nearest first, and may stop
+/// short: running out means no further tick changes liquidity, and the rest of
+/// the move happens at constant `L`. A CACHED ladder therefore must not be
+/// handed over truncated - see `TickWindow::rungs_towards`, which refuses
+/// rather than let "we did not read that far" pass for "there is nothing
+/// there".
+pub fn pay_to_move_along(
+    sqrt_p_now: f64,
+    liquidity_now: u128,
+    base_token: u8,
+    move_pct: f64,
+    lp_fee_pips: u32,
+    rungs: &[Rung],
+) -> Result<f64> {
+    anyhow::ensure!(move_pct > 0.0, "move_pct must be > 0, got {move_pct}");
+    anyhow::ensure!(sqrt_p_now > 0.0, "sqrt price must be > 0");
+    anyhow::ensure!(lp_fee_pips < 1_000_000, "fee must be < 100%");
+
     let up = base_token == 0;
-    let sqrt_target = if up { sqrt_p_now * k } else { sqrt_p_now / k };
+    let sqrt_target = move_target(sqrt_p_now, base_token, move_pct);
 
     let mut sqrt_cur = sqrt_p_now;
     let mut liquidity = liquidity_now as f64;
     let mut paid = 0.0f64;
-    let mut tick = tick_at_sqrt(sqrt_cur);
+    let mut ladder = rungs.iter();
 
-    // Each iteration covers one tick segment. The bound is generous: a 100%
-    // move at spacing 1 is ~6900 ticks, and initialized ticks are far sparser.
-    for _ in 0..1_000 {
+    // Each iteration covers one tick segment, and every one of them either
+    // consumes a rung or reaches the target, so this cannot run away.
+    loop {
         let done = if up { sqrt_cur >= sqrt_target } else { sqrt_cur <= sqrt_target };
         if done {
             break;
         }
-        let next = reader.next_initialized(tick, up, MAX_BITMAP_WORDS).await?;
+        let next = ladder.next();
         // Price of the next initialized tick, clamped to the target.
         let sqrt_edge = match next {
-            Some(t) => {
-                let s = sqrt_at_tick(t);
-                if up { s.min(sqrt_target) } else { s.max(sqrt_target) }
+            Some(r) => {
+                if up { r.sqrt.min(sqrt_target) } else { r.sqrt.max(sqrt_target) }
             }
             None => sqrt_target,
         };
@@ -776,10 +991,8 @@ pub async fn pay_to_move(
             break;
         }
         // Cross the tick: L changes, and the walk continues on the far side.
-        let t = next.context("no initialized tick but target not reached")?;
-        let net = reader.liquidity_net(t).await? as f64;
+        let net = next.map(|r| r.net).unwrap_or(0) as f64;
         liquidity = (if up { liquidity + net } else { liquidity - net }).max(0.0);
-        tick = if up { t } else { t - 1 };
     }
 
     // The pool fee is charged on the input, so the amount actually sent is
@@ -1089,12 +1302,33 @@ mod tests_in_range {
 mod tests {
     use super::*;
 
+    /// A window whose ticks are known but whose ladder is not: what a scan of
+    /// a pool with no batching, or of ticks too far from the price, comes back
+    /// with.
     fn window(ticks: &[i32], lo: i32, hi: i32) -> TickWindow {
         TickWindow {
-            edges: ticks.iter().map(|t| sqrt_at_tick(*t)).collect(),
+            edges: ticks.iter().map(|t| Edge { sqrt: sqrt_at_tick(*t), net: None }).collect(),
             lo: sqrt_at_tick(lo),
             hi: sqrt_at_tick(hi),
             whole: false,
+            ladder_lo: f64::INFINITY,
+            ladder_hi: f64::NEG_INFINITY,
+        }
+    }
+
+    /// The same, with every tick's liquidity change read - a fully laddered
+    /// window, which is what an ordinary v4 pool produces near its price.
+    fn laddered(ticks: &[(i32, i128)], lo: i32, hi: i32) -> TickWindow {
+        TickWindow {
+            edges: ticks
+                .iter()
+                .map(|(t, n)| Edge { sqrt: sqrt_at_tick(*t), net: Some(*n) })
+                .collect(),
+            lo: sqrt_at_tick(lo),
+            hi: sqrt_at_tick(hi),
+            whole: false,
+            ladder_lo: sqrt_at_tick(lo),
+            ladder_hi: sqrt_at_tick(hi),
         }
     }
 
@@ -1115,6 +1349,93 @@ mod tests {
         assert_eq!(w.crosses(sqrt_at_tick(-9000), sqrt_at_tick(0)), None);
         // A window that found nothing at all still answers inside its span.
         assert_eq!(window(&[], -6000, 6000).crosses(sqrt_at_tick(0), sqrt_at_tick(100)), Some(false));
+    }
+
+    /// The cached ladder and the chain-read walk must select the same ticks,
+    /// including at the ends: going up the starting price is exclusive, going
+    /// down it is inclusive, exactly as `next_initialized` has it. One extra
+    /// tick would change `L` a segment early and reprice everything after it.
+    #[test]
+    fn the_ladder_picks_the_same_ticks_the_chain_walk_would() {
+        let w = laddered(&[(-600, 5), (0, 7), (600, -3)], -6000, 6000);
+        let at = |t: i32| sqrt_at_tick(t);
+
+        // Up from a tick sitting exactly on an edge: that edge is behind us.
+        let up = w.rungs_towards(at(0), at(1200)).unwrap();
+        assert_eq!(up, vec![Rung { sqrt: at(600), net: -3 }]);
+
+        // Down from the same place: that edge is still to be crossed.
+        let down = w.rungs_towards(at(0), at(-1200)).unwrap();
+        assert_eq!(
+            down,
+            vec![Rung { sqrt: at(0), net: 7 }, Rung { sqrt: at(-600), net: 5 }],
+            "going down includes the tick the price is standing on"
+        );
+
+        // A move that reaches nothing carries nothing.
+        assert_eq!(w.rungs_towards(at(10), at(500)).unwrap(), vec![]);
+    }
+
+    /// A ladder that does not reach must say so rather than come back short:
+    /// inside the walk, a missing rung is indistinguishable from "there is no
+    /// further tick", which prices the rest of the move at the wrong liquidity.
+    #[test]
+    fn a_ladder_that_does_not_reach_refuses() {
+        // Ticks known, liquidity changes not - an unbatched pool, or ticks
+        // beyond the ladder's reach.
+        let bare = window(&[-600, 600], -6000, 6000);
+        assert!(bare.crosses(at_zero(), sqrt_at_tick(1200)).is_some(), "positions are known");
+        assert!(bare.rungs_towards(at_zero(), sqrt_at_tick(1200)).is_none(), "but not their effect");
+
+        // Laddered, but asked about a price outside what was read.
+        let w = laddered(&[(0, 7)], -600, 600);
+        assert!(w.rungs_towards(at_zero(), sqrt_at_tick(6000)).is_none());
+        assert!(w.rungs_towards(at_zero(), sqrt_at_tick(300)).is_some());
+    }
+
+    fn at_zero() -> f64 {
+        sqrt_at_tick(0)
+    }
+
+    /// The cached walk and the chain-read walk are the same arithmetic over the
+    /// same ticks, so feeding one the other's ladder must give the identical
+    /// number - not merely a close one.
+    #[test]
+    fn the_local_walk_is_the_walk() {
+        let w = laddered(&[(-600, 400_000), (600, -400_000)], -6000, 6000);
+        let sqrt_p = sqrt_at_tick(0);
+        let liquidity = 1_000_000u128;
+
+        for base in [0u8, 1] {
+            let target = move_target(sqrt_p, base, 5.0);
+            let rungs = w.rungs_towards(sqrt_p, target).expect("inside the ladder");
+            let local = pay_to_move_along(sqrt_p, liquidity, base, 5.0, 3000, &rungs).unwrap();
+
+            // The same ladder handed over directly is the same walk; what this
+            // pins is that the ladder EXTRACTION did not drop or add a tick.
+            let by_hand: Vec<Rung> = match base == 0 {
+                true => vec![Rung { sqrt: sqrt_at_tick(600), net: -400_000 }],
+                false => vec![Rung { sqrt: sqrt_at_tick(-600), net: 400_000 }],
+            };
+            let expect = pay_to_move_along(sqrt_p, liquidity, base, 5.0, 3000, &by_hand).unwrap();
+            assert_eq!(local, expect, "base {base}");
+            assert!(local > 0.0);
+        }
+    }
+
+    /// Crossing a tick has to change what the move costs, or the ladder is
+    /// being read and then ignored.
+    #[test]
+    fn the_ladder_actually_moves_the_answer() {
+        let sqrt_p = sqrt_at_tick(0);
+        let l = 1_000_000u128;
+        // Liquidity that halves just above the price.
+        let thinner = vec![Rung { sqrt: sqrt_at_tick(200), net: -500_000 }];
+        let flat: Vec<Rung> = vec![];
+
+        let with = pay_to_move_along(sqrt_p, l, 0, 5.0, 3000, &thinner).unwrap();
+        let without = pay_to_move_along(sqrt_p, l, 0, 5.0, 3000, &flat).unwrap();
+        assert!(with < without, "thinner beyond the tick must cost less to move: {with} vs {without}");
     }
 
     #[test]

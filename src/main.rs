@@ -75,10 +75,11 @@ async fn main() -> anyhow::Result<()> {
     let http = ethers::providers::Provider::<ethers::providers::Http>::try_from(
         cfg.http_url.clone(),
     )?;
-    match http.get_chainid().await {
-        Ok(id) => tracing::info!(chain_id = %id, "connected via http"),
-        Err(e) => tracing::warn!(err = %e, "http check failed (continuing with ws)"),
-    }
+    // Asked once and kept. This used to be two calls - a warning here and a
+    // fatal one inside `Executor::build` - so a moment of rate limiting at the
+    // very first request killed the process over a number it had already asked
+    // for, and asked for twice.
+    let chain_id = chain_id(&http).await?;
 
     if check_routes {
         return check_all_routes(&http, &cfg).await;
@@ -106,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         &http,
         &cfg,
         pool_manager(&cfg)?,
-        http.get_chainid().await?.as_u64(),
+        chain_id,
         execute,
     )
     .await
@@ -207,6 +208,42 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The chain id, with a few tries before giving up.
+///
+/// A trading process must not refuse to start because one request was rate
+/// limited or landed on a cold endpoint. The answer here is a constant: it will
+/// be the same number in two seconds as it is now, so waiting for it costs
+/// nothing and dying on it costs the whole session - which is exactly what
+/// happened when `fullnode request limit exceeded` came back on the first
+/// request of a restart.
+async fn chain_id(
+    http: &ethers::providers::Provider<ethers::providers::Http>,
+) -> anyhow::Result<u64> {
+    const TRIES: u32 = 5;
+    let mut wait = std::time::Duration::from_secs(2);
+    let mut last = String::new();
+    for attempt in 1..=TRIES {
+        match http.get_chainid().await {
+            Ok(id) => {
+                tracing::info!(chain_id = %id, attempt, "connected via http");
+                return Ok(id.as_u64());
+            }
+            Err(e) => {
+                last = e.to_string();
+                tracing::warn!(
+                    err = %last, attempt, of = TRIES, retry_in_s = wait.as_secs(),
+                    "the http endpoint would not answer"
+                );
+                if attempt < TRIES {
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+    }
+    anyhow::bail!("the http endpoint would not answer eth_chainId after {TRIES} tries: {last}")
 }
 
 /// Resolve every configured route and print what was recovered, without

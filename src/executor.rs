@@ -210,6 +210,15 @@ struct Entry {
 /// afterwards, so this is far shorter than the calibration interval.
 const TICK_WINDOW_REFRESH: Duration = Duration::from_secs(30);
 
+/// How long to leave startup alone before the first scan. Long enough for the
+/// routes, the approvals, the gas measurement and the first calibration pass to
+/// be done with the endpoint.
+const TICK_WINDOW_FIRST: Duration = Duration::from_secs(10);
+
+/// Pause between pools inside one pass, so a pass is a trickle rather than a
+/// burst. A request limit counts bursts.
+const TICK_WINDOW_GAP: Duration = Duration::from_secs(1);
+
 /// How old a window may be before it stops being believed. Three missed
 /// refreshes.
 ///
@@ -236,6 +245,18 @@ impl TickBook {
     /// `None` is "nothing on file", never "no". The caller falls back to the
     /// percentage on it, and reading it as "no" would trust the model on
     /// exactly the pools nothing is known about.
+    /// The ticks a move through this pool would cross, ready to be walked
+    /// without touching the chain - or `None` when nothing on file reaches that
+    /// far.
+    async fn rungs(&self, key: PoolRef, from: f64, to: f64) -> Option<Vec<crate::depth::Rung>> {
+        let book = self.inner.lock().await;
+        let entry = book.get(&key)?;
+        if entry.at.elapsed() > TICK_WINDOW_STALE_AFTER {
+            return None;
+        }
+        entry.window.as_ref()?.rungs_towards(from, to)
+    }
+
     async fn crosses(&self, key: PoolRef, from: f64, to: f64) -> Option<bool> {
         let book = self.inner.lock().await;
         let entry = book.get(&key)?;
@@ -626,6 +647,13 @@ impl Executor {
     fn watch_ticks(self: &Arc<Self>) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
+            // Startup is already the busiest moment this process has: routes
+            // resolving, approvals, gas measured, the first calibration pass
+            // walking every hop's ticks, balances read. Piling a full window
+            // scan on top of all of it is what turns a rate limit from a
+            // background annoyance into a process that cannot start. Nothing
+            // trades in the first few seconds anyway.
+            tokio::time::sleep(TICK_WINDOW_FIRST).await;
             loop {
                 // Every hop of every armed route, deduplicated: one pool shared
                 // by two routes is one window, and a route and its reverse are
@@ -633,9 +661,14 @@ impl Executor {
                 let mut done = std::collections::HashSet::new();
                 for plan in me.plans.values() {
                     for hop in &plan.route.hops {
-                        if done.insert(hop.pool_ref()) {
-                            me.refresh_window(hop).await;
+                        if !done.insert(hop.pool_ref()) {
+                            continue;
                         }
+                        me.refresh_window(hop).await;
+                        // Spread over the interval instead of arriving as one
+                        // burst. Nothing is waiting on these, and a burst is
+                        // what a request limit counts.
+                        tokio::time::sleep(TICK_WINDOW_GAP).await;
                     }
                 }
                 tokio::time::sleep(TICK_WINDOW_REFRESH).await;
@@ -679,6 +712,10 @@ impl Executor {
                 tracing::debug!(
                     pool = %key,
                     edges = w.edges(),
+                    // Of those, how many the scan also read the liquidity
+                    // change of - which is what decides whether a depth report
+                    // costs requests or costs nothing.
+                    ladder = w.ladder(),
                     // True means no price move can ever put this pool back on
                     // the percentage: the scan read every tick it could have.
                     whole_range = w.whole(),
@@ -777,6 +814,22 @@ impl Executor {
             );
         }
         Ok(())
+    }
+
+    /// The ticks a move through this pool crosses, from what the background
+    /// scan already read - so a caller can walk them locally instead of asking
+    /// the chain for what is sitting in memory.
+    ///
+    /// `None` means nothing usable is on file and the caller should read for
+    /// itself. It never means "nothing to cross": see
+    /// `depth::TickWindow::rungs_towards`, where that distinction is kept.
+    pub async fn rungs_towards(
+        &self,
+        key: PoolRef,
+        from: f64,
+        to: f64,
+    ) -> Option<Vec<crate::depth::Rung>> {
+        self.ticks.rungs(key, from, to).await
     }
 
     /// The address everything is signed and settled from.

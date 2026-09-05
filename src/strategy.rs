@@ -683,7 +683,12 @@ impl Strategy {
         }
 
         let http = self.http.clone();
-        tokio::spawn(async move { report_depth(&pool, &http, &sig, max_move).await });
+        // Handed the executor so the walk can come out of the ladder the
+        // background scan already read, instead of reading the same ticks again
+        // per signal - which is several requests each, arriving in a burst,
+        // during exactly the dip the buy is competing for the budget in.
+        let exec = self.exec.clone();
+        tokio::spawn(async move { report_depth(&pool, &http, exec, &sig, max_move).await });
     }
 
     /// The chain has answered. Everything that was set aside is now either real
@@ -1000,37 +1005,68 @@ fn emit_signal(pool: &Pool, sig: &Signal) {
 ///
 /// The two differ a lot on thin pools: the in-range figure assumes the whole
 /// move happens at the current liquidity and ignores the swap fee entirely.
-async fn report_depth(pool: &Pool, http: &Provider<Http>, sig: &Signal, max_move_pct: f64) {
+async fn report_depth(
+    pool: &Pool,
+    http: &Provider<Http>,
+    exec: Option<Arc<Executor>>,
+    sig: &Signal,
+    max_move_pct: f64,
+) {
     let unit = pool.quote_symbol.clone().unwrap_or_else(|| "quote".into());
     let scale = 10f64.powi(pool.quote_decimals() as i32);
     let sqrt_p = crate::pool::sqrt_to_f64(sig.sqrt);
+    let fee = sig.lp_fee.or(pool.lp_fee).unwrap_or(0);
 
     let mut pay = None;
     let mut method = "none";
-    if let (Some(spacing), Some(source)) = (pool.tick_spacing, pool.tick_source()) {
-        match crate::depth::TickReader::new(http, source, spacing) {
-            Ok(reader) => {
-                let fee = sig.lp_fee.or(pool.lp_fee).unwrap_or(0);
-                match crate::depth::pay_to_move(
-                    &reader, sqrt_p, sig.liquidity, pool.base_token, max_move_pct, fee,
-                )
-                .await
-                {
-                    Ok(v) => {
-                        pay = Some(v);
-                        method = "ticks";
-                    }
-                    Err(e) => warn!(
-                        // The whole chain, not just the outermost context:
-                        // `{e}` on an anyhow error prints "eth_getStorageAt"
-                        // and drops the sentence that says what went wrong
-                        // with it, which is the only part worth reading.
-                        pool = %pool.name, err = %format!("{e:#}"),
-                        "tick walk failed, falling back to in-range estimate"
-                    ),
+
+    // Everything this needs, the signal and the background scan already have
+    // between them: the price, the liquidity and the fee came in the log that
+    // raised the signal, and where the ticks are and what crossing them does
+    // was read on a timer. So the ordinary case is arithmetic, not a request.
+    if let Some(exec) = &exec {
+        let target = crate::depth::move_target(sqrt_p, pool.base_token, max_move_pct);
+        if let Some(rungs) = exec.rungs_towards(pool.pool_ref(), sqrt_p, target).await {
+            match crate::depth::pay_to_move_along(
+                sqrt_p, sig.liquidity, pool.base_token, max_move_pct, fee, &rungs,
+            ) {
+                Ok(v) => {
+                    pay = Some(v);
+                    method = "ticks (cached)";
                 }
+                Err(e) => warn!(
+                    pool = %pool.name, err = %format!("{e:#}"),
+                    "cached tick walk failed, reading the chain instead"
+                ),
             }
-            Err(e) => warn!(pool = %pool.name, err = %format!("{e:#}"), "bad tick spacing"),
+        }
+    }
+
+    if pay.is_none() {
+        if let (Some(spacing), Some(source)) = (pool.tick_spacing, pool.tick_source()) {
+            match crate::depth::TickReader::new(http, source, spacing) {
+                Ok(reader) => {
+                    match crate::depth::pay_to_move(
+                        &reader, sqrt_p, sig.liquidity, pool.base_token, max_move_pct, fee,
+                    )
+                    .await
+                    {
+                        Ok(v) => {
+                            pay = Some(v);
+                            method = "ticks";
+                        }
+                        Err(e) => warn!(
+                            // The whole chain, not just the outermost context:
+                            // `{e}` on an anyhow error prints "eth_getStorageAt"
+                            // and drops the sentence that says what went wrong
+                            // with it, which is the only part worth reading.
+                            pool = %pool.name, err = %format!("{e:#}"),
+                            "tick walk failed, falling back to in-range estimate"
+                        ),
+                    }
+                }
+                Err(e) => warn!(pool = %pool.name, err = %format!("{e:#}"), "bad tick spacing"),
+            }
         }
     }
     if pay.is_none() {
