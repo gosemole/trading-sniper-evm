@@ -167,6 +167,14 @@ Per route:
 | `take_profit_pct` | sell the whole position once it is worth this much more than it cost, **net of both fees, the hook and impact** |
 | `exit_after_secs` | sell it anyway once held this long since the last buy |
 
+Spelling out `token0`, `token1`, `fee`, `tick_spacing` and `hooks` for a v4 pool
+does more than save a lookup: the key is filed under its own hash and used
+everywhere, **routes included**. That is the only way to trade a pool created
+further back than the endpoint keeps logs, since a route recovers a PoolKey from
+the `Initialize` log and there is none to be had. A pool that also declares a
+`pool_id` is checked against the one its fields hash to, and refused if they
+disagree.
+
 Per pool: `name`, `version`, `pool_id`, and optionally `base_token`,
 `threshold_pct`, `max_move_pct`. `address` is required for a v3 pool - that is
 what a v3 pool is - and omitted for a v4 one, which takes the global

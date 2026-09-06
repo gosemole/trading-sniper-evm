@@ -446,7 +446,12 @@ pub fn pool_id_from_key(
     H256::from_slice(&keccak256(&buf))
 }
 
-fn derive_pool_id(cfg: &PoolConfig, tokens: &HashMap<String, String>) -> Result<H256> {
+/// The full PoolKey a `[[pools]]` entry spells out, when it spells out all of
+/// it. Currencies come back in the sorted order a PoolKey stores them in.
+fn key_from_config(
+    cfg: &PoolConfig,
+    tokens: &HashMap<String, String>,
+) -> Result<crate::cache::PoolKey> {
     let t0 = resolve_token(tokens, cfg.token0.as_deref().context("v4 missing token0")?)?;
     let t1 = resolve_token(tokens, cfg.token1.as_deref().context("v4 missing token1")?)?;
     let hooks: Address = cfg
@@ -454,21 +459,77 @@ fn derive_pool_id(cfg: &PoolConfig, tokens: &HashMap<String, String>) -> Result<
         .as_deref()
         .unwrap_or("0x0000000000000000000000000000000000000000")
         .parse()?;
+    let (currency0, currency1) = sorted(t0, t1);
+    Ok(crate::cache::PoolKey {
+        currency0,
+        currency1,
+        fee: cfg.fee.context("v4 missing fee")?,
+        tick_spacing: cfg.tick_spacing.context("v4 missing tick_spacing")?,
+        hooks: Some(hooks),
+    })
+}
+
+fn derive_pool_id(cfg: &PoolConfig, tokens: &HashMap<String, String>) -> Result<H256> {
+    let k = key_from_config(cfg, tokens)?;
     Ok(pool_id_from_key(
-        t0,
-        t1,
-        cfg.fee.context("v4 missing fee")?,
-        cfg.tick_spacing.context("v4 missing tick_spacing")?,
-        hooks,
+        k.currency0,
+        k.currency1,
+        k.fee,
+        k.tick_spacing,
+        k.hooks.unwrap_or_default(),
     ))
 }
 
-/// How far back one `eth_getLogs` reaches. Measured on chain 4663: a window of
-/// ten million blocks is answered, fifty million is not - and the refusal there
-/// is `fullnode unavailable`, which is the backend's retention rather than a
-/// limit on the request. Ten million blocks is about eleven days at this
-/// chain's block time, so a pool created in the last week and a half is found
-/// by the very first query and the whole chain by six.
+/// File the PoolKey of every `[[pools]]` entry that spells one out.
+///
+/// A route names its pools by id alone and recovers each key from the chain -
+/// which is impossible when the pool was created further back than the endpoint
+/// keeps logs. Writing the key into `[[pools]]` used to help only the pool
+/// being WATCHED, because `Route::resolve` never reads that section; this makes
+/// the config a source the routes can use too.
+///
+/// Filing a wrong key is not possible by construction: the id a key is filed
+/// under is the hash OF that key, and every read re-hashes it. A pool that also
+/// declares its `pool_id` is checked against the derived one and skipped when
+/// they disagree - one of the two then describes a different pool, and there is
+/// no way to tell which.
+pub fn seed_cache_from_config(pools: &[PoolConfig], tokens: &HashMap<String, String>) -> usize {
+    let mut seeded = 0;
+    for cfg in pools.iter().filter(|p| p.version == "v4") {
+        let Ok(key) = key_from_config(cfg, tokens) else { continue };
+        let derived = pool_id_from_key(
+            key.currency0,
+            key.currency1,
+            key.fee,
+            key.tick_spacing,
+            key.hooks.unwrap_or_default(),
+        );
+        if let Some(declared) = cfg.pool_id.as_deref().and_then(|s| s.parse::<H256>().ok()) {
+            if declared != derived {
+                tracing::warn!(
+                    pool = %cfg.name, ?declared, ?derived,
+                    "the pool_id and the token0/token1/fee/tick_spacing/hooks written for this \
+                     pool describe DIFFERENT pools - neither is used, fix the config"
+                );
+                continue;
+            }
+        }
+        crate::cache::put_v4_pool(derived, key);
+        seeded += 1;
+    }
+    seeded
+}
+
+/// Where the search starts, in blocks back from the head.
+///
+/// Small, and deliberately: at this chain's block time it is a few hours, and a
+/// pool worth trading was usually created recently - so the ordinary case is
+/// one narrow query rather than one enormous one. It also asks the least of the
+/// endpoint, which matters because the wide queries are the ones it refuses.
+const LOG_WINDOW_FIRST: u64 = 100_000;
+
+/// The widest one query may reach. Ten million blocks is about eleven days
+/// here; the walk doubles its way up to this and then keeps going at it.
 const LOG_WINDOW: u64 = 10_000_000;
 
 /// Where halving stops. A provider that refuses even this is one the walk
@@ -480,12 +541,19 @@ const MIN_LOG_WINDOW: u64 = 10_000;
 /// can turn one pool's resolution into an unbounded loop.
 const MAX_LOG_QUERIES: u32 = 64;
 
-/// Why an `eth_getLogs` was refused, which decides what to do about it.
+/// Why an `eth_getLogs` was refused. Both answers are the same one - ask for
+/// less - and they are kept apart only so the giving-up message can say which
+/// wall was hit.
 enum Refused {
-    /// The range was too wide for this provider. Ask for less.
+    /// The range was too wide for this provider.
     TooWide,
-    /// The node does not keep logs this far back. Asking for less will not
-    /// help; asking again for the same thing will not either.
+    /// The backend that would have served it is not there.
+    ///
+    /// NOT proof that history ends: this endpoint returns it and
+    /// `Block range is too large` interchangeably for the same range, so it is
+    /// really "the thing that serves wide queries is not answering". Treating
+    /// it as final gave up on a pool created forty minutes earlier, on the very
+    /// first query, without ever asking for a range small enough to be served.
     TooOld,
 }
 
@@ -531,15 +599,22 @@ fn classify(msg: &str) -> Option<Refused> {
 /// against one whose history simply does not reach, saying how far it got.
 async fn find_init_log(http: &Provider<Http>, manager: Address, pool_id: H256) -> Result<Log> {
     let head = http.get_block_number().await?.as_u64();
-    let mut window = LOG_WINDOW;
+    // Starts narrow and widens as it walks back, so a pool created today costs
+    // one small query and an old one still gets there. The other way round -
+    // one enormous query first - is what asked this endpoint for exactly the
+    // range it refuses, on every pool, including the recent ones.
+    let mut window = LOG_WINDOW_FIRST;
     let mut to = head;
     let mut queries = 0u32;
+    // Lowered by a refusal, so the walk never grows back into a width this
+    // endpoint has already turned down.
+    let mut ceiling = LOG_WINDOW;
 
     loop {
         anyhow::ensure!(
             queries < MAX_LOG_QUERIES,
             "gave up looking for the Initialize log after {queries} queries; searched back \
-             to block {to} of {head} in windows of {window}"
+             to block {to} of {head}"
         );
         // Inclusive on both ends, so consecutive windows neither overlap nor
         // skip the block between them.
@@ -563,29 +638,36 @@ async fn find_init_log(http: &Provider<Http>, manager: Address, pool_id: H256) -
                      wrong, or the pool belongs to a different PoolManager than {manager:?}"
                 );
                 to = from - 1;
+                // Nothing here, so reach further next time. Doubling keeps a
+                // deep pool to a handful of queries without asking for a wide
+                // range until a narrow one has been tried.
+                window = window.saturating_mul(2).min(LOG_WINDOW);
             }
-            Err(e) => match classify(&e.to_string()) {
-                Some(Refused::TooWide) => {
-                    let narrower = window / 2;
-                    anyhow::ensure!(
-                        narrower >= MIN_LOG_WINDOW,
-                        "this endpoint refuses a log range of even {window} blocks, so the \
-                         Initialize log cannot be reached from here: {e}"
-                    );
-                    tracing::debug!(window, narrower, "log range refused as too wide, narrowing");
-                    window = narrower;
-                }
-                // The floor of what this endpoint keeps. Nothing about asking
-                // differently gets underneath it.
-                Some(Refused::TooOld) => anyhow::bail!(
-                    "this endpoint's log history stops above block {from}, and the pool was \
-                     initialized below it - searched back from {head} without finding it. \
-                     Write the pool's token0/token1/fee/tick_spacing/hooks into [[pools]], or \
-                     point HTTP_URL at an endpoint that keeps more history: {e}"
-                ),
-                None => return Err(anyhow::anyhow!("{e}")).context("eth_getLogs Initialize"),
-            },
+            Err(e) => {
+                let why = classify(&e.to_string());
+                anyhow::ensure!(
+                    why.is_some(),
+                    "eth_getLogs failed for a reason this cannot work around: {e}"
+                );
+                let narrower = window / 2;
+                anyhow::ensure!(
+                    narrower >= MIN_LOG_WINDOW,
+                    "this endpoint would not serve a log range of even {window} blocks around \
+                     {from}..{to}, so the Initialize log cannot be reached from here. Either \
+                     point HTTP_URL at an endpoint that answers wider log queries, or add a \
+                     [[pools]] entry for this pool spelling out token0, token1, fee, \
+                     tick_spacing and hooks: a key written there is filed under its own hash \
+                     and used everywhere, routes included: {e}"
+                );
+                tracing::debug!(window, narrower, from, to, "log query refused, narrowing");
+                window = narrower;
+                // Having been refused once, the walk stops reaching for wide
+                // ranges again: doubling its way back up to the width that was
+                // just turned down would only be refused a second time.
+                ceiling = ceiling.min(narrower);
+            }
         }
+        window = window.min(ceiling);
     }
 }
 
@@ -1040,6 +1122,61 @@ mod tests {
         let forward = derive_pool_id(&a, &t).unwrap();
         std::mem::swap(&mut a.token0, &mut a.token1);
         assert_eq!(derive_pool_id(&a, &t).unwrap(), forward);
+    }
+
+    /// A pool older than the endpoint's log history cannot be recovered from
+    /// the chain at all, and the config is the only way to hand its key over.
+    /// It has to reach the ROUTES too, which read no config section - so it
+    /// goes into the cache, filed under the hash of itself.
+    #[test]
+    fn a_key_written_in_the_config_reaches_the_routes() {
+        let dir = std::env::temp_dir().join(format!("mm-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pools.json");
+        let _ = std::fs::remove_file(&path);
+        crate::cache::open(&path).unwrap();
+
+        let t = registry();
+        let spelled = PoolConfig {
+            name: "CAMELTOE/LULU (v4)".into(),
+            address: None,
+            version: "v4".into(),
+            token0: Some("LULU".into()),
+            token1: Some("CAMELTOE".into()),
+            decimals0: None,
+            decimals1: None,
+            base_token: None,
+            threshold_pct: None,
+            max_move_pct: None,
+            pool_id: None,
+            fee: Some(3000),
+            tick_spacing: Some(60),
+            hooks: None,
+        };
+        assert_eq!(seed_cache_from_config(std::slice::from_ref(&spelled), &t), 1);
+
+        // And it comes back out under its own hash, which is exactly how a
+        // route hop asks for it.
+        let id = derive_pool_id(&spelled, &t).unwrap();
+        let got = crate::cache::v4_pool(id, |k| {
+            pool_id_from_key(k.currency0, k.currency1, k.fee, k.tick_spacing, k.hooks.unwrap_or_default())
+        })
+        .expect("filed under its own hash");
+        assert_eq!(got.fee, 3000);
+        assert_eq!(got.tick_spacing, 60);
+
+        // A pool whose declared id disagrees with its own fields is filed under
+        // neither: one of the two describes a different pool, and nothing says
+        // which.
+        let mut lying = spelled.clone();
+        lying.pool_id = Some(format!("0x{}", "11".repeat(32)));
+        assert_eq!(seed_cache_from_config(std::slice::from_ref(&lying), &t), 0);
+
+        // A pool that spells nothing out is simply not a source.
+        let bare = PoolConfig { fee: None, tick_spacing: None, ..spelled };
+        assert_eq!(seed_cache_from_config(std::slice::from_ref(&bare), &t), 0);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

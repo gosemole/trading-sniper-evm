@@ -76,6 +76,14 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(err = %format!("{e:#}"), "pool cache unusable, ignoring it"),
     }
 
+    // Whatever the config already knows, before anything goes looking for it.
+    // A pool older than the endpoint's log history cannot be recovered from the
+    // chain at all, and this is the only way to hand it over.
+    match pool::seed_cache_from_config(&cfg.pools, &cfg.tokens) {
+        0 => {}
+        n => tracing::info!(pools = n, "PoolKeys taken from the config"),
+    }
+
     // Sanity check via HTTP JSON-RPC before opening WS subscriptions.
     let http = ethers::providers::Provider::<ethers::providers::Http>::try_from(
         cfg.http_url.clone(),
