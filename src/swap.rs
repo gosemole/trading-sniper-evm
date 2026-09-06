@@ -612,6 +612,41 @@ pub struct Landed {
     pub logs: Vec<ethers::types::Log>,
 }
 
+/// Why a transaction reverted, by running it again as a call.
+///
+/// A receipt carries no reason - the chain does not store one - but replaying
+/// the same call against the block it landed in usually reproduces the revert,
+/// and a call's revert comes back with its data. Two requests, only ever on a
+/// revert, and in a task nothing is waiting on.
+///
+/// "Usually", because a call sees the state at the END of that block while the
+/// transaction ran somewhere inside it. So a replay that SUCCEEDS is itself an
+/// answer, and a useful one: whatever it hit was gone by the end of the block,
+/// which for a swap means something else in the same block moved the pool.
+async fn why_reverted(http: &Provider<Http>, hash: H256, at: Option<ethers::types::U64>) -> String {
+    let tx = match http.get_transaction(hash).await {
+        Ok(Some(t)) => t,
+        _ => return "could not read the transaction back to replay it".to_string(),
+    };
+    let Some(to) = tx.to else {
+        return "the transaction created a contract; there is nothing to replay".to_string();
+    };
+    let req = TransactionRequest::new()
+        .from(tx.from)
+        .to(to)
+        .value(tx.value)
+        .data(tx.input.clone());
+    let block = at.map(|n| ethers::types::BlockId::Number(BlockNumber::Number(n)));
+    match http.call(&req.into(), block).await {
+        Ok(_) => "it does not revert when replayed at the end of that block, so what it \
+                  depended on was changed by something else inside the block"
+            .to_string(),
+        // Anything this does not have a name for still prints its selector,
+        // which is enough to look up.
+        Err(e) => crate::execute::explain_revert(&e.to_string()),
+    }
+}
+
 /// Follow a broadcast transaction to its receipt, saying how it ended and
 /// carrying the logs so a caller can read what actually moved.
 pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> Landed {
@@ -667,14 +702,14 @@ pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> La
             }
         }
         Ok(Some(r)) => {
-            // TODO: say WHY. A receipt carries no revert reason, but replaying
-            // the transaction as an `eth_call` at the block it landed in gets
-            // one - and `execute::explain_revert` already turns the bytes into
-            // the router's own error names. Two requests, only on a revert, off
-            // any hot path. Without it a failed buy is a wall: the quote, the
-            // minimum and the size are all in the log above and none of them
+            // Asked here rather than left to the operator: the quote, the
+            // minimum and the size are all in the log above, and none of them
             // says which was wrong.
-            tracing::error!(tx = ?hash, block = ?r.block_number, label, "REVERTED");
+            let why = why_reverted(http, hash, r.block_number).await;
+            tracing::error!(
+                tx = ?hash, block = ?r.block_number, label, why = %why,
+                "REVERTED"
+            );
             Landed {
                 outcome: Outcome::Reverted,
                 logs: r.logs,

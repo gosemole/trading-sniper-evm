@@ -1242,6 +1242,24 @@ mod tests {
         assert!(execute_calldata(&r, huge, U256::one(), U256::zero()).is_err());
     }
 
+    /// The one this deployment actually produces, and the reason a gas probe
+    /// of one wei measures nothing: after fees it reaches the curve as zero.
+    /// Kept as a test because a revert nobody can name is a revert nobody can
+    /// act on, and this is the selector seen most.
+    #[test]
+    fn the_selector_this_chain_keeps_returning_is_named() {
+        let mut data = selector("SwapAmountCannotBeZero()");
+        assert_eq!(format!("0x{}", hex::encode(&data)), "0xbe8b8507");
+        assert!(decode_revert(&data).contains("SwapAmountCannotBeZero"));
+
+        // And it survives the prose a provider wraps it in.
+        data.clear();
+        let said = explain_revert(
+            "(code: 3, message: execution reverted, data: Some(String(\"0xbe8b8507\")))",
+        );
+        assert!(said.contains("SwapAmountCannotBeZero"), "{said}");
+    }
+
     #[test]
     fn the_real_output_is_read_out_of_the_refusal() {
         let mut d = selector("V4TooLittleReceived(uint256,uint256)");
