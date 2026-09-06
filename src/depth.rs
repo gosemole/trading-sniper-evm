@@ -522,31 +522,6 @@ struct Edge {
 }
 
 impl TickWindow {
-    /// Whether a swap from `from` to `to` passes a price where liquidity
-    /// changes.
-    ///
-    /// `None` means the scan did not reach one of the two ends, so the answer
-    /// is UNKNOWN rather than "no". Losing that distinction is the one way this
-    /// can do harm: "no" is what makes a caller trust the model outright.
-    ///
-    /// The interval is closed at both ends. A swap stopping exactly on an
-    /// initialized tick does not truly cross it, but answering "it does" costs
-    /// one trade priced the slow way, while answering "it does not" on a tick
-    /// that was in fact crossed costs a quote nobody checked.
-    pub fn crosses(&self, from: f64, to: f64) -> Option<bool> {
-        if !from.is_finite() || !to.is_finite() {
-            return None;
-        }
-        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
-        if lo < self.lo || hi > self.hi {
-            return None;
-        }
-        // First edge at or above the bottom of the move; it is crossed when it
-        // also sits at or below the top.
-        let i = self.edges.partition_point(|e| e.sqrt < lo);
-        Some(self.edges.get(i).is_some_and(|e| e.sqrt <= hi))
-    }
-
     /// The ticks a move from `from` to `to` crosses, ready for
     /// `pay_to_move_along` - or `None` when the ladder does not reach that far.
     ///
@@ -587,6 +562,33 @@ impl TickWindow {
         };
         rungs.shrink_to_fit();
         Some(rungs)
+    }
+
+    /// Every tick from `sqrt_p` in one direction whose effect is known, in the
+    /// order a walk meets them - ready to drive `swap_exact_in_along`.
+    ///
+    /// `None` when the price is outside what the ladder covers. That is not the
+    /// same answer as an empty ladder: empty means "nothing to cross round
+    /// here", `None` means "nothing was read round here", and only one of them
+    /// may be walked on.
+    ///
+    /// The direction convention is `TickReader::next_initialized`'s, because
+    /// the two must select the same ticks: going up the starting price is
+    /// exclusive, going down it is inclusive.
+    pub fn ladder_from(&self, sqrt_p: f64, up: bool) -> Option<Vec<Rung>> {
+        if !sqrt_p.is_finite() || sqrt_p < self.ladder_lo || sqrt_p > self.ladder_hi {
+            return None;
+        }
+        let selected = self.edges.iter().filter(|e| match up {
+            true => e.sqrt > sqrt_p,
+            false => e.sqrt <= sqrt_p,
+        });
+        // Collected through `Option` so a hole in the ladder comes back as "ask
+        // the chain" rather than as a walk with a tick silently missing.
+        match up {
+            true => selected.map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect(),
+            false => selected.rev().map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect(),
+        }
     }
 
     /// The sqrt prices the scan covered, for logs and tests.
@@ -802,53 +804,6 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
         ladder_lo,
         ladder_hi,
     })
-}
-
-/// What a swap yields while it stays inside the current tick range, where
-/// liquidity is constant and no tick data is needed at all.
-///
-/// This is the same step `swap_exact_in` takes between two ticks, on its own.
-/// It is exact whenever the swap does not reach an initialized tick, and it
-/// overstates the output once it would - so callers must check the price move
-/// it reports and stop trusting it before that point. Returns the output and
-/// the price the pool would be left at.
-///
-/// `fee_pips` is the WHOLE fee charged on the input, protocol fee included -
-/// `PoolState::swap_fee` for this direction, not the pool's bare `lp_fee`.
-pub fn in_range_out(
-    sqrt_p: f64,
-    liquidity: u128,
-    fee_pips: u32,
-    zero_for_one: bool,
-    amount_in: f64,
-) -> Option<(f64, f64)> {
-    // NaN has to fail these too, hence the explicit finiteness checks rather
-    // than negated comparisons.
-    if !sqrt_p.is_finite()
-        || sqrt_p <= 0.0
-        || !amount_in.is_finite()
-        || amount_in <= 0.0
-        || liquidity == 0
-        || fee_pips >= 1_000_000
-    {
-        return None;
-    }
-    let l = liquidity as f64;
-    // The fee comes off the input before it reaches the curve.
-    let net = amount_in * (1.0 - fee_pips as f64 / 1_000_000.0);
-    // Paying token1 pushes the raw price up; paying token0 pushes it down.
-    let up = !zero_for_one;
-    let (sqrt_new, out) = if up {
-        let s = sqrt_p + net / l;
-        (s, l * (1.0 / sqrt_p - 1.0 / s))
-    } else {
-        let s = 1.0 / (1.0 / sqrt_p + net / l);
-        (s, l * (sqrt_p - s))
-    };
-    if !out.is_finite() || out <= 0.0 || !sqrt_new.is_finite() || sqrt_new <= 0.0 {
-        return None;
-    }
-    Some((out, sqrt_new))
 }
 
 /// sqrt(price) at a tick, in the plain f64 domain (not X96).
@@ -1145,7 +1100,7 @@ fn x96_to_f64(v: U256) -> f64 {
 }
 
 /// Result of simulating one exact-input swap.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SwapResult {
     pub amount_out: f64,
     /// Input actually consumed. Less than requested only if the pool ran out of
@@ -1155,16 +1110,51 @@ pub struct SwapResult {
     pub ticks_crossed: u32,
 }
 
-/// Simulate an exact-input swap, walking every tick it crosses.
+/// What lies past the last rung a walk was handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Beyond {
+    /// Nothing further changes liquidity, so the rest of the input trades at
+    /// constant `L`. This is what a chain scan concludes when its search finds
+    /// no more initialized ticks - a full-range position looks exactly like it,
+    /// its only ticks sitting far outside the scanned window.
+    ConstantLiquidity,
+    /// The ladder simply stops here. A swap that reaches it has NOT been
+    /// modelled, and saying otherwise would report a price nothing computed.
+    Unknown,
+}
+
+/// How far a walk got.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Walk {
+    Done(SwapResult),
+    /// Input is left over and the rungs ran out. The caller supplied them, so
+    /// it knows where the next one would be found.
+    NeedsRung,
+}
+
+/// The most initialized ticks one swap may cross before this gives up. The old
+/// interleaved walk carried the same bound for the same reason: a pathological
+/// pool must not spin.
+const MAX_WALK_TICKS: usize = 1_000;
+
+/// Simulate an exact-input swap over a ladder of ticks.
+///
+/// The arithmetic of a swap lives here and ONLY here. `swap_exact_in` drives
+/// this with rungs it reads off the chain, `executor::model_quote` drives it
+/// with rungs the background scan already read, and neither of them owns a copy
+/// of the loop. Two walks deciding what a trade is worth would be two chances
+/// to disagree, and the one that disagreed silently would be the one signing an
+/// `amountOutMinimum` nobody checked.
 ///
 /// `zero_for_one` means token0 goes in and token1 comes out, which pushes the
 /// raw price P = y/x DOWN. Amounts are raw token units.
-pub async fn swap_exact_in(
-    reader: &TickReader<'_>,
+pub fn swap_exact_in_along(
     state: PoolState,
     zero_for_one: bool,
     amount_in: f64,
-) -> Result<SwapResult> {
+    rungs: &[Rung],
+    beyond: Beyond,
+) -> Result<Walk> {
     anyhow::ensure!(amount_in > 0.0, "amount_in must be > 0");
     anyhow::ensure!(state.sqrt_p > 0.0, "sqrt price must be > 0");
     let fee_pips = state.swap_fee(zero_for_one);
@@ -1180,47 +1170,45 @@ pub async fn swap_exact_in(
     let mut sqrt_cur = state.sqrt_p;
     let mut liquidity = state.liquidity as f64;
     let mut out = 0.0f64;
-    let mut tick = tick_at_sqrt(sqrt_cur);
     let mut crossed = 0u32;
     // Going down in price when selling token0.
     let up = !zero_for_one;
+    let mut ladder = rungs.iter();
 
-    for _ in 0..1_000 {
+    // Every turn either consumes a rung or finishes, so this cannot run away.
+    loop {
         if remaining <= 0.0 {
             break;
         }
-        let next = reader.next_initialized(tick, up, MAX_BITMAP_WORDS).await?;
-        let sqrt_edge = match next {
-            Some(t) => sqrt_at_tick(t),
-            None => {
-                // No further initialized tick means no boundary where liquidity
-                // could change, so the rest of the input trades at constant L.
-                // A full-range position looks exactly like this: its only ticks
-                // sit at MIN_TICK/MAX_TICK, far outside the scanned window.
-                if liquidity > 0.0 {
-                    let sqrt_new = if up {
-                        sqrt_cur + remaining / liquidity
-                    } else {
-                        1.0 / (1.0 / sqrt_cur + remaining / liquidity)
-                    };
-                    out += if up {
-                        liquidity * (1.0 / sqrt_cur - 1.0 / sqrt_new)
-                    } else {
-                        liquidity * (sqrt_cur - sqrt_new)
-                    };
-                    sqrt_cur = sqrt_new;
-                    remaining = 0.0;
+        let next = match ladder.next() {
+            Some(r) => r,
+            None => match beyond {
+                Beyond::Unknown => return Ok(Walk::NeedsRung),
+                Beyond::ConstantLiquidity => {
+                    if liquidity > 0.0 {
+                        let sqrt_new = if up {
+                            sqrt_cur + remaining / liquidity
+                        } else {
+                            1.0 / (1.0 / sqrt_cur + remaining / liquidity)
+                        };
+                        out += if up {
+                            liquidity * (1.0 / sqrt_cur - 1.0 / sqrt_new)
+                        } else {
+                            liquidity * (sqrt_cur - sqrt_new)
+                        };
+                        sqrt_cur = sqrt_new;
+                        remaining = 0.0;
+                    }
+                    break;
                 }
-                break;
-            }
+            },
         };
+        let sqrt_edge = next.sqrt;
+        let net = next.net as f64;
         if liquidity <= 0.0 {
             // Empty range: skip straight across it, no input consumed.
-            let t = next.context("no tick to cross")?;
-            let net = reader.liquidity_net(t).await? as f64;
             liquidity = (if up { liquidity + net } else { liquidity - net }).max(0.0);
             sqrt_cur = sqrt_edge;
-            tick = if up { t } else { t - 1 };
             crossed += 1;
             continue;
         }
@@ -1253,61 +1241,66 @@ pub async fn swap_exact_in(
         };
         remaining -= cap;
         sqrt_cur = sqrt_edge;
-        let t = next.context("no tick to cross")?;
-        let net = reader.liquidity_net(t).await? as f64;
         liquidity = (if up { liquidity + net } else { liquidity - net }).max(0.0);
-        tick = if up { t } else { t - 1 };
         crossed += 1;
     }
 
     let net_used = amount_in * (1.0 - fee_frac) - remaining;
-    Ok(SwapResult {
+    Ok(Walk::Done(SwapResult {
         amount_out: out,
         amount_in_used: net_used * gross_per_net,
         sqrt_p_after: sqrt_cur,
         ticks_crossed: crossed,
-    })
+    }))
 }
 
-#[cfg(test)]
-mod tests_in_range {
-    use super::*;
+/// Simulate an exact-input swap, reading each tick it crosses off the chain.
+///
+/// The reading and the arithmetic used to be one interleaved loop. They are now
+/// the same walk, fed one rung at a time: each turn either finishes or fetches
+/// exactly ONE more tick, so this makes the same number of requests it always
+/// did - the crossings and nothing else - while the sums happen in the one
+/// place `swap_exact_in_along` keeps them.
+pub async fn swap_exact_in(
+    reader: &TickReader<'_>,
+    state: PoolState,
+    zero_for_one: bool,
+    amount_in: f64,
+) -> Result<SwapResult> {
+    let up = !zero_for_one;
+    let mut rungs: Vec<Rung> = Vec::new();
+    // Where the next tick is looked for. The same cursor the interleaved walk
+    // kept, with the same asymmetry: exclusive going up, inclusive going down.
+    let mut tick = tick_at_sqrt(state.sqrt_p);
 
-    /// The in-range step and the full walk have to agree wherever the walk
-    /// crosses nothing - they are the same formula, and this is what lets the
-    /// cheap one stand in for the expensive one on small trades.
-    #[test]
-    fn it_is_the_same_step_the_walk_takes() {
-        let sqrt_p = 2.0f64;
-        let l = 1_000_000_000u128;
-        // A trade small enough to stay put: the price barely moves.
-        let (out, after) = in_range_out(sqrt_p, l, 3000, false, 1_000.0).unwrap();
-        assert!(out > 0.0);
-        assert!(after > sqrt_p, "paying token1 lifts the raw price");
-        let moved = (after / sqrt_p).powi(2) - 1.0;
-        assert!(moved < 1e-5, "moved {moved}");
-
-        // The other direction moves it the other way.
-        let (_, after) = in_range_out(sqrt_p, l, 3000, true, 1_000.0).unwrap();
-        assert!(after < sqrt_p);
+    for _ in 0..MAX_WALK_TICKS {
+        match swap_exact_in_along(state, zero_for_one, amount_in, &rungs, Beyond::Unknown)? {
+            Walk::Done(r) => return Ok(r),
+            Walk::NeedsRung => match reader.next_initialized(tick, up, MAX_BITMAP_WORDS).await? {
+                Some(t) => {
+                    rungs.push(Rung { sqrt: sqrt_at_tick(t), net: reader.liquidity_net(t).await? });
+                    tick = if up { t } else { t - 1 };
+                }
+                // The scan found nothing further, so nothing further changes
+                // liquidity and the rest of the input trades at constant L.
+                None => {
+                    return match swap_exact_in_along(
+                        state,
+                        zero_for_one,
+                        amount_in,
+                        &rungs,
+                        Beyond::ConstantLiquidity,
+                    )? {
+                        Walk::Done(r) => Ok(r),
+                        Walk::NeedsRung => {
+                            anyhow::bail!("the walk asked for a rung past the end of the pool")
+                        }
+                    };
+                }
+            },
+        }
     }
-
-    #[test]
-    fn the_fee_comes_off_the_input() {
-        let free = in_range_out(2.0, 1_000_000_000, 0, false, 1_000.0).unwrap().0;
-        let charged = in_range_out(2.0, 1_000_000_000, 10_000, false, 1_000.0).unwrap().0;
-        // 1% of the input never reaches the curve, so ~1% less comes out.
-        let ratio = charged / free;
-        assert!((ratio - 0.99).abs() < 1e-6, "ratio {ratio}");
-    }
-
-    #[test]
-    fn nothing_is_quoted_out_of_nothing() {
-        assert!(in_range_out(2.0, 0, 3000, false, 1.0).is_none(), "no liquidity");
-        assert!(in_range_out(0.0, 1_000, 3000, false, 1.0).is_none(), "no price");
-        assert!(in_range_out(2.0, 1_000, 3000, false, 0.0).is_none(), "no input");
-        assert!(in_range_out(2.0, 1_000, 1_000_000, false, 1.0).is_none(), "a 100% fee");
-    }
+    anyhow::bail!("this swap crosses more than {MAX_WALK_TICKS} initialized ticks")
 }
 
 #[cfg(test)]
@@ -1345,22 +1338,27 @@ mod tests {
     }
 
     /// The distinction the whole design rests on: a stretch the scan covered
-    /// and found empty is a FACT, the same stretch outside it is merely unread.
-    /// Answering "no" for the second would tell the model to trust arithmetic
-    /// nothing has checked.
+    /// and found empty is a FACT, one it never read is not. An empty ladder
+    /// means "nothing to cross round here" and is walkable; `None` means
+    /// "nothing was read round here" and is not. Confusing them would hand the
+    /// walk a swap it finishes at a liquidity nobody looked up.
     #[test]
     fn unread_is_not_the_same_answer_as_empty() {
-        let w = window(&[-600, 600], -6000, 6000);
+        let at = sqrt_at_tick;
 
-        // Inside the scan, between two edges: known, and known to cross nothing.
-        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(500)), Some(false));
-        // Inside the scan with no edges anywhere near: still a fact.
-        assert_eq!(w.crosses(sqrt_at_tick(1000), sqrt_at_tick(5000)), Some(false));
-        // One end past what was read: not known, and must not read as "no".
-        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(9000)), None);
-        assert_eq!(w.crosses(sqrt_at_tick(-9000), sqrt_at_tick(0)), None);
-        // A window that found nothing at all still answers inside its span.
-        assert_eq!(window(&[], -6000, 6000).crosses(sqrt_at_tick(0), sqrt_at_tick(100)), Some(false));
+        // Read, and genuinely empty around the price.
+        let empty = laddered(&[], -6000, 6000);
+        assert_eq!(empty.ladder_from(at(0), true), Some(vec![]));
+        assert_eq!(empty.ladder_from(at(0), false), Some(vec![]));
+
+        // Positions known, effects not - an unbatched pool.
+        let bare = window(&[-600, 600], -6000, 6000);
+        assert_eq!(bare.ladder_from(at(0), true), None, "positions alone cannot be walked");
+
+        // Laddered, but asked about a price outside what was read.
+        let near = laddered(&[(0, 7)], -600, 600);
+        assert_eq!(near.ladder_from(at(6000), true), None);
+        assert!(near.ladder_from(at(100), true).is_some());
     }
 
     /// The cached ladder and the chain-read walk must select the same ticks,
@@ -1386,27 +1384,6 @@ mod tests {
 
         // A move that reaches nothing carries nothing.
         assert_eq!(w.rungs_towards(at(10), at(500)).unwrap(), vec![]);
-    }
-
-    /// A ladder that does not reach must say so rather than come back short:
-    /// inside the walk, a missing rung is indistinguishable from "there is no
-    /// further tick", which prices the rest of the move at the wrong liquidity.
-    #[test]
-    fn a_ladder_that_does_not_reach_refuses() {
-        // Ticks known, liquidity changes not - an unbatched pool, or ticks
-        // beyond the ladder's reach.
-        let bare = window(&[-600, 600], -6000, 6000);
-        assert!(bare.crosses(at_zero(), sqrt_at_tick(1200)).is_some(), "positions are known");
-        assert!(bare.rungs_towards(at_zero(), sqrt_at_tick(1200)).is_none(), "but not their effect");
-
-        // Laddered, but asked about a price outside what was read.
-        let w = laddered(&[(0, 7)], -600, 600);
-        assert!(w.rungs_towards(at_zero(), sqrt_at_tick(6000)).is_none());
-        assert!(w.rungs_towards(at_zero(), sqrt_at_tick(300)).is_some());
-    }
-
-    fn at_zero() -> f64 {
-        sqrt_at_tick(0)
     }
 
     /// The cached walk and the chain-read walk are the same arithmetic over the
@@ -1450,22 +1427,15 @@ mod tests {
         assert!(with < without, "thinner beyond the tick must cost less to move: {with} vs {without}");
     }
 
+    /// A ladder that does not reach must say so rather than come back short:
+    /// inside the walk, a missing rung is `Beyond::Unknown` and refuses, while
+    /// a short-but-complete one would finish at the wrong liquidity.
     #[test]
-    fn a_swap_reaching_an_edge_is_a_crossing() {
-        let w = window(&[-600, 600], -6000, 6000);
-
-        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(700)), Some(true));
-        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(-700)), Some(true));
-        // Landing exactly on one counts, deliberately: saying "crossed" costs a
-        // trade priced the slow way, saying "did not" costs an unchecked quote.
-        assert_eq!(w.crosses(sqrt_at_tick(0), sqrt_at_tick(600)), Some(true));
-        // Direction is not part of the question.
-        assert_eq!(
-            w.crosses(sqrt_at_tick(700), sqrt_at_tick(0)),
-            w.crosses(sqrt_at_tick(0), sqrt_at_tick(700))
-        );
-        // A price that is not a number is never an answer.
-        assert_eq!(w.crosses(f64::NAN, sqrt_at_tick(0)), None);
+    fn a_ladder_that_does_not_reach_refuses() {
+        let w = laddered(&[(0, 7)], -600, 600);
+        assert!(w.ladder_from(sqrt_at_tick(0), true).is_some());
+        assert!(w.ladder_from(sqrt_at_tick(-6000), true).is_none());
+        assert!(w.ladder_from(f64::NAN, true).is_none());
     }
 
     /// A scan has to reach `WINDOW_SPAN` on the worse side (the price can sit
@@ -1644,29 +1614,73 @@ mod tests {
     /// reaches the curve, so a quote that ignores it is optimistic.
     #[test]
     fn the_protocol_fee_costs_the_swapper_output() {
-        let with = in_range_out(
-            2.0,
-            1_000_000_000,
-            PoolState {
-                sqrt_p: 2.0,
-                liquidity: 1_000_000_000,
-                lp_fee: 2500,
-                protocol_fee_0for1: 400,
-                protocol_fee_1for0: 400,
+        let state = |protocol: u32| PoolState {
+            sqrt_p: 2.0,
+            liquidity: 1_000_000_000,
+            lp_fee: 2500,
+            protocol_fee_0for1: protocol,
+            protocol_fee_1for0: protocol,
+        };
+        let out = |protocol: u32| {
+            match swap_exact_in_along(state(protocol), true, 1_000_000.0, &[], Beyond::ConstantLiquidity)
+                .unwrap()
+            {
+                Walk::Done(r) => r.amount_out,
+                Walk::NeedsRung => unreachable!("constant liquidity always finishes"),
             }
-            .swap_fee(true),
-            true,
-            1_000_000.0,
-        )
-        .unwrap()
-        .0;
-        let without = in_range_out(2.0, 1_000_000_000, 2500, true, 1_000_000.0)
-            .unwrap()
-            .0;
+        };
+        let with = out(400);
+        let without = out(0);
         assert!(
             with < without,
             "charging the protocol fee must return less, got {with} >= {without}"
         );
+    }
+
+    /// The LP fee comes off the input before it reaches the curve, so a fee of
+    /// one percent costs about one percent of the output.
+    #[test]
+    fn the_fee_comes_off_the_input() {
+        let state = |lp_fee: u32| PoolState {
+            sqrt_p: 2.0,
+            liquidity: 1_000_000_000,
+            lp_fee,
+            protocol_fee_0for1: 0,
+            protocol_fee_1for0: 0,
+        };
+        let out = |lp_fee: u32| {
+            match swap_exact_in_along(state(lp_fee), false, 1_000.0, &[], Beyond::ConstantLiquidity)
+                .unwrap()
+            {
+                Walk::Done(r) => r.amount_out,
+                Walk::NeedsRung => unreachable!(),
+            }
+        };
+        let ratio = out(10_000) / out(0);
+        assert!((ratio - 0.99).abs() < 1e-6, "ratio {ratio}");
+    }
+
+    /// Nothing is quoted out of nothing, and a walk with no ladder and no
+    /// liquidity does not invent a price.
+    #[test]
+    fn nothing_is_quoted_out_of_nothing() {
+        let state = |sqrt_p: f64, liquidity: u128, lp_fee: u32| PoolState {
+            sqrt_p,
+            liquidity,
+            lp_fee,
+            protocol_fee_0for1: 0,
+            protocol_fee_1for0: 0,
+        };
+        let walk = |st, amount| swap_exact_in_along(st, false, amount, &[], Beyond::ConstantLiquidity);
+
+        // An empty pool consumes nothing and returns nothing.
+        match walk(state(2.0, 0, 3000), 1.0).unwrap() {
+            Walk::Done(r) => assert_eq!(r.amount_out, 0.0, "no liquidity, no output"),
+            Walk::NeedsRung => unreachable!(),
+        }
+        assert!(walk(state(0.0, 1_000, 3000), 1.0).is_err(), "no price");
+        assert!(walk(state(2.0, 1_000, 3000), 0.0).is_err(), "no input");
+        assert!(walk(state(2.0, 1_000, 1_000_000), 1.0).is_err(), "a 100% fee");
     }
 
     #[test]

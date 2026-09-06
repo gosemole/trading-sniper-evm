@@ -270,10 +270,12 @@ async fn depth_check_cmd(
     // readable yet, which is the `header not found` calibration keeps hitting.
     let at = http.get_block_number().await?.as_u64().saturating_sub(2);
     let manager = pool_manager(cfg).ok();
-    println!("comparing batched and unbatched tick walks at block {at}\n");
+    println!("comparing tick walks at block {at}\n");
 
     let mut checked = 0;
     let mut differed = 0;
+    let mut walk_differed = 0;
+    let mut walk_checked = 0;
     for pc in &cfg.pools {
         let pool = match pool::Pool::resolve(http, pc, &cfg.tokens, manager).await {
             Ok(p) => p,
@@ -323,10 +325,66 @@ async fn depth_check_cmd(
             pool.name,
             if same { "same " } else { "DIFFER" },
         );
+
+        // The second claim, and the one that decides real trades: a swap walked
+        // from the ladder the background scan reads must be the SAME swap the
+        // chain walk produces. They share `swap_exact_in_along`, so what this
+        // pins is not the arithmetic but the ladder - that the cached rungs are
+        // the same ticks, in the same order, that `next_initialized` selects.
+        //
+        // One reader for both, pinned to one block: the walks must differ over
+        // the data or not at all, and an unpinned pair would differ because the
+        // pool moved between them.
+        let reader = depth::TickReader::new(http, source.clone(), spacing)?.at_block(Some(at));
+        let state = depth::read_state(&reader).await?;
+        // The size that moves this pool by its own `max_move_pct`, so the walk
+        // is asked something the pool can actually feel.
+        let amount = batched;
+        // Paying to lift the base token's price: token1 in when the base is
+        // token0, and the mirror image otherwise.
+        let zero_for_one = pool.base_token != 0;
+        let window = depth::tick_window(&reader, state.sqrt_p).await?;
+        match window.ladder_from(state.sqrt_p, !zero_for_one) {
+            Some(rungs) => {
+                let cached =
+                    depth::swap_exact_in_along(state, zero_for_one, amount, &rungs, depth::Beyond::Unknown)?;
+                let chain = depth::swap_exact_in(&reader, state, zero_for_one, amount).await?;
+                walk_checked += 1;
+                match cached {
+                    depth::Walk::Done(local) if local == chain => println!(
+                        "{:24} same   walk from the cached ladder matches the chain: \
+                         {:.6} out, {} tick(s) crossed",
+                        "", local.amount_out, local.ticks_crossed
+                    ),
+                    depth::Walk::Done(local) => {
+                        walk_differed += 1;
+                        println!(
+                            "{:24} DIFFER cached {:.6} ({} ticks) vs chain {:.6} ({} ticks)",
+                            "", local.amount_out, local.ticks_crossed,
+                            chain.amount_out, chain.ticks_crossed
+                        );
+                    }
+                    // Not a disagreement: the ladder is read near the price and
+                    // this size walked past it. The model refuses exactly here.
+                    depth::Walk::NeedsRung => println!(
+                        "{:24} n/a    this size walks past the cached ladder ({} rung(s))",
+                        "", rungs.len()
+                    ),
+                }
+            }
+            None => println!("{:24} n/a    no ladder covers this pool's price", ""),
+        }
     }
 
-    println!("\n{checked} pool(s) checked, {differed} differed");
+    println!(
+        "\n{checked} pool(s) checked, {differed} differed on batching; \
+         {walk_checked} walk(s) compared, {walk_differed} differed"
+    );
     anyhow::ensure!(differed == 0, "batched reads changed an answer - do not ship this");
+    anyhow::ensure!(
+        walk_differed == 0,
+        "the cached ladder walks a swap differently from the chain - do not ship this"
+    );
     Ok(())
 }
 

@@ -30,6 +30,13 @@
 //! slippage tolerance, so what the trade will accept is recomputed for this
 //! pair every single time.
 //!
+//! What the model computes is the SAME walk `--quote` runs against the chain,
+//! over a ladder of ticks read in the background rather than one at a time -
+//! `depth::swap_exact_in_along`, driven by `TickBook`. So a quote from memory is
+//! not an approximation of the real one within some tolerance; it is the real
+//! one, and a swap that walks past what was read is refused rather than
+//! estimated.
+//!
 //! Nothing here asks the router to rehearse the trade, so nothing proves the
 //! wallet can afford it except a balance check run for that purpose alone -
 //! see `quote`. Allowance is dealt with once, when the route is armed: both
@@ -177,11 +184,11 @@ struct Modelled {
     amount_out: U256,
     /// Fraction, not percent: the largest price move any single hop takes.
     impact: f64,
-    /// True when EVERY hop was cleared by its tick window - so the arithmetic
-    /// is exact rather than merely inside a percentage. One hop falling back
-    /// makes the whole quote an estimate, which is why this is an `and` and not
-    /// a count.
-    exact: bool,
+    /// Initialized ticks the whole route walked through. Zero is the ordinary
+    /// case and is not a lesser answer - it means the swap stayed inside one
+    /// stretch of constant liquidity, where the arithmetic is exact for any
+    /// size at all.
+    crossed: u32,
 }
 
 /// Where every armed route's pools change liquidity, read in the background so
@@ -257,13 +264,14 @@ impl TickBook {
         entry.window.as_ref()?.rungs_towards(from, to)
     }
 
-    async fn crosses(&self, key: PoolRef, from: f64, to: f64) -> Option<bool> {
+    /// The ladder a swap through this pool would walk, in its direction.
+    async fn ladder(&self, key: PoolRef, sqrt_p: f64, up: bool) -> Option<Vec<crate::depth::Rung>> {
         let book = self.inner.lock().await;
         let entry = book.get(&key)?;
         if entry.at.elapsed() > TICK_WINDOW_STALE_AFTER {
             return None;
         }
-        entry.window.as_ref()?.crosses(from, to)
+        entry.window.as_ref()?.ladder_from(sqrt_p, up)
     }
 
     /// File a window, saying so out loud when a pool starts or stops having one.
@@ -299,10 +307,8 @@ struct Quoted {
     amount_out: U256,
     /// The worst hop's price move, as `Modelled::impact`.
     impact: f64,
-    /// Whether every hop was judged against a real tick window rather than
-    /// against the percentage. Logged on each buy, because it is the difference
-    /// between a quote that is exact and one that is merely probably close.
-    exact: bool,
+    /// Initialized ticks the route walked, as `Modelled::crossed`.
+    crossed: u32,
     /// How old the calibration snapshot was when this was priced, in seconds,
     /// or `None` when there is no snapshot at all. Logged on every buy so that
     /// the state ageing is visible while it is still pricing trades, rather
@@ -335,42 +341,6 @@ const STATE_STALE_MIN: Duration = Duration::from_secs(120);
 /// pass is survivable and only a second one stops trading.
 fn state_stale_after(calibrate_secs: u64) -> Duration {
     Duration::from_secs(calibrate_secs.saturating_mul(2)).max(STATE_STALE_MIN)
-}
-
-/// How far a fast-quoted swap may move a pool's own price before the model is
-/// no longer trusted - a share of the route's OWN slippage tolerance, not a
-/// number of its own.
-///
-/// Inside a tick range the arithmetic is exact. Past an initialized tick the
-/// liquidity it assumes is wrong and the output it reports can be too high, and
-/// too high is the direction that matters: `amountOutMinimum` is built from
-/// this figure, so an overstatement that eats the whole tolerance is a
-/// transaction which reverts on chain. That tolerance is therefore the only
-/// thing the cap can sensibly be measured against, and it used to be an
-/// unrelated constant sitting beside it - so a route whose slippage was
-/// tightened kept a modelling cap sized for the old one.
-///
-/// A third of it, because the error is a FRACTION of the impact rather than the
-/// impact itself. The in-range step is `out = net / (sqrt_p * sqrt_new)` with
-/// `sqrt_new = sqrt_p * (1 + x)`, so an impact of `2x` modelled at liquidity
-/// `L` against a pool really holding `L/2` from the very first wei overstates
-/// by `(1 + 2x)/(1 + x) - 1`, which is about `x`. A 1% impact is thus misread
-/// by about half a percent even when liquidity halves across the entire swap;
-/// for it to spend a 3% tolerance outright, liquidity past the tick would have
-/// to fall roughly sevenfold and do it immediately.
-///
-/// The 1% ceiling is not about reverting. Past there the question stops being
-/// how wrong the model is and becomes whether a tick is crossed at all, and no
-/// tolerance makes that knowable from a swap log.
-fn modelled_impact_cap(max_slippage_pct: f64) -> f64 {
-    // Config validates this, but the value decides whether a trade is priced at
-    // all: a NaN reaching the comparison in `model_quote` would pass every
-    // impact instead of failing it, because every comparison against NaN is
-    // false. Fall back to what this was before it was derived from anything.
-    if !max_slippage_pct.is_finite() || max_slippage_pct <= 0.0 {
-        return 0.005;
-    }
-    (max_slippage_pct / 100.0 / 3.0).min(0.01)
 }
 
 /// How far the measured yield has to move before it is worth saying out loud,
@@ -906,12 +876,10 @@ impl Executor {
             // refusals, because a cap is only tunable against a distribution
             // somebody can see.
             impact_pct = format!("{:.4}", quoted.impact * 100.0),
-            // Whether every hop was cleared against real tick data or against
-            // the percentage that stands in for it. The difference is between a
-            // quote that is exact and one that is probably close, and it is
-            // worth being able to tell them apart afterwards.
-            exact = quoted.exact,
-            impact_limit_pct = format!("{:.4}", modelled_impact_cap(route.max_slippage_pct) * 100.0),
+            // How much walking the price took. Zero means the swap stayed
+            // inside one stretch of constant liquidity, where the arithmetic is
+            // exact whatever the size.
+            ticks_crossed = quoted.crossed,
             quote_ms = quoted.took.as_millis(),
             state_age_s = quoted.state_age_s,
             min_out = amount(min_out, &route.output),
@@ -1067,14 +1035,7 @@ impl Executor {
         // The router's answer has no impact to report: it is not a model, so
         // there is no assumption to say how hard this leaned on.
         let (amount_out, priced_by, impact) = match modelled {
-            Some(m) => (
-                m.amount_out,
-                match m.exact {
-                    true => "model (ticks)",
-                    false => "model (in-range)",
-                },
-                Some(m.impact),
-            ),
+            Some(m) => (m.amount_out, "model", Some(m.impact)),
             None => (
                 execute::verify(
                     &self.http, self.router, self.owner, &sell, U256::zero(), deadline, None,
@@ -1266,7 +1227,7 @@ impl Executor {
         // The model prices every buy or none does: there is no router
         // fallback on this path. Skip the buy instead of guessing; it costs
         // nothing but this one drop, and there will be another.
-        let Some(Modelled { amount_out, impact, exact }) = modelled else {
+        let Some(Modelled { amount_out, impact, crossed }) = modelled else {
             anyhow::bail!(
                 "route '{}': the model could not price this trade - see the reason logged \
                  just above; skipping rather than guessing",
@@ -1309,7 +1270,7 @@ impl Executor {
         Ok(Quoted {
             amount_out,
             impact,
-            exact,
+            crossed,
             state_age_s,
             took: started.elapsed(),
             fees,
@@ -1531,7 +1492,7 @@ impl Executor {
     /// ones that moved.
     ///
     /// `yield_ppm` is what calibration measured this direction to actually pay
-    /// against what this same arithmetic predicted, and it IS applied here as
+    /// against what this same walk predicted, and it IS applied here as
     /// a term: whatever a hook takes on top of the pools' stated fees is real
     /// money, and a quote that leaves it out is optimistic by exactly that
     /// much. It is clamped at 1.0 - a route measured to pay more than the
@@ -1549,9 +1510,10 @@ impl Executor {
     /// calibration snapshot - which is only consulted for hops the signal says
     /// nothing about, so a single-hop route never waits on a snapshot at all.
     ///
-    /// Returns `None` whenever anything is missing or out of range; a buy is
-    /// then skipped and a sale asks the router. Being slow is recoverable;
-    /// signing a wrong minimum is not.
+    /// Returns `None` whenever anything is missing: no measurement, no state
+    /// for a hop, or a ladder that does not reach as far as the swap walks. A
+    /// buy is then skipped and a sale asks the router. Being slow is
+    /// recoverable; signing a wrong minimum is not.
     async fn model_quote(
         &self,
         plan: &Plan,
@@ -1561,10 +1523,8 @@ impl Executor {
     ) -> Option<Modelled> {
         // Measured against this route's own tolerance, so the two cannot drift
         // apart - see `modelled_impact_cap`.
-        let cap = modelled_impact_cap(route.max_slippage_pct);
         let mut worst_impact = 0.0f64;
-        // Cleared by a real tick window everywhere, until some hop is not.
-        let mut exact = true;
+        let mut crossed = 0u32;
         // Never priced by a measurement that does not exist. The callers check
         // this too, and both of them refusing is the point.
         if yield_ppm == 0 {
@@ -1640,86 +1600,77 @@ impl Executor {
                     here.protocol_fee_1for0 = snap.protocol_fee_1for0;
                 }
             }
-            let fee_pips = here.swap_fee(hop.zero_for_one());
-            let stepped = crate::depth::in_range_out(
-                here.sqrt_p,
-                here.liquidity,
-                fee_pips,
-                hop.zero_for_one(),
-                amount,
-            );
-            let Some((out, after)) = stepped else {
+            // The pool as we believe it to be, and then the ticks around it.
+            // A swap is exact for as long as liquidity holds, and liquidity
+            // holds exactly until an initialized tick is crossed - so the walk
+            // needs to know where those are, and the background scan has
+            // already read them. See `TickBook`.
+            let state = crate::depth::PoolState {
+                sqrt_p: here.sqrt_p,
+                liquidity: here.liquidity,
+                lp_fee: here.lp_fee,
+                protocol_fee_0for1: here.protocol_fee_0for1,
+                protocol_fee_1for0: here.protocol_fee_1for0,
+            };
+            let up = !hop.zero_for_one();
+            let Some(rungs) = self.ticks.ladder(hop.pool_ref(), here.sqrt_p, up).await else {
                 warn!(
                     route = %route.name,
                     pool = %hop.pool_ref(),
-                    fee_pips,
-                    liquidity = here.liquidity,
-                    amount_in = amount,
-                    "not priced: the in-range step returned nothing for this hop"
+                    "not priced: no tick ladder covers this pool's price, so a swap through \
+                     it cannot be walked from memory"
                 );
                 return None;
             };
-            let impact = ((after / here.sqrt_p).powi(2) - 1.0).abs();
-            if !impact.is_finite() {
-                warn!(route = %route.name, pool = %hop.pool_ref(), "not priced: impact is not a number");
-                return None;
-            }
-            // The worst hop, not the last: the whole quote is only as
-            // trustworthy as the pool it strained most.
-            worst_impact = worst_impact.max(impact);
-
-            // The real question, asked of the real answer where there is one.
-            // `in_range_out` is exact for as long as liquidity holds, and
-            // liquidity holds exactly until an initialized tick is crossed - so
-            // a swap the window clears is not an estimate at all, and its size
-            // stops mattering. Read in the background; see `TickBook`.
-            match self.ticks.crosses(hop.pool_ref(), here.sqrt_p, after).await {
-                Some(true) => {
+            // The same walk `--quote` runs against the chain, over rungs read
+            // in advance instead of one at a time. `Beyond::Unknown` is what
+            // makes it safe: a swap reaching the end of the ladder is refused
+            // rather than finished at a liquidity nobody read.
+            let walked = crate::depth::swap_exact_in_along(
+                state,
+                hop.zero_for_one(),
+                amount,
+                &rungs,
+                crate::depth::Beyond::Unknown,
+            );
+            let out = match walked {
+                Ok(crate::depth::Walk::Done(r)) if r.amount_out > 0.0 => {
+                    let impact = ((r.sqrt_p_after / here.sqrt_p).powi(2) - 1.0).abs();
+                    if !impact.is_finite() {
+                        warn!(route = %route.name, pool = %hop.pool_ref(),
+                              "not priced: this hop's price move is not a number");
+                        return None;
+                    }
+                    // The worst hop, not the last: a quote is only as
+                    // trustworthy as the pool it strained most.
+                    worst_impact = worst_impact.max(impact);
+                    crossed += r.ticks_crossed;
+                    r.amount_out
+                }
+                Ok(crate::depth::Walk::Done(_)) => {
                     warn!(
-                        route = %route.name,
-                        pool = %hop.pool_ref(),
-                        impact_pct = format!("{:.4}", impact * 100.0),
-                        "not priced: this swap crosses a tick where the pool's liquidity \
-                         changes, so the in-range formula does not describe it"
+                        route = %route.name, pool = %hop.pool_ref(), amount_in = amount,
+                        "not priced: this hop returns nothing for that size"
                     );
                     return None;
                 }
-                Some(false) => {
-                    // Exact - but a trade that moves a pool as far as its whole
-                    // slippage tolerance is a size to look at rather than a
-                    // model to trust, whatever the ticks say.
-                    let ceiling = route.max_slippage_pct / 100.0;
-                    if impact > ceiling {
-                        warn!(
-                            route = %route.name,
-                            pool = %hop.pool_ref(),
-                            impact_pct = format!("{:.4}", impact * 100.0),
-                            slippage_pct = route.max_slippage_pct,
-                            "not priced: the swap crosses no tick, but it moves the pool by \
-                             as much as the whole slippage tolerance - that is a size, not a \
-                             modelling question"
-                        );
-                        return None;
-                    }
+                Ok(crate::depth::Walk::NeedsRung) => {
+                    warn!(
+                        route = %route.name,
+                        pool = %hop.pool_ref(),
+                        amount_in = amount,
+                        rungs = rungs.len(),
+                        "not priced: this size walks past the last tick the scan read, so \
+                         where it ends is not known"
+                    );
+                    return None;
                 }
-                // Nothing on file for this pool, or the window does not reach
-                // this far. Back to guessing by percentage, and saying so.
-                None => {
-                    exact = false;
-                    if impact > cap {
-                        warn!(
-                            route = %route.name,
-                            pool = %hop.pool_ref(),
-                            impact_pct = format!("{:.4}", impact * 100.0),
-                            limit_pct = format!("{:.4}", cap * 100.0),
-                            slippage_pct = route.max_slippage_pct,
-                            "not priced: no tick window covers this swap, and it moves the \
-                             pool further than the in-range formula is assumed exact for"
-                        );
-                        return None;
-                    }
+                Err(e) => {
+                    warn!(route = %route.name, pool = %hop.pool_ref(),
+                          err = %format!("{e:#}"), "not priced: the walk refused this hop");
+                    return None;
                 }
-            }
+            };
             amount = out;
         }
 
@@ -1731,7 +1682,7 @@ impl Executor {
         (!raw.is_zero()).then_some(Modelled {
             amount_out: raw,
             impact: worst_impact,
-            exact,
+            crossed,
         })
     }
 
@@ -1918,56 +1869,6 @@ impl Approver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The cap is a share of the route's own tolerance, so the two cannot be
-    /// tightened apart from each other.
-    #[test]
-    fn the_impact_cap_follows_the_route_tolerance() {
-        assert!((modelled_impact_cap(0.3) - 0.001).abs() < 1e-12);
-        assert!((modelled_impact_cap(1.5) - 0.005).abs() < 1e-12);
-        // Up to the ceiling, past which the question stops being how wrong the
-        // model is and starts being whether a tick is crossed at all.
-        assert_eq!(modelled_impact_cap(3.0), 0.01);
-        assert_eq!(modelled_impact_cap(50.0), 0.01);
-        // Nonsense falls back rather than passing everything: `impact > NaN` is
-        // false, so a NaN cap would price every trade instead of refusing them.
-        assert_eq!(modelled_impact_cap(f64::NAN), 0.005);
-        assert_eq!(modelled_impact_cap(0.0), 0.005);
-        assert_eq!(modelled_impact_cap(-1.0), 0.005);
-    }
-
-    /// The arithmetic `modelled_impact_cap` is argued from, run rather than
-    /// asserted in prose: at the ceiling impact, a pool holding half what the
-    /// model assumed - from the very first wei, which is the worst an unseen
-    /// initialized tick can do short of a liquidity cliff - overstates the
-    /// output by about half the impact, not by the impact and nothing like the
-    /// tolerance.
-    #[test]
-    fn the_cap_leaves_room_for_the_error_it_guards_against() {
-        let sqrt_p = 1.0f64;
-        let l: u128 = 1_000_000_000;
-        // x = amount / (L * sqrt_p) = 0.5%, so the price impact is about 1% -
-        // the most any route can ever be allowed.
-        let amount_in = 5_000_000.0;
-
-        let (modelled, after) =
-            crate::depth::in_range_out(sqrt_p, l, 0, false, amount_in).expect("in range");
-        let impact = (after / sqrt_p).powi(2) - 1.0;
-        assert!((impact - 0.01).abs() < 0.001, "impact {impact}");
-
-        let (actual, _) =
-            crate::depth::in_range_out(sqrt_p, l / 2, 0, false, amount_in).expect("in range");
-        let overstated = modelled / actual - 1.0;
-
-        assert!(overstated > 0.0, "halving liquidity must overstate, not understate");
-        assert!(
-            overstated < impact,
-            "the error {overstated} should be a fraction of the impact {impact}"
-        );
-        // The tolerance a route like this carries is 3%. The gap is what makes
-        // a third of it a cap with room rather than a coin toss.
-        assert!(overstated < 0.01, "{overstated} is too close to the tolerance");
-    }
 
     /// The bar that decides whether a token gets approved at startup has to sit
     /// above anything a position could ever reach and below what `--approve`
