@@ -683,6 +683,14 @@ impl TickWindow {
 /// unavoidable rather than chosen.
 const LADDER_SLOTS: usize = SLOTS_PER_CALL;
 
+/// Initialized ticks whose `liquidityNet` a scan reads when it cannot batch.
+///
+/// One `eth_call` each, so a fraction of what a batched pool reads - but not
+/// zero, because zero meant `ladder_from` had an empty range to answer from and
+/// refused every price. A route with one such hop was then unpriceable however
+/// well its other hops read.
+const LADDER_UNBATCHED: usize = 16;
+
 /// The furthest tick either protocol allows. A pool cannot have an initialized
 /// tick beyond it, so a scan reaching this far on both sides has read the pool
 /// entirely and can never answer "I did not look there".
@@ -808,10 +816,10 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
     // handful of ticks; a pool can have hundreds, and each one costs its own
     // storage word rather than sharing a bitmap word with 255 others.
     //
-    // Only when the reads can be batched. Unbatched this would be one
-    // `eth_call` per tick, which is the flood this whole scan is written to
-    // avoid - so a v3 pool keeps the bitmap and loses the ladder, and a walk
-    // through it goes to the chain as it always did.
+    // A pool that cannot be batched reads far fewer, one `eth_call` each. That
+    // is a cost worth paying: skipping the ladder entirely left `ladder_from`
+    // with an empty range, so it refused every price - and a route with one v3
+    // hop could not be priced at all, however well the rest of it read.
     // Centred on the price, and spending the whole budget: a side with fewer
     // ticks than its share leaves room the other side takes, rather than the
     // scan reading less than it could.
@@ -823,7 +831,14 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
             let last = (first + want).min(found.len());
             (last.saturating_sub(want), last)
         }
-        false => (0, 0),
+        // One request per tick here, so a far smaller neighbourhood - enough
+        // for what a walk of these sizes reaches, and no more.
+        false => {
+            let want = LADDER_UNBATCHED.min(found.len());
+            let first = pivot.saturating_sub(want / 2);
+            let last = (first + want).min(found.len());
+            (last.saturating_sub(want), last)
+        }
     };
     if first < last {
         let slots: Vec<U256> =
@@ -850,13 +865,14 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
     // What the ladder really covers. Reading out to the edge of the window on a
     // side means there is nothing further to cross on it, so the ladder can be
     // said to reach the window's own bound; stopping short means it cannot.
-    let (ladder_lo, ladder_hi) = match (first < last, found.is_empty() && batched) {
+    let (ladder_lo, ladder_hi) = match (first < last, found.is_empty()) {
         (true, _) => (
             if first == 0 { lo } else { found[first].1 },
             if last == found.len() { hi } else { found[last - 1].1 },
         ),
         // No ticks anywhere in the window: nothing to cross, so any walk inside
-        // it is exact with an empty ladder.
+        // it is exact with an empty ladder. True of a pool provided across its
+        // whole range, whether or not its reads can be batched.
         (false, true) => (lo, hi),
         // No ladder. An empty range, so every check against it fails - which is
         // the answer wanted, and safer than a NaN, against which every
@@ -1497,6 +1513,23 @@ mod tests {
         let down = w.ladder_from(at(0), false).expect("the near ticks were read");
         assert_eq!(down.rungs, vec![Rung { sqrt: at(-600), net: 5 }]);
         assert_eq!(down.bound, at(-600));
+    }
+
+    /// A pool whose reads cannot be batched still has to be walkable. Skipping
+    /// its ladder left `ladder_from` with an empty range to answer from, so it
+    /// refused every price - and one such hop made a whole route unpriceable,
+    /// however well the rest of it read.
+    #[test]
+    fn an_unbatched_pool_still_gets_a_ladder() {
+        // What the scan builds for one: fewer rungs than a batched pool, but a
+        // real range rather than an empty one.
+        let w = laddered(&[(-600, 5), (0, 7), (600, -3)], -6000, 6000);
+        assert!(w.ladder_from(sqrt_at_tick(0), true).is_some());
+
+        // And a window that read NOTHING is the case that must still refuse -
+        // the two have to stay distinguishable.
+        let bare = window(&[-600, 600], -6000, 6000);
+        assert!(bare.ladder_from(sqrt_at_tick(0), true).is_none());
     }
 
     /// A pool provided across its whole range has NO initialized ticks near
