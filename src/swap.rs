@@ -667,6 +667,13 @@ pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> La
             }
         }
         Ok(Some(r)) => {
+            // TODO: say WHY. A receipt carries no revert reason, but replaying
+            // the transaction as an `eth_call` at the block it landed in gets
+            // one - and `execute::explain_revert` already turns the bytes into
+            // the router's own error names. Two requests, only on a revert, off
+            // any hot path. Without it a failed buy is a wall: the quote, the
+            // minimum and the size are all in the log above and none of them
+            // says which was wrong.
             tracing::error!(tx = ?hash, block = ?r.block_number, label, "REVERTED");
             Landed {
                 outcome: Outcome::Reverted,

@@ -285,6 +285,15 @@ struct Entry {
     /// `None` after a read that failed, so a pool whose ticks cannot be read
     /// is remembered as such rather than retried by every signal.
     window: Option<crate::depth::TickWindow>,
+    /// What the pool looked like when the window was read.
+    ///
+    /// The scan reads this anyway - it needs a price to centre on - and used to
+    /// throw it away, leaving the calibration snapshot as the only state a hop
+    /// the signal says nothing about could be priced from. That snapshot is
+    /// written every `calibrate_secs` and trusted for twice as long, so two
+    /// failed passes took every route off the air; this one is read every
+    /// thirty seconds by a task that wants it for its own reasons.
+    state: Option<crate::depth::PoolState>,
     at: Instant,
 }
 
@@ -360,12 +369,29 @@ impl TickBook {
     /// repeated twice a minute for as long as it lasts is a line nobody reads.
     /// Without this the only trace was `exact=false` on a buy, which says a
     /// trade was affected but not that anything is wrong.
+    /// What the last scan saw of this pool, while it is recent enough to price
+    /// from. Twenty times fresher than the calibration snapshot, and read by a
+    /// task that keeps running when calibration cannot.
+    fn state(&self, key: PoolRef) -> Option<crate::depth::PoolState> {
+        let book = self.inner.lock().ok()?;
+        let entry = book.get(&key)?;
+        if entry.at.elapsed() > TICK_WINDOW_STALE_AFTER {
+            return None;
+        }
+        entry.state
+    }
+
     /// How long ago this pool's window was last read, if it ever was.
     fn age(&self, key: PoolRef) -> Option<Duration> {
         self.inner.lock().ok()?.get(&key).map(|e| e.at.elapsed())
     }
 
-    fn put(&self, key: PoolRef, window: Option<crate::depth::TickWindow>) {
+    fn put(
+        &self,
+        key: PoolRef,
+        window: Option<crate::depth::TickWindow>,
+        state: Option<crate::depth::PoolState>,
+    ) {
         let Ok(mut book) = self.inner.lock() else { return };
         let had = book.get(&key).is_some_and(|e| e.window.is_some());
         match (had, window.is_some()) {
@@ -377,7 +403,7 @@ impl TickBook {
             (false, true) => info!(pool = %key, "tick window available"),
             _ => {}
         }
-        book.insert(key, Entry { window, at: Instant::now() });
+        book.insert(key, Entry { window, state, at: Instant::now() });
     }
 }
 
@@ -861,7 +887,7 @@ impl Executor {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(pool = %key, err = %format!("{e:#}"), "no tick reader for this pool");
-                self.ticks.put(key, None);
+                self.ticks.put(key, None, None);
                 return;
             }
         };
@@ -898,7 +924,7 @@ impl Executor {
                     walkable_up = format!("{:.1}%", ((lhi / state.sqrt_p).powi(2) - 1.0) * 100.0),
                     "tick window read"
                 );
-                self.ticks.put(key, Some(w));
+                self.ticks.put(key, Some(w), Some(state));
             }
             Err(e) => self.keep_window(key, "could not read the tick window", e).await,
         }
@@ -1899,10 +1925,21 @@ impl Executor {
 
         let mut prepared = Vec::with_capacity(route.hops.len());
         for hop in &route.hops {
+            // Freshest first. The signal's own log describes the pool it came
+            // from as of that very swap; the tick scan is at most half a minute
+            // old and keeps running when calibration cannot; the calibration
+            // snapshot is the last resort and used to be the only one.
+            let scanned = self.ticks.state(hop.pool_ref()).map(|s| HopState {
+                sqrt_p: s.sqrt_p,
+                liquidity: s.liquidity,
+                lp_fee: s.lp_fee,
+                protocol_fee_0for1: s.protocol_fee_0for1,
+                protocol_fee_1for0: s.protocol_fee_1for0,
+            });
             let mut here = match fresh {
                 Some((p, s)) if p == hop.pool_ref() => s,
-                _ => match known.as_ref().and_then(|k| k.get(&hop.pool_ref())) {
-                    Some(s) => *s,
+                _ => match scanned.or_else(|| known.as_ref().and_then(|k| k.get(&hop.pool_ref())).copied()) {
+                    Some(s) => s,
                     None => {
                         warn!(
                             route = %route.name,
@@ -1911,8 +1948,9 @@ impl Executor {
                             usable_for_s = stale_after.as_secs(),
                             calibrate_secs = self.calibrate_secs,
                             "not priced: no usable state for this hop - the signal does not \
-                             cover it, and the calibration snapshot is missing, too old, or \
-                             describes a different number of hops"
+                             cover it, the tick scan has none for it, and the calibration \
+                             snapshot is missing, too old, or describes a different number \
+                             of hops"
                         );
                         return None;
                     }
