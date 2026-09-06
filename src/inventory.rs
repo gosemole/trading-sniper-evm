@@ -527,6 +527,13 @@ impl Inventory {
         true
     }
 
+    /// What a reservation was quoted at, before the chain said what really
+    /// arrived. For measuring one against the other.
+    pub fn quoted(&self, hash: ethers::types::H256) -> Option<ethers::types::U256> {
+        let p = self.pending.get(&format!("{hash:?}").to_lowercase())?;
+        ethers::types::U256::from_dec_str(&p.raw).ok()
+    }
+
     /// Everything still waiting on the chain, for a caller that has just
     /// started and needs to find out how those trades ended.
     pub fn unsettled(&self) -> Vec<(ethers::types::H256, Pending)> {

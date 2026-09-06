@@ -219,6 +219,33 @@ struct Walked {
 }
 
 impl Prepared {
+    /// A number in the right neighbourhood, for bracketing somebody else's
+    /// search. NEVER for a minimum.
+    ///
+    /// Where `walk` stops at the edge of what was read, this carries on as if
+    /// liquidity held - which may be wrong, and does not matter: a hint only
+    /// has to be close enough to save the router's bisection from doubling its
+    /// way up from two. That search costs a request per doubling, and a sale
+    /// asking with nothing to start from spent fifty-odd of them at the one
+    /// moment a position needed closing.
+    fn estimate(&self, amount_in: f64) -> Option<f64> {
+        let mut amount = amount_in;
+        for hop in &self.hops {
+            let walked = crate::depth::swap_exact_in_along(
+                hop.state,
+                hop.zero_for_one,
+                amount,
+                &hop.ladder.rungs,
+                crate::depth::Beyond::ConstantLiquidity,
+            );
+            match walked {
+                Ok(crate::depth::Walk::Done(r)) if r.amount_out > 0.0 => amount = r.amount_out,
+                _ => return None,
+            }
+        }
+        Some(amount)
+    }
+
     /// Walk the route at this size. Pure: no locks, no reads, no allocation
     /// beyond the impacts it reports.
     fn walk(&self, amount_in: f64) -> Option<Walked> {
@@ -421,10 +448,8 @@ struct Quoted {
     /// How long the asking took, so the log separates the network from
     /// everything else - which is otherwise invisible and dominates.
     took: Duration,
-    /// Deferred: a gas price that could not be read only matters if we send.
-    fees: Result<(U256, U256)>,
-    /// The nonce the node reported while the quote was in flight, if asked.
-    nonce_seen: Option<u64>,
+    /// Deferred: a gas price that is not known only matters if we send.
+    fees: Option<(U256, U256)>,
 }
 
 /// What the signal itself says about the pool it came from.
@@ -711,6 +736,8 @@ impl Executor {
         // header rather than off a lookup.
         let fees = Arc::new(swap::FeeWatch::default());
         fees.watch(cfg.ws_url.clone(), http.clone());
+        // And the fallback that used to run inside a buy, on a timer instead.
+        fees.top_up(http.clone());
         swap::keep_warm(http.clone());
 
         // Broadcasting fans out; everything else stays on the one endpoint the
@@ -1403,27 +1430,31 @@ impl Executor {
                  this sale from a snapshot"
             );
         }
-        let modelled = match plan.filter(|_| !retry && fresh.is_some()) {
-            Some(plan) => {
-                // The fee check uses the figure measured in this direction when
-                // the token was held long enough to measure it; otherwise the
-                // buying figure, which assumes the hook charges the same both
-                // ways. Failing it does not stop the sale - the router prices
-                // it instead, and prices it honestly.
-                let ppm = match plan.sell_yield_ppm.load(Ordering::Relaxed) {
-                    0 => plan.yield_ppm.load(Ordering::Relaxed),
-                    m => m,
-                };
-                match self.unstated_fee_acceptable(plan, ppm) {
-                    // A sale has no signal to be sized from, so it gathers its
-                    // own snapshot here rather than being handed one.
-                    true => self
-                        .prepare(plan, &sell, fresh, ppm)
-                        .and_then(|p| self.model_quote(&sell, &p, ppm, size)),
-                    false => None,
-                }
-            }
-            None => None,
+        // Prepared once, and used for two different things. The strict walk
+        // may decline - a retry never trusts it, and a ladder may not reach -
+        // but the loose one is still worth having, because the router's search
+        // needs somewhere to start and starting from nothing costs it fifty
+        // requests.
+        let ppm = plan
+            .map(|p| match p.sell_yield_ppm.load(Ordering::Relaxed) {
+                0 => p.yield_ppm.load(Ordering::Relaxed),
+                m => m,
+            })
+            .unwrap_or(0);
+        let prepared = plan
+            .filter(|p| self.unstated_fee_acceptable(p, ppm))
+            .and_then(|p| self.prepare(p, &sell, fresh, ppm));
+        let hint = prepared
+            .as_ref()
+            .and_then(|p| p.estimate(crate::route::u256_to_f64(size)))
+            .map(|a| crate::route::f64_to_u256_pub(a * ppm.min(PPM) as f64 / PPM as f64))
+            .unwrap_or_default();
+
+        // A sale that already reverted is not re-quoted by the model, and one
+        // with no live state was never going to be.
+        let modelled = match !retry && fresh.is_some() {
+            true => prepared.as_ref().and_then(|p| self.model_quote(&sell, p, ppm, size)),
+            false => None,
         };
         // The router's answer has no impact to report: it is not a model, so
         // there is no assumption to say how hard this leaned on.
@@ -1431,7 +1462,7 @@ impl Executor {
             Some(m) => (m.amount_out, "model", Some(m.impact)),
             None => (
                 execute::verify(
-                    &self.http, self.router, self.owner, &sell, size, U256::zero(), deadline, None,
+                    &self.http, self.router, self.owner, &sell, size, hint, deadline, None,
                 )
                 .await
                 .context("quoting the sale")?
@@ -1449,6 +1480,9 @@ impl Executor {
             sell = format!("{} {}", format_units(size, sell.input.decimals), sell.input.symbol),
             quoted = format!("{} {}", format_units(amount_out, sell.output.decimals), sell.output.symbol),
             priced_by,
+            // What the router's search was started from. Zero means it had to
+            // double its way up from nothing, which is fifty-odd requests.
+            hint = %format_units(hint, sell.output.decimals),
             impact_pct = impact
                 .map(|i| format!("{:.4}", i * 100.0))
                 .unwrap_or_else(|| "-".into()),
@@ -1476,18 +1510,13 @@ impl Executor {
             Some(g) if g != 0 => U256::from(g),
             _ => U256::from(GAS_FALLBACK),
         };
-        let want_nonce = self.next_nonce.lock().await.is_none();
-        let (fees, seen) = tokio::join!(
-            self.fees.params(&self.http),
-            async {
-                match want_nonce {
-                    true => swap::pending_nonce(&self.http, self.owner).await.ok(),
-                    false => None,
-                }
-            },
-        );
-        let fees = fees.context("reading the gas price")?;
-        let nonce = self.claim_nonce(seen).await?;
+        // Both from memory. Nothing between deciding to sell and broadcasting
+        // may wait on a request - see `swap::FeeWatch::params` and
+        // `claim_nonce`, which is why neither of them can ask any more.
+        let fees = self.fees.params().context(
+            "no gas price known yet - the header stream has not delivered one",
+        )?;
+        let nonce = self.claim_nonce().await?;
         match swap::send_nowait(&self.submit, &self.wallet, &tx, nonce.into(), fees, gas).await {
             Ok(hash) => {
                 info!(route = %sell.name, ?hash, nonce, %gas, "sold");
@@ -1496,6 +1525,7 @@ impl Executor {
             }
             Err(e) => {
                 *self.next_nonce.lock().await = None;
+                self.refill_nonce();
                 Err(e)
             }
         }
@@ -1590,28 +1620,13 @@ impl Executor {
             );
         };
 
-        // A nonce is only spent by a real send, so a dry run does not ask -
-        // and neither does a send that already knows the answer. This process
-        // is the only thing signing with this key while it runs, so once it
-        // has a counter, the counter IS the nonce; asking again would spend
-        // the last network wait left between a drop and a broadcast on
-        // confirming something we already know.
-        //
-        // The counter is filled at startup (see `build`), so in the ordinary
-        // case this asks for nothing at all - not even on the first buy, which
-        // used to be the one trade that paid for it. What is left is the send
-        // that failed and cleared the counter, which must ask because the gap
-        // it left is exactly what nobody knows the size of.
-        let want_nonce = self.execute && self.next_nonce.lock().await.is_none();
-        let (fees, nonce_seen) = tokio::join!(
-            self.fees.params(&self.http),
-            async {
-                match want_nonce {
-                    true => swap::pending_nonce(&self.http, self.owner).await.ok(),
-                    false => None,
-                }
-            },
-        );
+        // Read, never asked. This process is the only thing signing with this
+        // key while it runs, so the counter IS the nonce, and the gas price
+        // arrives on the header stream whether or not anybody is trading. Both
+        // used to fall back to a request when they had nothing, which put two
+        // round trips between a drop and a broadcast at exactly the moment the
+        // whole design exists to have none.
+        let fees = self.fees.params();
         // Read back rather than returned from `model_quote`, which has two
         // callers and no use for it: one uncontended lock, off the critical
         // arithmetic and before the send.
@@ -1628,7 +1643,6 @@ impl Executor {
             state_age_s,
             took: started.elapsed(),
             fees,
-            nonce_seen,
         })
     }
 
@@ -1674,9 +1688,11 @@ impl Executor {
         quoted: Quoted,
     ) -> Result<ethers::types::H256> {
         let name = plan.route.name.clone();
-        let fees = quoted.fees.context("reading the gas price")?;
+        let fees = quoted.fees.context(
+            "no gas price known yet - the header stream has not delivered one",
+        )?;
         let gas_limit = U256::from(plan.gas_limit.load(Ordering::Relaxed));
-        let nonce = self.claim_nonce(quoted.nonce_seen).await?;
+        let nonce = self.claim_nonce().await?;
         let started = Instant::now();
         match swap::send_nowait(
             &self.submit,
@@ -1698,6 +1714,7 @@ impl Executor {
                 // The number was taken but never used, and every later
                 // transaction would queue behind the hole it leaves.
                 *self.next_nonce.lock().await = None;
+                self.refill_nonce();
                 Err(e)
             }
         }
@@ -2062,16 +2079,38 @@ impl Executor {
     /// The premise is that nothing else signs with this key while the bot runs.
     /// If something did, its transaction would be missed until the next send
     /// failed and cleared the counter - which is what makes that reset matter.
-    async fn claim_nonce(&self, observed: Option<u64>) -> Result<u64> {
+    async fn claim_nonce(&self) -> Result<u64> {
         let mut slot = self.next_nonce.lock().await;
-        let n = match (*slot, observed) {
-            (Some(local), Some(seen)) => local.max(seen),
-            (Some(local), None) => local,
-            (None, Some(seen)) => seen,
-            (None, None) => swap::pending_nonce(&self.http, self.owner).await?,
-        };
+        let n = slot.context(
+            "no nonce in hand - the counter was cleared by a failed send and is being \
+             refilled; this trade is skipped rather than made to wait for it",
+        )?;
         *slot = Some(n + 1);
         Ok(n)
+    }
+
+    /// Put a number back in the counter, off the path of any trade.
+    ///
+    /// Called when a send clears it. Asking here rather than at the next trade
+    /// is the whole point: the gap a failed send leaves is exactly what nobody
+    /// knows the size of, and finding out takes a round trip that a buy must
+    /// not be made to wait for.
+    fn refill_nonce(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            match swap::pending_nonce(&me.http, me.owner).await {
+                Ok(n) => {
+                    let mut slot = me.next_nonce.lock().await;
+                    // Only if nothing has claimed one meanwhile: the node may
+                    // not have counted a transaction sent a moment ago.
+                    if slot.is_none() {
+                        *slot = Some(n);
+                        info!(nonce = n, "nonce counter refilled");
+                    }
+                }
+                Err(e) => warn!(err = %format!("{e:#}"), "could not refill the nonce counter"),
+            }
+        });
     }
 }
 

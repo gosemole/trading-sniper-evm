@@ -106,16 +106,61 @@ impl FeeWatch {
         Ok(())
     }
 
-    /// Fees to sign with. Returns instantly from the last header, and only asks
-    /// the node when no header is recent enough to trust.
-    pub async fn params(&self, http: &Provider<Http>) -> Result<(U256, U256)> {
+    /// Fees to sign with, from memory and never from the network.
+    ///
+    /// A trade must not wait on a request, and this used to be one of two
+    /// places a buy still could: a stale header sent it to `fee_params`, which
+    /// is two round trips at the one moment nothing may be spent on them.
+    /// Refreshing when stale is a background job now - see `watch`.
+    ///
+    /// `None` when no header has EVER been seen, which is a process that has
+    /// not yet been told what gas costs. Signing on a guess is worse than
+    /// missing one signal, and the miss is loud.
+    pub fn params(&self) -> Option<(U256, U256)> {
         let seen = self.seen_at.load(Ordering::Relaxed);
-        if seen != 0 && now_secs().saturating_sub(seen) <= FEES_STALE_AFTER_SECS {
-            let base = U256::from(self.base_fee.load(Ordering::Relaxed));
-            let tip = U256::from(self.tip.load(Ordering::Relaxed).max(TIP_FLOOR));
-            return Ok((base * 2 + tip, tip));
+        if seen == 0 {
+            return None;
         }
-        fee_params(http).await
+        let base = U256::from(self.base_fee.load(Ordering::Relaxed));
+        let tip = U256::from(self.tip.load(Ordering::Relaxed).max(TIP_FLOOR));
+        Some((base * 2 + tip, tip))
+    }
+
+    /// How old the last header is, so a caller can say so rather than guess.
+    pub fn age_secs(&self) -> Option<u64> {
+        match self.seen_at.load(Ordering::Relaxed) {
+            0 => None,
+            seen => Some(now_secs().saturating_sub(seen)),
+        }
+    }
+
+    /// Keep the figures usable when the header stream is not.
+    ///
+    /// The stream is the cheap source and this is the fallback, moved off the
+    /// path of a trade and onto a timer of its own: a buy reads whatever is in
+    /// memory, and keeping memory true is somebody else's job.
+    pub fn top_up(self: &Arc<Self>, http: Provider<Http>) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(FEES_STALE_AFTER_SECS)).await;
+                let stale = match me.age_secs() {
+                    None => true,
+                    Some(age) => age > FEES_STALE_AFTER_SECS,
+                };
+                if !stale {
+                    continue;
+                }
+                if let Ok((max_fee, tip)) = fee_params(&http).await {
+                    // Stored as a base, because that is what `params` doubles.
+                    let base = max_fee.saturating_sub(tip) / 2;
+                    me.base_fee.store(base.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
+                    me.tip.store(tip.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
+                    me.seen_at.store(now_secs(), Ordering::Relaxed);
+                    tracing::debug!("gas price refreshed without the header stream");
+                }
+            }
+        });
     }
 }
 

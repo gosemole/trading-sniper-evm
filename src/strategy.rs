@@ -799,6 +799,12 @@ impl Strategy {
                 credit_moved,
             },
         };
+        // Asked before settling, which consumes the reservation. What was
+        // quoted against what arrived is the only measurement of how far the
+        // model and the chain drift apart on a trade that LANDED - the ones
+        // that revert say so loudly, and the ones that do not used to say
+        // nothing at all, so the distribution was only ever half visible.
+        let quoted = self.inventory.quoted(s.hash);
         let side = if s.ok {
             self.inventory.settle(s.hash, s.moved, s.credit_moved, s.entry_price)
         } else {
@@ -815,6 +821,23 @@ impl Strategy {
             // position, and the inventory refuses to.
             return;
         };
+        if let (Side::Buy, true, Some(q), Some(got)) = (side, s.ok, quoted, s.moved) {
+            if !q.is_zero() {
+                let ratio = crate::route::u256_to_f64(got) / crate::route::u256_to_f64(q);
+                let short = (1.0 - ratio) * 100.0;
+                info!(
+                    tx = ?s.hash,
+                    quoted = %q,
+                    received = %got,
+                    // Positive means the model asked for more than the chain
+                    // gave. Some of it is the model, some of it is whoever got
+                    // in front of us between the signal and the block - and the
+                    // two only tell apart across many trades.
+                    short_pct = format!("{short:+.3}%"),
+                    "the fill against the quote"
+                );
+            }
+        }
         match (side, s.ok) {
             (Side::Buy, true) => {
                 if let Some(w) = self.watches.get(&s.pool) {
