@@ -67,6 +67,14 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
     let cfg = config::Config::load(&path)?;
+    // Said out loud, and absolute. `config.toml` is resolved against the
+    // working directory, so running the binary by its path from somewhere else
+    // reads a different file than the one being edited - and every parameter
+    // that decides a trade comes out of it.
+    tracing::info!(
+        config = %std::fs::canonicalize(&path).unwrap_or(path.clone()).display(),
+        "config loaded"
+    );
 
     // Opened before anything resolves a pool, so the first lookup already has
     // somewhere to look.

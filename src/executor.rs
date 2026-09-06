@@ -1151,11 +1151,19 @@ impl Executor {
         // that writes it is a circle with no way in. Measure at what there is
         // to spend instead - the ratio is what is wanted here, and the next
         // pass will have a snapshot to size itself properly from.
-        let Some(prepared) = self.prepare(plan, route, None, PPM) else {
+        //
+        // Asked BEFORE `prepare` rather than by letting it fail: its refusal is
+        // a warning aimed at a trade that will not happen, and on the one pass
+        // that is meant to have nothing it read as a fault instead of a start.
+        let cold = plan.state.lock().map(|s| s.is_none()).unwrap_or(true);
+        if cold {
             tracing::debug!(
                 route = %route.name,
                 "no snapshot to size the measurement from yet; measuring at the balance"
             );
+            return Ok(cap);
+        }
+        let Some(prepared) = self.prepare(plan, route, None, PPM) else {
             return Ok(cap);
         };
         let target = route.impact_pct / 100.0;
