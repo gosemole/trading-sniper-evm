@@ -12,7 +12,9 @@
 threshold_pct = 3     # signal on a drop this big (%) inside one block
 max_move_pct = 1.0    # depth line: what it costs to move the price this much (%)
 
-# Needed for --approve, --swap and auto_buy. Not for the monitor.
+# universal_router is needed for --approve, --swap and auto_buy; not for the
+# monitor. pool_manager is shared by every v4 pool and every v4 route, so it is
+# written once here and left out of the pools themselves.
 # universal_router = "0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99"
 # pool_manager     = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
 
@@ -22,14 +24,13 @@ WETH     = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
 USDG     = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
 PONS     = "0x39dbed3a2bd333467115de45665cc57f813c4571"
 POOLS    = "0x385b36ff682ab4c76e7c37a66b96aabc466471d5"
-LULU     = "0x4e62068525ab11fe768e29dfd00ef909b9803016"
-CAMELTOE = "0xc32b91fe216af1b834db02f33326e983ad8cf201"
 
-# v4 pool: PoolManager address + pool_id is all it takes.
+# v4 pool: the pool_id is all it takes - the manager comes from pool_manager
+# above. An `address` here still works and overrides it, for a pool held by a
+# different manager.
 # [[pools]]
 # name = "CAMELTOE/LULU (v4)"
 # version = "v4"
-# address = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
 # pool_id = "0x1e75aa57c6f96fd805296b4fa4969741060407f62c94a7f88c3fdfccc6cc2d35"
 # base_token = 1        # the side that "fell"; indexes the SORTED PoolKey
 # threshold_pct = 5     # optional, overrides the global

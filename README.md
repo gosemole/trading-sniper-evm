@@ -121,7 +121,7 @@ Global:
 | `calibrate_secs` | how often to re-measure what a route takes on top of its pools' stated fees, and how often the pool snapshot a buy is priced from is refreshed. Both a price input and a safety check: an unmeasured route is not bought, and one keeping over 5% is refused. `0` disables it, so nothing is ever bought. The snapshot is trusted for twice this interval, so raising it makes buys price off older state |
 | `pool_cache_path` | where recovered PoolKeys, decimals and symbols are kept |
 | `inventory_path` | where positions and unsettled trades are kept |
-| `universal_router`, `pool_manager`, `permit2` | contracts |
+| `universal_router`, `pool_manager`, `permit2` | contracts. `pool_manager` is shared by every v4 pool and every v4 route, so it is written once here and omitted from the pools themselves |
 
 Per route:
 
@@ -136,8 +136,10 @@ Per route:
 | `take_profit_pct` | sell the whole position once it is worth this much more than it cost, **net of both fees, the hook and impact** |
 | `exit_after_secs` | sell it anyway once held this long since the last buy |
 
-Per pool: `name`, `version`, `address`, `pool_id`, and optionally `base_token`,
-`threshold_pct`, `max_move_pct`. `base_token` is normally omitted - a pool named
+Per pool: `name`, `version`, `pool_id`, and optionally `base_token`,
+`threshold_pct`, `max_move_pct`. `address` is required for a v3 pool - that is
+what a v3 pool is - and omitted for a v4 one, which takes the global
+`pool_manager`. `base_token` is normally omitted - a pool named
 `BASE/QUOTE` says which side is which, and the index is derived from the name
 and checked against the chain.
 

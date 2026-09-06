@@ -98,8 +98,13 @@ pub struct Config {
     /// Permit2. Defaults to the canonical deterministic deployment.
     #[serde(default)]
     pub permit2: Option<String>,
-    /// v4 PoolManager used by routes. Defaults to the address of the first
-    /// v4 pool in `[[pools]]` when omitted.
+    /// v4 PoolManager. Every v4 pool on a chain shares one, so it belongs here
+    /// beside the router rather than repeated as each pool's `address` - which
+    /// is what `[[pools]]` used to require, one identical line per pool.
+    ///
+    /// A v4 pool with no `address` of its own uses this. Still optional, and
+    /// still inferred from the first v4 pool that does name one, so a config
+    /// written the old way keeps working unchanged.
     #[serde(default)]
     pub pool_manager: Option<String>,
     /// Signing key for swap execution. Prefer the PRIVATE_KEY environment
@@ -201,8 +206,13 @@ fn default_inventory() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PoolConfig {
     pub name: String,
-    /// v3: pool contract address. v4: PoolManager address.
-    pub address: String,
+    /// v3: the pool contract, and required - a v3 pool IS an address.
+    ///
+    /// v4: the PoolManager, and omitted in normal use. Every v4 pool on a chain
+    /// shares one manager, so it is written once as the global `pool_manager`
+    /// and left out here.
+    #[serde(default)]
+    pub address: Option<String>,
     /// Either "v3" (Uniswap V3 pool) or "v4" (Uniswap V4 via PoolManager).
     pub version: String,
     /// Ticker (from `[tokens]`) or raw address. v3: optional, read from the
@@ -352,6 +362,26 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
             "pool '{}': version must be 'v3' or 'v4'",
             p.name
         );
+        // A v3 pool is an address; a v4 pool borrows the shared manager.
+        if p.version == "v3" {
+            anyhow::ensure!(
+                p.address.is_some(),
+                "pool '{}': v3 needs its own address - that is what a v3 pool is",
+                p.name
+            );
+        } else {
+            anyhow::ensure!(
+                p.address.is_some() || cfg.pool_manager.is_some(),
+                "pool '{}': set pool_manager at the top of the config, or give this pool an \
+                 address of its own",
+                p.name
+            );
+        }
+        if let Some(a) = &p.address {
+            a.parse::<ethers::types::Address>().map_err(|e| {
+                anyhow::anyhow!("pool '{}': address \"{a}\" is not an address: {e}", p.name)
+            })?;
+        }
         anyhow::ensure!(
             p.base_token.is_none_or(|b| b <= 1),
             "pool '{}': base_token must be 0 or 1",
@@ -393,4 +423,83 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Everything `validate` insists on, so a test can vary one thing at a time.
+    fn with(extra: &str) -> anyhow::Result<Config> {
+        let src = format!(
+            "ws_url = \"wss://x\"\nhttp_url = \"https://x\"\nthreshold_pct = 3\n{extra}"
+        );
+        let cfg: Config = toml::from_str(&src)?;
+        validate(&cfg)?;
+        Ok(cfg)
+    }
+
+    const MANAGER: &str = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
+
+    /// Every v4 pool on a chain shares one PoolManager, so it is written once at
+    /// the top and the pools say nothing about it.
+    #[test]
+    fn a_v4_pool_takes_the_shared_manager() {
+        let cfg = with(&format!(
+            "pool_manager = \"{MANAGER}\"\n\
+             [[pools]]\nname = \"A/B (v4)\"\nversion = \"v4\"\npool_id = \"0x{}\"\n",
+            "11".repeat(32)
+        ))
+        .expect("a v4 pool needs no address of its own");
+        assert!(cfg.pools[0].address.is_none());
+    }
+
+    /// ...but something has to name it. Failing here beats resolving a pool
+    /// against an address nobody chose.
+    #[test]
+    fn a_v4_pool_with_no_manager_anywhere_is_refused() {
+        let e = with(&format!(
+            "[[pools]]\nname = \"A/B (v4)\"\nversion = \"v4\"\npool_id = \"0x{}\"\n",
+            "11".repeat(32)
+        ))
+        .expect_err("no manager, no address");
+        assert!(format!("{e:#}").contains("pool_manager"), "{e:#}");
+    }
+
+    /// A v3 pool IS an address; there is nothing for it to fall back on.
+    #[test]
+    fn a_v3_pool_must_name_its_own_contract() {
+        let e = with(&format!(
+            "pool_manager = \"{MANAGER}\"\n[[pools]]\nname = \"A/B\"\nversion = \"v3\"\n"
+        ))
+        .expect_err("a v3 pool without an address is not a pool");
+        assert!(format!("{e:#}").contains("v3"), "{e:#}");
+
+        with(&format!(
+            "[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"{MANAGER}\"\n"
+        ))
+        .expect("with its own address it is fine, and needs no manager");
+    }
+
+    /// A config written before `pool_manager` existed keeps working: the manager
+    /// is still inferred from a v4 pool that spells out its address.
+    #[test]
+    fn the_old_shape_still_parses() {
+        let cfg = with(&format!(
+            "[[pools]]\nname = \"A/B (v4)\"\nversion = \"v4\"\naddress = \"{MANAGER}\"\n\
+             pool_id = \"0x{}\"\n",
+            "11".repeat(32)
+        ))
+        .expect("an address per pool is still allowed");
+        assert_eq!(cfg.pools[0].address.as_deref(), Some(MANAGER));
+    }
+
+    /// A misspelled address is caught while someone is reading the message, not
+    /// when a pool is resolved against it.
+    #[test]
+    fn a_bad_address_is_refused_at_load() {
+        let e = with("[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"0xnope\"\n")
+            .expect_err("not an address");
+        assert!(format!("{e:#}").contains("not an address"), "{e:#}");
+    }
 }

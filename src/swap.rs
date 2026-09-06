@@ -91,9 +91,12 @@ impl FeeWatch {
                 self.seen_at.store(now_secs(), Ordering::Relaxed);
             }
             // The tip is a separate call, and blocks here are a tenth of a
-            // second apart, so it is worth far less often than every one.
+            // second apart, so it is worth far less often than every one - and
+            // far less often than every five seconds, which is twelve requests
+            // a minute spent on a number that moves slowly and is floored
+            // anyway.
             let now = now_secs();
-            if now.saturating_sub(tip_checked) >= 5 {
+            if now.saturating_sub(tip_checked) >= 20 {
                 tip_checked = now;
                 if let Ok(tip) = http.request::<_, U256>("eth_maxPriorityFeePerGas", ()).await {
                     self.tip.store(tip.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);

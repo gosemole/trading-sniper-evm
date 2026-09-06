@@ -623,12 +623,21 @@ const LADDER_TICKS: usize = 32;
 /// entirely and can never answer "I did not look there".
 const MAX_TICK: i64 = 887_272;
 
+/// How far either side of the price a scan aims to reach, as a fraction.
+///
+/// Wide enough that no single-block move worth trading through leaves it - the
+/// hardest drop seen on this chain was 32% - and no wider, because width is not
+/// free. It costs one `extsload` either way, but an endpoint metering
+/// `fullnode requests` counts the SLOADs inside it, and reading the WHOLE tick
+/// range is 117 of them per pool per pass at spacing 60 against 5 for this.
+/// That difference is what exhausted the budget and took calibration down with
+/// it; one word each side is already a price factor of 4.6 at that spacing.
+const WINDOW_SPAN: f64 = 0.50;
+
 /// Most bitmap words a scan will read on each side when the manager batches
-/// them. The whole tick range fits well inside this for every ordinary spacing:
-/// one `extsload` call at spacing 60 or above, a handful at spacing 10. The cap
-/// only ever bites on a spacing-1 pool, where 512 words still spans a price
-/// factor of about half a million.
-const MAX_WINDOW_WORDS: i64 = 512;
+/// them. Only bites on a finely spaced pool, where a word is a couple of
+/// percent and the span alone would ask for far more.
+const MAX_WINDOW_WORDS: i64 = 32;
 
 /// The same for a pool that cannot be batched - a v3 pool, where every word is
 /// its own `eth_call` and reading the range would be thousands of them.
@@ -642,19 +651,22 @@ const MAX_UNBATCHED_WORDS: i64 = 16;
 
 /// Bitmap words to read on EACH side of the word the price sits in.
 ///
-/// Aimed at the whole tick range, not at a percentage of price. An earlier
-/// version scanned a fixed +/-30% and left everything past it unanswerable -
-/// which is backwards, because at spacing 60 the entire range is 58 words a
-/// side and arrives in a single batched call. Paying one request to never have
-/// to guess again is not a trade-off worth thinking about.
+/// Enough for `WINDOW_SPAN`, never more than the whole tick range, and capped.
+/// A wider scan is not a free upgrade: see `WINDOW_SPAN`.
 ///
-/// The word the price sits in does not count towards coverage: the price can be
-/// hard against either of its edges, so only the words BEYOND it are guaranteed
-/// on both sides.
+/// The word the price sits in does not count towards coverage, and that is the
+/// subtlety: the price can be hard against either of its edges, so only the
+/// words BEYOND it are guaranteed on both sides. An earlier version counted it
+/// and returned a single word for every widely spaced pool - a window
+/// guaranteeing nothing, which `crosses` would then have answered from.
 fn window_words(spacing: i32, batched: bool) -> i32 {
     let cap = if batched { MAX_WINDOW_WORDS } else { MAX_UNBATCHED_WORDS };
+    let per_word = spacing.max(1) as f64 * 256.0;
+    let wanted = ((1.0 + WINDOW_SPAN).ln() / 1.0001f64.ln() / per_word).ceil() as i64;
+    // Never past the range a tick can be in - beyond it there is nothing to
+    // read, and asking is only cost.
     let whole_range = MAX_TICK / (spacing.max(1) as i64 * 256) + 1;
-    whole_range.clamp(1, cap) as i32
+    (wanted + 1).min(whole_range).clamp(1, cap) as i32
 }
 
 /// Whether a scan of this width reaches every tick the pool could have, in
@@ -1456,48 +1468,46 @@ mod tests {
         assert_eq!(w.crosses(f64::NAN, sqrt_at_tick(0)), None);
     }
 
-    /// Every ordinary spacing reads the WHOLE tick range, so `crosses` can
-    /// never come back "unread" for it - and it does so in a request or two,
-    /// which is why aiming at a percentage of price was the wrong idea.
-    ///
-    /// The word the price sits in cannot count towards coverage: the price can
-    /// sit hard against either of its edges, so only the words beyond it are
-    /// guaranteed on both sides.
+    /// A scan has to reach `WINDOW_SPAN` on the worse side (the price can sit
+    /// hard against an edge of its own word, so only the words beyond it
+    /// count), and has to stay cheap enough to repeat every thirty seconds.
+    /// The second half is not decoration: reading the whole tick range instead
+    /// was what exhausted the endpoint's budget.
     #[test]
-    fn an_ordinary_pool_is_scanned_end_to_end() {
-        for spacing in [10, 30, 60, 200, 2000] {
+    fn the_scan_reaches_its_span_without_costing_the_budget() {
+        for spacing in [1, 10, 30, 60, 200, 2000] {
             let words = window_words(spacing, true);
+            let guaranteed = (words as i64 - 1).max(0) * 256 * spacing as i64;
+            let covers = 1.0001f64.powf(guaranteed as f64) - 1.0;
             assert!(
-                covers_whole_range(words, spacing),
-                "spacing {spacing}: {words} words a side leaves part of the range unread"
+                covers >= WINDOW_SPAN || covers_whole_range(words, spacing),
+                "spacing {spacing}: {words} words cover only {:.0}%",
+                covers * 100.0
             );
-            // And it stays cheap enough to do every thirty seconds.
-            let calls = (2 * words as usize + 1).div_ceil(SLOTS_PER_CALL);
-            assert!(calls <= 6, "spacing {spacing}: {calls} extsload calls");
+            // Slots, not requests: an endpoint metering work counts every one.
+            let slots = 2 * words + 1;
+            assert!(slots <= 70, "spacing {spacing}: {slots} slots per pass");
         }
     }
 
-    /// Where the range does not fit, the cap still has to leave a span nothing
-    /// this bot trades could walk out of. The floor is deliberately lower for
-    /// an unbatched pool at spacing 1: coverage falls with spacing, and so does
-    /// how far such a pair moves, so the least-covered pools are the ones that
-    /// need it least.
+    /// The cap only bites on a finely spaced pool. There the span asks for
+    /// more words than are allowed, and what is left still has to cover more
+    /// than any real move - lower for an unbatched pool, where every word is
+    /// its own request, because coverage falls with spacing and so does how far
+    /// such a pair moves.
     #[test]
     fn a_capped_scan_still_covers_more_than_any_real_move() {
-        for (spacing, batched, least) in
-            [(1, true, 2.0), (60, false, 2.0), (1, false, 0.40)]
-        {
+        for (spacing, batched, least) in [(1, true, 0.50), (1, false, 0.40), (60, false, 2.0)] {
             let words = window_words(spacing, batched);
-            let guaranteed = words as i64 * 256 * spacing as i64;
-            let factor = 1.0001f64.powf(guaranteed as f64) - 1.0;
+            let guaranteed = (words as i64 - 1).max(0) * 256 * spacing as i64;
+            let covers = 1.0001f64.powf(guaranteed as f64) - 1.0;
             assert!(
-                factor >= least,
+                covers >= least,
                 "spacing {spacing} batched={batched}: covers only {:.1}%, wanted {:.0}%",
-                factor * 100.0,
+                covers * 100.0,
                 least * 100.0
             );
         }
-        // An unbatched pool must not ask for hundreds of eth_calls.
         assert!(window_words(1, false) <= MAX_UNBATCHED_WORDS as i32);
     }
 

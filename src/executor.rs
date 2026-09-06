@@ -274,6 +274,11 @@ impl TickBook {
     /// repeated twice a minute for as long as it lasts is a line nobody reads.
     /// Without this the only trace was `exact=false` on a buy, which says a
     /// trade was affected but not that anything is wrong.
+    /// How long ago this pool's window was last read, if it ever was.
+    async fn age(&self, key: PoolRef) -> Option<Duration> {
+        self.inner.lock().await.get(&key).map(|e| e.at.elapsed())
+    }
+
     async fn put(&self, key: PoolRef, window: Option<crate::depth::TickWindow>) {
         let mut book = self.inner.lock().await;
         let had = book.get(&key).is_some_and(|e| e.window.is_some());
@@ -473,9 +478,12 @@ impl Executor {
             // Not fatal - the pool may be about to be added - but silent
             // failure is exactly what this is otherwise.
             let watched = cfg.pools.iter().any(|p| {
-                let named = match &p.pool_id {
-                    Some(id) => parse_pool_ref(id).ok(),
-                    None => parse_pool_ref(&p.address).ok(),
+                let named = match (&p.pool_id, &p.address) {
+                    // A v4 pool is named by its id; a v3 pool by its own
+                    // address, which it always has.
+                    (Some(id), _) => parse_pool_ref(id).ok(),
+                    (None, Some(a)) => parse_pool_ref(a).ok(),
+                    (None, None) => None,
                 };
                 named == Some(trigger)
             });
@@ -700,11 +708,7 @@ impl Executor {
         // next, so it is worth centring on the truth.
         let state = match crate::depth::read_state(&reader).await {
             Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(pool = %key, err = %format!("{e:#}"), "could not read pool state");
-                self.ticks.put(key, None).await;
-                return;
-            }
+            Err(e) => return self.keep_window(key, "could not read pool state", e).await,
         };
         match crate::depth::tick_window(&reader, state.sqrt_p).await {
             Ok(w) => {
@@ -727,10 +731,32 @@ impl Executor {
                 );
                 self.ticks.put(key, Some(w)).await;
             }
-            Err(e) => {
-                tracing::debug!(pool = %key, err = %format!("{e:#}"), "could not read tick window");
-                self.ticks.put(key, None).await;
-            }
+            Err(e) => self.keep_window(key, "could not read the tick window", e).await,
+        }
+    }
+
+    /// A read failed. Leave whatever is on file alone.
+    ///
+    /// A failed read is not evidence that the last successful one was wrong,
+    /// and discarding it on that basis is what turned an endpoint's occasional
+    /// rate limit into a window flapping in and out every thirty seconds - each
+    /// refusal throwing away a perfectly good scan. What bounds a window's life
+    /// is its AGE, and `TICK_WINDOW_STALE_AFTER` already does that.
+    ///
+    /// So this only speaks up once there is genuinely nothing usable left,
+    /// which is the moment worth a warning rather than every moment on the way
+    /// to it.
+    async fn keep_window(&self, key: PoolRef, what: &str, e: anyhow::Error) {
+        match self.ticks.age(key).await {
+            Some(age) if age <= TICK_WINDOW_STALE_AFTER => tracing::debug!(
+                pool = %key, kept_age_s = age.as_secs(), err = %format!("{e:#}"),
+                "{what}; keeping the last one"
+            ),
+            _ => warn!(
+                pool = %key, err = %format!("{e:#}"),
+                "{what}, and there is no usable one left - trades through this pool are \
+                 priced by the impact percentage"
+            ),
         }
     }
 

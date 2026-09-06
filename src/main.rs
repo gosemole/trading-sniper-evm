@@ -103,10 +103,13 @@ async fn main() -> anyhow::Result<()> {
     // Armed routes are resolved and checked before the first log arrives: a
     // broken route should stop the process here, not at the one moment it was
     // meant to fire.
+    // One shared v4 PoolManager for the whole config: routes need it, and so
+    // does every v4 pool that no longer writes it out for itself.
+    let manager = pool_manager(&cfg)?;
     let auto = match executor::Executor::build(
         &http,
         &cfg,
-        pool_manager(&cfg)?,
+        manager,
         chain_id,
         execute,
     )
@@ -133,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
     let mut feeds = Vec::new();
     let tokens = cfg.tokens.clone();
     for pool_cfg in cfg.pools {
-        let pool = match pool::Pool::resolve(&http, &pool_cfg, &tokens).await {
+        let pool = match pool::Pool::resolve(&http, &pool_cfg, &tokens, Some(manager)).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(pool = %pool_cfg.name, err = %e, "failed to resolve pool, skipping");
@@ -266,12 +269,13 @@ async fn depth_check_cmd(
     // Two behind the head: a block the node has just announced is not always
     // readable yet, which is the `header not found` calibration keeps hitting.
     let at = http.get_block_number().await?.as_u64().saturating_sub(2);
+    let manager = pool_manager(cfg).ok();
     println!("comparing batched and unbatched tick walks at block {at}\n");
 
     let mut checked = 0;
     let mut differed = 0;
     for pc in &cfg.pools {
-        let pool = match pool::Pool::resolve(http, pc, &cfg.tokens).await {
+        let pool = match pool::Pool::resolve(http, pc, &cfg.tokens, manager).await {
             Ok(p) => p,
             Err(e) => {
                 println!("{:24} skipped: {e:#}", pc.name);
@@ -331,16 +335,9 @@ async fn check_all_routes(
     cfg: &config::Config,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!cfg.routes.is_empty(), "no [[routes]] configured");
-    let manager: ethers::types::Address = match &cfg.pool_manager {
-        Some(a) => a.parse()?,
-        None => cfg
-            .pools
-            .iter()
-            .find(|p| p.version == "v4")
-            .map(|p| p.address.parse())
-            .transpose()?
-            .context("set pool_manager, or add at least one v4 pool to infer it from")?,
-    };
+    // The same resolution the rest of the process uses; it was a second copy of
+    // it here, which is one place for the two to drift apart.
+    let manager = pool_manager(cfg)?;
     tracing::info!(?manager, routes = cfg.routes.len(), "checking routes");
 
     let mut failed = 0;
@@ -374,13 +371,16 @@ async fn check_all_routes(
 fn pool_manager(cfg: &config::Config) -> anyhow::Result<ethers::types::Address> {
     match &cfg.pool_manager {
         Some(a) => Ok(a.parse()?),
+        // Still inferred from a v4 pool that names one, so a config written
+        // before `pool_manager` existed keeps working untouched.
         None => cfg
             .pools
             .iter()
-            .find(|p| p.version == "v4")
-            .map(|p| p.address.parse())
+            .filter(|p| p.version == "v4")
+            .find_map(|p| p.address.as_ref())
+            .map(|a| a.parse())
             .transpose()?
-            .context("set pool_manager, or add at least one v4 pool to infer it from"),
+            .context("set pool_manager, or give at least one v4 pool an address to infer it from"),
     }
 }
 

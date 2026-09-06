@@ -113,15 +113,27 @@ pub struct Pool {
 
 impl Pool {
     /// Build a pool, resolving token/decimals on-chain when not given in config.
+    /// `manager` is the config's shared v4 PoolManager. A v4 pool with no
+    /// address of its own uses it - every v4 pool on a chain has the same one,
+    /// so writing it per pool was one identical line repeated. A v3 pool always
+    /// names its own contract and ignores this.
     pub async fn resolve(
         http: &Provider<Http>,
         cfg: &PoolConfig,
         tokens: &HashMap<String, String>,
+        manager: Option<Address>,
     ) -> Result<Self> {
-        let address: Address = cfg
-            .address
-            .parse()
-            .with_context(|| format!("invalid pool address for '{}'", cfg.name))?;
+        let address: Address = match &cfg.address {
+            Some(a) => a
+                .parse()
+                .with_context(|| format!("invalid pool address for '{}'", cfg.name))?,
+            None => manager.with_context(|| {
+                format!(
+                    "pool '{}': no address, and no pool_manager to fall back on",
+                    cfg.name
+                )
+            })?,
+        };
 
         // 1. Determine the PoolId for v4 (given directly, or derived from key).
         let pool_id = if cfg.version == "v4" {
@@ -1010,7 +1022,8 @@ mod tests {
         let t = registry();
         let mut a = PoolConfig {
             name: "t".into(),
-            address: "0x0000000000000000000000000000000000000000".into(),
+            // A v4 pool takes the shared manager, so it names no address.
+            address: None,
             version: "v4".into(),
             token0: Some("LULU".into()),
             token1: Some("CAMELTOE".into()),
@@ -1174,7 +1187,8 @@ mod tests {
         // c0 = 0x0 (native ETH), c1 = 0xb427..., fee 2500, tickSpacing 60, hooks 0x0.
         let cfg = PoolConfig {
             name: "t".into(),
-            address: "0x0000000000000000000000000000000000000000".into(),
+            // A v4 pool takes the shared manager, so it names no address.
+            address: None,
             version: "v4".into(),
             token0: Some("0x0000000000000000000000000000000000000000".into()),
             token1: Some("0xb427c36931e23b607cfafbcb5a93786117bad597".into()),
