@@ -27,8 +27,10 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Flags that take a value, so their value is not mistaken for the config
     // path: `--quote "test buy CAMELTOE"` must not try to open the route name.
-    const VALUE_FLAGS: [&str; 6] =
-        ["--quote", "--approve", "--swap", "--sell-all", "--amount", "--config"];
+    const VALUE_FLAGS: [&str; 8] = [
+        "--quote", "--approve", "--swap", "--sell-all", "--amount", "--config", "--wrap",
+        "--unwrap",
+    ];
     let consumed: std::collections::HashSet<usize> = args
         .iter()
         .enumerate()
@@ -53,6 +55,8 @@ async fn main() -> anyhow::Result<()> {
     // size do" without editing config.
     let amount = flag_value("--amount");
     let approve_token = flag_value("--approve");
+    let wrap_amount = flag_value("--wrap");
+    let unwrap_amount = flag_value("--unwrap");
     let path = flag_value("--config")
         .or_else(|| {
             args.iter()
@@ -102,6 +106,12 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(token) = approve_token {
         return approve_cmd(&http, &cfg, &token, execute).await;
+    }
+    if let Some(amount) = wrap_amount {
+        return wrap_cmd(&http, &cfg, &amount, true, chain_id, execute).await;
+    }
+    if let Some(amount) = unwrap_amount {
+        return wrap_cmd(&http, &cfg, &amount, false, chain_id, execute).await;
     }
 
     // Armed routes are resolved and checked before the first log arrives: a
@@ -607,6 +617,71 @@ async fn check_all_routes(
     cache::flush();
     anyhow::ensure!(failed == 0, "{failed} route(s) failed to resolve");
     Ok(())
+}
+
+/// Move between the native currency and its wrapper, by hand.
+///
+/// A route that trades a native pool while holding the wrapped token needs the
+/// wrapped token to exist first, and the native balance kept for gas has to be
+/// refilled from somewhere. Both are plain calls to the wrapper - no router, no
+/// pool, nothing this chain's fork could have changed.
+async fn wrap_cmd(
+    http: &ethers::providers::Provider<ethers::providers::Http>,
+    cfg: &config::Config,
+    amount: &str,
+    wrapping: bool,
+    chain_id: u64,
+    execute: bool,
+) -> anyhow::Result<()> {
+    let weth = weth(cfg)?.context("set `weth` in the config to wrap or unwrap")?;
+    // The wrapper matches the native currency it wraps, and every one of them
+    // has eighteen decimals.
+    let amount_raw = route::parse_units(amount, 18)
+        .with_context(|| format!("--{} {amount}", if wrapping { "wrap" } else { "unwrap" }))?;
+
+    let wallet = swap::load_wallet(cfg, chain_id)?;
+    let owner = ethers::signers::Signer::address(&wallet);
+    let native = swap::balance_of(http, ethers::types::Address::zero(), owner).await?;
+    let wrapped = swap::balance_of(http, weth, owner).await?;
+
+    println!("\n{} {} for {owner:?}", if wrapping { "wrap" } else { "unwrap" }, amount);
+    println!("  weth     {weth:?}");
+    println!("  native   {}", route::format_units(native, 18));
+    println!("  wrapped  {}", route::format_units(wrapped, 18));
+
+    // Said here rather than discovered as a revert, and said about the side
+    // that is actually short.
+    let (have, what) = match wrapping {
+        true => (native, "native"),
+        false => (wrapped, "wrapped"),
+    };
+    anyhow::ensure!(
+        have >= amount_raw,
+        "{what} balance is {} but this moves {amount}",
+        route::format_units(have, 18)
+    );
+    if wrapping {
+        // Wrapping every last wei leaves nothing to pay for the transaction
+        // doing it, which is a call that cannot be made.
+        anyhow::ensure!(
+            native > amount_raw,
+            "wrapping the whole native balance leaves nothing for the gas to send it with"
+        );
+    }
+
+    let tx = match wrapping {
+        true => swap::build_wrap(weth, amount_raw)?,
+        false => swap::build_unwrap(weth, amount_raw)?,
+    };
+    println!("\ntransaction:");
+    tx.print(0);
+
+    if !execute {
+        println!("\ndry run - nothing sent. Re-run with --execute to submit.");
+        return Ok(());
+    }
+    println!("\nsubmitting from {owner:?}");
+    swap::send_all(http, wallet, std::slice::from_ref(&tx)).await
 }
 
 /// The wrapped native token, when one is configured.

@@ -244,6 +244,35 @@ pub fn build_unlimited_approval(
     ])
 }
 
+/// Wrap native currency: `WETH.deposit()` with the amount as `msg.value`.
+///
+/// A plain call to the wrapper, not a router command. Nothing about it depends
+/// on which router is deployed or how this chain's fork encodes its inputs -
+/// `deposit()` and `withdraw(uint256)` are the whole of WETH9's interface for
+/// this, and they have not changed since 2017.
+pub fn build_wrap(weth: Address, amount: U256) -> Result<PendingTx> {
+    anyhow::ensure!(!amount.is_zero(), "wrapping nothing");
+    Ok(PendingTx {
+        label: format!("WETH.deposit()  {amount} wei"),
+        to: weth,
+        data: Bytes::from(selector("deposit()")),
+        value: amount,
+    })
+}
+
+/// Unwrap back to the native currency: `WETH.withdraw(wad)`.
+pub fn build_unwrap(weth: Address, amount: U256) -> Result<PendingTx> {
+    anyhow::ensure!(!amount.is_zero(), "unwrapping nothing");
+    let mut data = selector("withdraw(uint256)");
+    data.extend_from_slice(&word(amount));
+    Ok(PendingTx {
+        label: format!("WETH.withdraw({amount})"),
+        to: weth,
+        data: Bytes::from(data),
+        value: U256::zero(),
+    })
+}
+
 /// EIP-1559 fees with enough headroom that a rising base fee does not strand
 /// the transaction.
 ///
@@ -914,6 +943,32 @@ mod tests {
         let one = Broadcaster::new(&["http://127.0.0.1:8545".to_string()]).unwrap();
         assert_eq!(one.width(), 1);
         assert_eq!(one.labels(), vec!["http://127.0.0.1:8545"]);
+    }
+
+    /// Wrapping is a payable call with no arguments; unwrapping is an argument
+    /// with no payment. Getting the two the wrong way round would send ETH to a
+    /// function that does not want it, or ask for a withdrawal of nothing.
+    #[test]
+    fn wrapping_calldata_is_well_formed() {
+        let weth = Address::from_low_u64_be(0xbeef);
+        let amount = U256::from(1_500_000_000_000_000_000u64);
+
+        let w = build_wrap(weth, amount).unwrap();
+        assert_eq!(w.to, weth);
+        assert_eq!(w.value, amount, "the amount is the payment, not an argument");
+        // keccak("deposit()")[..4]
+        assert_eq!(hex::encode(&w.data), "d0e30db0");
+
+        let u = build_unwrap(weth, amount).unwrap();
+        assert_eq!(u.to, weth);
+        assert!(u.value.is_zero(), "unwrapping pays nothing in");
+        // keccak("withdraw(uint256)")[..4] followed by the amount
+        assert_eq!(&hex::encode(&u.data)[..8], "2e1a7d4d");
+        assert_eq!(u.data.len(), 36);
+        assert_eq!(U256::from_big_endian(&u.data[4..36]), amount);
+
+        assert!(build_wrap(weth, U256::zero()).is_err());
+        assert!(build_unwrap(weth, U256::zero()).is_err());
     }
 
     #[test]

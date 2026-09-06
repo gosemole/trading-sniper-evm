@@ -103,6 +103,17 @@ sell. Without `--execute` it only prints them.
 Running the bot with `--execute` does this by itself for every armed route, so
 this command is only needed for the manual ones (`--swap`, `--sell-all`).
 
+```bash
+cargo run -- --wrap 0.5
+cargo run -- --unwrap 0.2 --execute
+```
+
+Move between the native currency and its wrapper, for a setup that trades a
+native pool while holding the wrapped token. Needs `weth` in the config. Prints
+both balances and the exact call; sends only with `--execute`. Wrapping refuses
+to take the whole native balance, because the transaction doing it has to be
+paid for out of what is left.
+
 Running the bot:
 
 ```bash
