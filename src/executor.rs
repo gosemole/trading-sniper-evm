@@ -1146,15 +1146,27 @@ impl Executor {
             .last()
             .map(|h| h.pool_ref())
             .context("route has no hops")?;
-        let prepared = self
-            .prepare(plan, route, None, PPM)
-            .context("no usable pool state to size the measurement from")?;
+        // No snapshot yet, which is the state every route starts in: the
+        // snapshot is written by this very pass, so asking it to size the pass
+        // that writes it is a circle with no way in. Measure at what there is
+        // to spend instead - the ratio is what is wanted here, and the next
+        // pass will have a snapshot to size itself properly from.
+        let Some(prepared) = self.prepare(plan, route, None, PPM) else {
+            tracing::debug!(
+                route = %route.name,
+                "no snapshot to size the measurement from yet; measuring at the balance"
+            );
+            return Ok(cap);
+        };
         let target = route.impact_pct / 100.0;
         let impact_at = |amount: U256| -> Option<f64> {
             let walked = prepared.walk(crate::route::u256_to_f64(amount))?;
             walked.impacts.iter().find(|(p, _)| *p == key).map(|(_, i)| *i)
         };
-        size_to_impact(cap, target, impact_at).context("the wallet cannot move this pool that far")
+        // Falling back rather than failing: a measurement at the wrong size is
+        // worth more than no measurement, and no measurement means no trading
+        // at all - `unstated_fee_acceptable` refuses a route it has never seen.
+        Ok(size_to_impact(cap, target, impact_at).unwrap_or(cap))
     }
 
     /// The address everything is signed and settled from.
@@ -1236,7 +1248,7 @@ impl Executor {
             return Ok(None);
         }
         let amount_out = quoted.amount_out;
-        let hash = self.broadcast(key, plan, &tx, quoted).await?;
+        let hash = self.broadcast(key, plan, &tx, spend, quoted).await?;
         Ok(Some(Fill { hash, sold: spend, amount_out }))
     }
 
@@ -1622,6 +1634,9 @@ impl Executor {
         key: PoolRef,
         plan: &Plan,
         tx: &crate::swap::PendingTx,
+        // The size this transaction spends, so the gas it really costs can be
+        // measured afterwards at that size rather than at a token amount.
+        spend: U256,
         quoted: Quoted,
     ) -> Result<ethers::types::H256> {
         let name = plan.route.name.clone();
@@ -1642,7 +1657,7 @@ impl Executor {
             Ok(hash) => {
                 info!(route = %name, ?hash, nonce, %gas_limit,
                       send_ms = started.elapsed().as_millis(), "sent");
-                self.remeasure_gas(key);
+                self.remeasure_gas(key, spend);
                 Ok(hash)
             }
             Err(e) => {
@@ -1717,14 +1732,17 @@ impl Executor {
 
     /// Re-measure a route's gas in the background, so the next buy signs with a
     /// figure that reflects the pool as it is now.
-    fn remeasure_gas(self: &Arc<Self>, key: PoolRef) {
+    fn remeasure_gas(self: &Arc<Self>, key: PoolRef, size: U256) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             let Some(plan) = me.plans.get(&key) else { return };
+            // At the size that was just sent. A one-wei probe reverts - the
+            // swap returns nothing - so it measured nothing and the limit was
+            // always the fallback.
             let probe = match execute::pending_swap(
                 me.router,
                 &plan.route,
-                U256::one(),
+                size,
                 U256::one(),
                 execute::deadline_in(600),
             ) {
