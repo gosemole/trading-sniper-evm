@@ -583,7 +583,7 @@ async fn check_all_routes(
 
     let mut failed = 0;
     for rc in &cfg.routes {
-        match route::Route::resolve(http, manager, rc, &cfg.tokens).await {
+        match route::Route::resolve(http, manager, rc, &cfg.tokens, weth(cfg)?).await {
             Ok(r) => {
                 println!("\nroute \"{}\"  OK", r.name);
                 println!(
@@ -607,6 +607,11 @@ async fn check_all_routes(
     cache::flush();
     anyhow::ensure!(failed == 0, "{failed} route(s) failed to resolve");
     Ok(())
+}
+
+/// The wrapped native token, when one is configured.
+fn weth(cfg: &config::Config) -> anyhow::Result<Option<ethers::types::Address>> {
+    cfg.weth.as_deref().map(str::parse).transpose().map_err(Into::into)
 }
 
 fn pool_manager(cfg: &config::Config) -> anyhow::Result<ethers::types::Address> {
@@ -639,7 +644,7 @@ async fn quote_route_cmd(
         .find(|r| r.name == name)
         .with_context(|| format!("no route named '{name}' in config"))?;
     let manager = pool_manager(cfg)?;
-    let r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
+    let r = route::Route::resolve(http, manager, rc, &cfg.tokens, weth(cfg)?).await?;
     let amount_in = manual_amount(&r, amount)?;
     let q = r.quote(http, manager, None, amount_in).await?;
 
@@ -768,7 +773,7 @@ async fn swap_cmd(
     let router = swap::resolve_addr(&cfg.universal_router, None, "universal_router")?;
     let permit2 = swap::resolve_addr(&cfg.permit2, Some(swap::PERMIT2_DEFAULT), "permit2")?;
 
-    let r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
+    let r = route::Route::resolve(http, manager, rc, &cfg.tokens, weth(cfg)?).await?;
     let amount_in = manual_amount(&r, amount)?;
     let chain_id = http.get_chainid().await?.as_u64();
     let wallet = swap::load_wallet(cfg, chain_id)?;
@@ -891,7 +896,7 @@ async fn sell_all_cmd(
     let mut buy = None;
     let mut also_end_here = Vec::new();
     for rc in &cfg.routes {
-        let r = route::Route::resolve(http, manager, rc, &cfg.tokens)
+        let r = route::Route::resolve(http, manager, rc, &cfg.tokens, weth(cfg)?)
             .await
             .with_context(|| format!("route '{}'", rc.name))?;
         if r.output.address == token {

@@ -20,6 +20,14 @@ max_move_pct = 1.0    # depth line: what it costs to move the price this much (%
 # written once here and left out of the pools themselves.
 # universal_router = "0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99"
 # pool_manager     = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+# weth             = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+#   Set this to trade a NATIVE pool while holding the wrapped token instead. A
+#   v4 pool names its currencies, so one holding ETH is a different pool from
+#   one holding WETH and there is no choice about which to use - but with this
+#   set, a route can write `input = "WETH"` for a native pool and the router
+#   unwraps on the way in and wraps on the way out, inside the same
+#   transaction. The native balance is then left alone for gas, and gas_reserve
+#   stops applying to that route.
 
 [tokens]
 ETH      = "0x0000000000000000000000000000000000000000"

@@ -588,7 +588,8 @@ impl Executor {
 
         let mut plans = HashMap::new();
         for rc in armed {
-            let route = Route::resolve(http, manager, rc, &cfg.tokens)
+            let weth = cfg.weth.as_deref().map(str::parse).transpose().context("weth")?;
+            let route = Route::resolve(http, manager, rc, &cfg.tokens, weth)
                 .await
                 .with_context(|| format!("auto_buy route '{}'", rc.name))?;
             // Default to the pool the route ends in: that is the one whose

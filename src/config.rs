@@ -105,6 +105,20 @@ pub struct Config {
     /// reserve large enough for many transactions has to be right once.
     #[serde(default = "default_gas_reserve")]
     pub gas_reserve: String,
+    /// The wrapped native token, when a route pays in it for a pool that holds
+    /// the native one.
+    ///
+    /// A v4 pool NAMES its currencies: one holding native ETH is a different
+    /// pool from one holding WETH, and which to use is not a choice. Setting
+    /// this lets a route hold WETH anyway - the router unwraps on the way in
+    /// and wraps on the way out, in the same transaction - so the native
+    /// balance is left alone for gas and the traded balance is exactly what
+    /// this bot moved.
+    ///
+    /// Unset means a route spending the native currency spends it directly, as
+    /// it always did.
+    #[serde(default)]
+    pub weth: Option<String>,
     /// Uniswap Universal Router, the contract swaps are sent to.
     #[serde(default)]
     pub universal_router: Option<String>,
@@ -339,6 +353,10 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
             !u.trim().is_empty(),
             "submit_urls[{i}] is empty - remove the entry rather than leaving a blank one"
         );
+    }
+    if let Some(w) = &cfg.weth {
+        w.parse::<ethers::types::Address>()
+            .map_err(|e| anyhow::anyhow!("weth \"{w}\" is not an address: {e}"))?;
     }
     for (ticker, addr) in &cfg.tokens {
         anyhow::ensure!(!ticker.is_empty(), "[tokens] has an empty ticker");

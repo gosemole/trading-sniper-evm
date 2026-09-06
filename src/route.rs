@@ -137,6 +137,14 @@ pub struct Route {
     /// question about one trade and one moment, and it is answered where that
     /// is known and passed to whoever needs it.
     pub impact_pct: f64,
+    /// The wrapped native token this route pays in, when the path itself runs
+    /// through the NATIVE one.
+    ///
+    /// `input` is then the wrapped token (what is approved, spent and tracked)
+    /// while the hops start or end at the zero address. The router bridges the
+    /// two inside the same transaction: it unwraps what goes in and wraps what
+    /// comes out, so the native balance is never touched except for gas.
+    pub wrap: Option<Address>,
     pub max_slippage_pct: f64,
     pub hops: Vec<Hop>,
 }
@@ -193,12 +201,17 @@ impl Route {
         manager: Address,
         cfg: &RouteConfig,
         tokens: &HashMap<String, String>,
+        weth: Option<Address>,
     ) -> Result<Self> {
         let input_addr = resolve_token(tokens, &cfg.input)
             .with_context(|| format!("route '{}': bad input token", cfg.name))?;
 
         let mut hops = Vec::with_capacity(cfg.pools.len());
         let mut cursor = input_addr;
+        // Set when the path runs through the native currency while this route
+        // pays in the wrapped one. Decided at the first hop, because that is
+        // where the two first fail to meet.
+        let mut wrap = None;
         for (i, raw) in cfg.pools.iter().enumerate() {
             let (venue, c0, c1, fee, tick_spacing) =
                 match parse_pool_ref(raw)
@@ -231,6 +244,18 @@ impl Route {
                     }
                 };
 
+            // Paying in WETH for a pool that holds native ETH: the router
+            // unwraps on the way in, so the PATH starts at the zero address
+            // while the route still spends, approves and tracks WETH.
+            if i == 0
+                && cursor != c0
+                && cursor != c1
+                && weth == Some(cursor)
+                && (c0 == Address::zero() || c1 == Address::zero())
+            {
+                wrap = Some(cursor);
+                cursor = Address::zero();
+            }
             let output = if cursor == c0 {
                 c1
             } else if cursor == c1 {
@@ -263,13 +288,26 @@ impl Route {
         );
 
         let input = describe(http, input_addr).await?;
-        let output = describe(http, cursor).await?;
+        // The path may end on the native currency while the route is paid out
+        // in the wrapped one - the mirror of the unwrap above, and the router
+        // wraps before it hands anything back.
+        if wrap.is_none() && cursor == Address::zero() {
+            if let Some(w) = weth.filter(|w| *w == input_addr) {
+                wrap = Some(w);
+            }
+        }
+        let out_addr = match (wrap, cursor == Address::zero()) {
+            (Some(w), true) => w,
+            _ => cursor,
+        };
+        let output = describe(http, out_addr).await?;
 
         Ok(Route {
             name: cfg.name.clone(),
             input,
             output,
             impact_pct: cfg.impact_pct,
+            wrap,
             max_slippage_pct: cfg.max_slippage_pct,
             hops,
         })
@@ -304,6 +342,9 @@ impl Route {
             // an impact; the target is carried anyway so a reversal round trip
             // is the original.
             impact_pct: self.impact_pct,
+            // Which end of the path is native changes, but that it is handled
+            // as the wrapped token does not.
+            wrap: self.wrap,
             max_slippage_pct: self.max_slippage_pct,
             hops,
         }
@@ -517,6 +558,7 @@ mod tests {
             input: tok(1, 6, "A"),
             output: tok(3, 18, "C"),
             impact_pct: 0.5,
+            wrap: None,
             max_slippage_pct: 1.0,
             hops: vec![hop(1, 2, 1, 2, 6, 8), hop(2, 3, 2, 3, 8, 18)],
         }

@@ -62,6 +62,20 @@ use ethers::utils::keccak256;
 
 /// Universal Router commands.
 const CMD_V3_SWAP_EXACT_IN: u8 = 0x00;
+/// `PERMIT2_TRANSFER_FROM(address token, address recipient, uint160 amount)` -
+/// pulls a token from the caller onto the router, which is the only way to get
+/// WETH there for unwrapping.
+const CMD_PERMIT2_TRANSFER_FROM: u8 = 0x02;
+/// `SWEEP(address token, address recipient, uint256 amountMin)` - hands the
+/// router's balance of a token to somebody, refusing below the minimum. It is
+/// what carries the slippage guard when a sale ends in a wrap.
+const CMD_SWEEP: u8 = 0x04;
+/// `WRAP_ETH(address recipient, uint256 amount)` - `amount` is an AMOUNT, not a
+/// minimum, and `CONTRACT_BALANCE` means "everything the router holds".
+const CMD_WRAP_ETH: u8 = 0x0b;
+/// `UNWRAP_WETH(address recipient, uint256 amountMin)` - unwraps the router's
+/// whole WETH balance, refusing below the minimum.
+const CMD_UNWRAP_WETH: u8 = 0x0c;
 const CMD_V4_SWAP: u8 = 0x10;
 
 /// v4-periphery `Actions` opcodes.
@@ -107,6 +121,14 @@ fn address_this() -> Address {
 
 fn selector(sig: &str) -> Vec<u8> {
     keccak256(sig.as_bytes())[..4].to_vec()
+}
+
+fn u160_arg(v: U256, what: &str) -> Result<U256> {
+    anyhow::ensure!(
+        v < (U256::one() << 160),
+        "{what} ({v}) does not fit in the uint160 Permit2 stores amounts as"
+    );
+    Ok(v)
 }
 
 fn u128_arg(v: U256, what: &str) -> Result<U256> {
@@ -170,6 +192,7 @@ fn v3_leg(
     leg: &[&Hop],
     first: bool,
     last: bool,
+    payer_is_user: bool,
     min_out: U256,
 ) -> Result<Vec<u8>> {
     Ok(encode(&[
@@ -179,7 +202,7 @@ fn v3_leg(
         AbiToken::Uint(if first { amount_in } else { contract_balance() }),
         AbiToken::Uint(min_out),
         AbiToken::Bytes(v3_path(leg)?),
-        AbiToken::Bool(first),
+        AbiToken::Bool(payer_is_user),
         AbiToken::Array(Vec::new()),
     ]))
 }
@@ -224,16 +247,25 @@ fn exact_in_single(hop: &Hop, amount_in: U256, min_out: U256) -> Result<Vec<u8>>
 /// `SETTLE` puts the input currency onto the pool manager, every hop then
 /// swaps the whole open credit, and a final take moves the output out. Only
 /// where the money comes from and where it goes changes.
+#[allow(clippy::too_many_arguments)]
 fn v4_leg(
     amount_in: U256,
     leg: &[&Hop],
     first: bool,
     last: bool,
+    payer_is_user: bool,
+    takes_to_router: bool,
     min_out: U256,
 ) -> Result<Vec<u8>> {
     let mut actions = vec![ACTION_SETTLE];
     actions.extend(std::iter::repeat_n(ACTION_SWAP_EXACT_IN_SINGLE, leg.len()));
-    actions.push(if last { ACTION_TAKE_ALL } else { ACTION_TAKE });
+    // `TAKE_ALL` pays the caller and carries the minimum. A leg whose output is
+    // about to be wrapped has to leave it on the router instead, and the
+    // minimum then moves to the `SWEEP` that hands the wrapped token over.
+    actions.push(match last && !takes_to_router {
+        true => ACTION_TAKE_ALL,
+        false => ACTION_TAKE,
+    });
 
     let mut params = Vec::with_capacity(actions.len());
     // What is settled here becomes the open credit the first hop swaps, and the
@@ -247,15 +279,16 @@ fn v4_leg(
     params.push(AbiToken::Bytes(encode(&[
         AbiToken::Address(leg[0].input),
         // The first leg is paid for by the caller through Permit2; a later one
-        // spends what the previous leg left on the router.
+        // spends what the previous leg left on the router - and so does the
+        // first, when what it spends was just unwrapped there.
         AbiToken::Uint(settle_amount),
-        AbiToken::Bool(first),
+        AbiToken::Bool(payer_is_user),
     ])));
     for hop in leg {
         params.push(AbiToken::Bytes(exact_in_single(hop, OPEN_DELTA, U256::zero())?));
     }
     let out = leg[leg.len() - 1].output;
-    params.push(AbiToken::Bytes(if last {
+    params.push(AbiToken::Bytes(if last && !takes_to_router {
         // TAKE_ALL(currency, minimum) - the whole slippage guard of the route.
         encode(&[AbiToken::Address(out), AbiToken::Uint(min_out)])
     } else {
@@ -283,21 +316,87 @@ pub fn execute_calldata(
 ) -> Result<Bytes> {
     anyhow::ensure!(!route.hops.is_empty(), "route has no hops");
     let legs = legs(route);
-    let mut commands = Vec::with_capacity(legs.len());
-    let mut inputs = Vec::with_capacity(legs.len());
+
+    // Which end of the path runs through the native currency while the route
+    // is paid in the wrapped one. Both can be true at once, for a path that
+    // starts and ends native.
+    let native = |a: Address| a == Address::zero();
+    let unwrap_in = route.wrap.filter(|_| native(route.hops[0].input));
+    let wrap_out = route.wrap.filter(|_| native(route.hops[route.hops.len() - 1].output));
+
+    let mut commands = Vec::with_capacity(legs.len() + 4);
+    let mut inputs = Vec::with_capacity(legs.len() + 4);
+
+    if let Some(weth) = unwrap_in {
+        // Onto the router, then out of its wrapper. After this the router holds
+        // the native currency and the swap settles from ITS balance rather than
+        // pulling from the caller - which is what `payer_is_user = false` below
+        // says, and the only reason that flag is not simply `first`.
+        commands.push(CMD_PERMIT2_TRANSFER_FROM);
+        inputs.push(AbiToken::Bytes(encode(&[
+            AbiToken::Address(weth),
+            AbiToken::Address(address_this()),
+            AbiToken::Uint(u160_arg(amount_in, "amount_in")?),
+        ])));
+        commands.push(CMD_UNWRAP_WETH);
+        inputs.push(AbiToken::Bytes(encode(&[
+            AbiToken::Address(address_this()),
+            AbiToken::Uint(amount_in),
+        ])));
+    }
+
     for (i, leg) in legs.iter().enumerate() {
         let first = i == 0;
         let last = i + 1 == legs.len();
         // Only the last leg carries the minimum: an intermediate one has no
         // business refusing an amount that the rest of the route still acts on.
-        let leg_min = if last { min_out } else { U256::zero() };
+        // Nor does the last one, when a wrap still stands between the swap and
+        // the wallet - the guard moves to the `SWEEP` that finishes the job.
+        let leg_min = match last && wrap_out.is_none() {
+            true => min_out,
+            false => U256::zero(),
+        };
+        let payer_is_user = first && unwrap_in.is_none();
+        let takes_to_router = last && wrap_out.is_some();
         if leg[0].venue.is_v4() {
             commands.push(CMD_V4_SWAP);
-            inputs.push(AbiToken::Bytes(v4_leg(amount_in, leg, first, last, leg_min)?));
+            inputs.push(AbiToken::Bytes(v4_leg(
+                amount_in,
+                leg,
+                first,
+                last,
+                payer_is_user,
+                takes_to_router,
+                leg_min,
+            )?));
         } else {
             commands.push(CMD_V3_SWAP_EXACT_IN);
-            inputs.push(AbiToken::Bytes(v3_leg(amount_in, leg, first, last, leg_min)?));
+            inputs.push(AbiToken::Bytes(v3_leg(
+                amount_in,
+                leg,
+                first,
+                last,
+                payer_is_user,
+                leg_min,
+            )?));
         }
+    }
+
+    if let Some(weth) = wrap_out {
+        // Everything the swap just left on the router, wrapped and handed over.
+        // `WRAP_ETH` takes an amount and not a minimum, so the guard is the
+        // `SWEEP` after it - which is why the leg above gave its minimum up.
+        commands.push(CMD_WRAP_ETH);
+        inputs.push(AbiToken::Bytes(encode(&[
+            AbiToken::Address(address_this()),
+            AbiToken::Uint(contract_balance()),
+        ])));
+        commands.push(CMD_SWEEP);
+        inputs.push(AbiToken::Bytes(encode(&[
+            AbiToken::Address(weth),
+            AbiToken::Address(msg_sender()),
+            AbiToken::Uint(min_out),
+        ])));
     }
 
     let mut data = selector("execute(bytes,bytes[],uint256)");
@@ -715,9 +814,127 @@ mod tests {
             input: RouteToken { address: first, decimals: 18, symbol: "IN".into() },
             output: RouteToken { address: last, decimals: 18, symbol: "OUT".into() },
             impact_pct: 0.5,
+            wrap: None,
             max_slippage_pct: 1.0,
             hops,
         }
+    }
+
+    const WETH: u64 = 0xbeef;
+
+    /// A route paying in WETH through a pool that holds the native currency.
+    fn wrapped_route(hops: Vec<Hop>) -> Route {
+        let weth = Address::from_low_u64_be(WETH);
+        let mut r = route_of(hops);
+        r.wrap = Some(weth);
+        r.input = RouteToken { address: weth, decimals: 18, symbol: "WETH".into() };
+        r
+    }
+
+    /// Paying in WETH for a native pool has to do three things in one
+    /// transaction: get the WETH onto the router, unwrap it there, and then
+    /// settle the swap from the ROUTER's balance instead of pulling from the
+    /// caller. That last one is the easy part to miss - `payer_is_user` was
+    /// simply "is this the first leg" before, which would send the router to
+    /// Permit2 for a currency the caller does not hold.
+    #[test]
+    fn paying_in_weth_unwraps_before_the_swap() {
+        // A pool holding native ETH on one side.
+        let r = wrapped_route(vec![v4_hop(0, 2, 3477)]);
+        let (commands, inputs) =
+            unwrap(&execute_calldata(&r, U256::from(1000u64), U256::from(9u64), U256::zero()).unwrap());
+
+        assert_eq!(
+            commands,
+            vec![CMD_PERMIT2_TRANSFER_FROM, CMD_UNWRAP_WETH, CMD_V4_SWAP],
+            "the wrapper has to be dealt with before the swap, not after"
+        );
+
+        // Pulled to the router, not to the caller.
+        let pull = ethers::abi::decode(
+            &[ParamType::Address, ParamType::Address, ParamType::Uint(160)],
+            &inputs[0],
+        )
+        .unwrap();
+        assert_eq!(pull[0], AbiToken::Address(Address::from_low_u64_be(WETH)));
+        assert_eq!(pull[1], AbiToken::Address(address_this()));
+        assert_eq!(pull[2], AbiToken::Uint(U256::from(1000u64)));
+
+        // Unwrapped onto the router, with the same amount as the floor.
+        let un =
+            ethers::abi::decode(&[ParamType::Address, ParamType::Uint(256)], &inputs[1]).unwrap();
+        assert_eq!(un[0], AbiToken::Address(address_this()));
+        assert_eq!(un[1], AbiToken::Uint(U256::from(1000u64)));
+
+        // And the swap settles from the router, not from the caller.
+        let (_actions, params) = v4_actions(&inputs[2]);
+        let settle = ethers::abi::decode(
+            &[ParamType::Address, ParamType::Uint(256), ParamType::Bool],
+            &params[0],
+        )
+        .unwrap();
+        assert_eq!(settle[0], AbiToken::Address(Address::zero()), "settles the native currency");
+        assert_eq!(
+            settle[2],
+            AbiToken::Bool(false),
+            "payer is the router, which is where the unwrapped ETH now sits"
+        );
+    }
+
+    /// Selling back is the mirror, and it moves the slippage guard: `TAKE_ALL`
+    /// pays the caller and carries the minimum, so a leg whose output still has
+    /// to be wrapped must leave it on the router - and the minimum then has to
+    /// reappear on the `SWEEP`, or the trade would have no floor at all.
+    #[test]
+    fn taking_native_wraps_before_it_reaches_the_wallet() {
+        let r = wrapped_route(vec![v4_hop(2, 0, 3477)]);
+        let min = U256::from(950u64);
+        let (commands, inputs) =
+            unwrap(&execute_calldata(&r, U256::from(1000u64), min, U256::zero()).unwrap());
+
+        assert_eq!(commands, vec![CMD_V4_SWAP, CMD_WRAP_ETH, CMD_SWEEP]);
+
+        // The leg keeps its output on the router and gives up its minimum.
+        let (actions, params) = v4_actions(&inputs[0]);
+        assert_eq!(
+            *actions.last().unwrap(),
+            ACTION_TAKE,
+            "TAKE_ALL would pay the caller in the currency being wrapped"
+        );
+        let take = ethers::abi::decode(
+            &[ParamType::Address, ParamType::Address, ParamType::Uint(256)],
+            params.last().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(take[1], AbiToken::Address(address_this()));
+
+        // Wrapped whole, then handed over with the floor the leg gave up.
+        let wrapped =
+            ethers::abi::decode(&[ParamType::Address, ParamType::Uint(256)], &inputs[1]).unwrap();
+        assert_eq!(wrapped[0], AbiToken::Address(address_this()));
+        assert_eq!(wrapped[1], AbiToken::Uint(contract_balance()));
+
+        let sweep = ethers::abi::decode(
+            &[ParamType::Address, ParamType::Address, ParamType::Uint(256)],
+            &inputs[2],
+        )
+        .unwrap();
+        assert_eq!(sweep[0], AbiToken::Address(Address::from_low_u64_be(WETH)));
+        assert_eq!(sweep[1], AbiToken::Address(msg_sender()));
+        assert_eq!(sweep[2], AbiToken::Uint(min), "the floor has to survive the move");
+    }
+
+    /// A route that touches no native currency must be byte-for-byte what it
+    /// was: the wrapping is an addition, not a change.
+    #[test]
+    fn an_ordinary_route_is_untouched_by_the_wrapping() {
+        let plain = route_of(vec![v4_hop(1, 2, 3477)]);
+        let mut carries = plain.clone();
+        carries.wrap = Some(Address::from_low_u64_be(WETH));
+
+        let a = execute_calldata(&plain, U256::from(1000u64), U256::from(9u64), U256::zero()).unwrap();
+        let b = execute_calldata(&carries, U256::from(1000u64), U256::from(9u64), U256::zero()).unwrap();
+        assert_eq!(a, b, "no native end means nothing to wrap");
     }
 
     /// The v4 struct as this fork decodes it, extra word and all.

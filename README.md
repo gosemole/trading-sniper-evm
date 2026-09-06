@@ -139,6 +139,7 @@ Global:
 | `gas_reserve` | native currency never spent on a trade, e.g. `"0.05"`. Only bites on a route that **spends** the native currency, where the swap and its gas come out of the same balance - an ERC-20 route is unaffected. Defaults to `0.05` |
 | `pool_cache_path` | where recovered PoolKeys, decimals and symbols are kept |
 | `inventory_path` | where positions and unsettled trades are kept |
+| `weth` | wrapped native token. Set it to trade a **native** pool while holding the wrapped one: a route writes `input = "WETH"`, and the router unwraps on the way in and wraps on the way out inside the same transaction. The native balance is then only ever touched for gas, and `gas_reserve` stops applying to that route |
 | `universal_router`, `pool_manager`, `permit2` | contracts. `pool_manager` is shared by every v4 pool and every v4 route, so it is written once here and omitted from the pools themselves |
 
 Per route:
