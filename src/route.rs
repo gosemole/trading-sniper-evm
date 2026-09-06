@@ -129,7 +129,12 @@ pub struct Route {
     pub input: Token,
     pub output: Token,
     /// Amount to spend, in raw units of the input token.
+    /// The most this route ever spends on one buy.
     pub amount_in: U256,
+    /// When set, each buy is sized to move its trigger pool by this much rather
+    /// than to spend `amount_in` - which becomes the ceiling. See
+    /// `executor::Executor::size_for`.
+    pub impact_pct: Option<f64>,
     pub max_slippage_pct: f64,
     pub hops: Vec<Hop>,
 }
@@ -266,6 +271,7 @@ impl Route {
             input,
             output,
             amount_in,
+            impact_pct: cfg.impact_pct,
             max_slippage_pct: cfg.max_slippage_pct,
             hops,
         })
@@ -274,6 +280,17 @@ impl Route {
 }
 
 impl Route {
+    /// The same route at a different size.
+    ///
+    /// `amount_in` is what the calldata actually spends - `execute_calldata`
+    /// reads it for the SETTLE amount and for a v3 leg's input - so a buy sized
+    /// per signal has to travel as a route carrying that size. Sizing without
+    /// this would compute one number, reserve it, and then send a transaction
+    /// spending the route's ceiling instead.
+    pub fn at(&self, amount_in: U256) -> Route {
+        Route { amount_in, ..self.clone() }
+    }
+
     /// The same pools walked the other way, to sell what this route buys.
     ///
     /// Only the direction changes: the pool ids, fees, tick spacings and hooks
@@ -297,6 +314,9 @@ impl Route {
             input: self.output.clone(),
             output: self.input.clone(),
             amount_in,
+            // A sale sells the whole position, so there is no size to work out
+            // and nothing for a target impact to size.
+            impact_pct: None,
             max_slippage_pct: self.max_slippage_pct,
             hops,
         }
@@ -509,6 +529,7 @@ mod tests {
             input: tok(1, 6, "A"),
             output: tok(3, 18, "C"),
             amount_in: U256::from(100u64),
+            impact_pct: None,
             max_slippage_pct: 1.0,
             hops: vec![hop(1, 2, 1, 2, 6, 8), hop(2, 3, 2, 3, 8, 18)],
         }

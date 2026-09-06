@@ -146,6 +146,22 @@ pub struct RouteConfig {
     /// unrelated numbers, and tightening this one silently left the modelling
     /// cap sized for the old one.
     pub max_slippage_pct: f64,
+    /// Size every buy so it moves the TRIGGER pool's price by this much,
+    /// instead of always spending `amount_in`.
+    ///
+    /// `amount_in` stays, as the ceiling: a deep pool can absorb far more than
+    /// the wallet holds before it moves a percent, and a route without a limit
+    /// would work out a size that does not exist. So this is "aim for this
+    /// impact, and never spend more than `amount_in` doing it".
+    ///
+    /// Unset means the old behaviour exactly: every signal spends `amount_in`.
+    ///
+    /// Measured on the pool the drop happened in, not on the worst hop of the
+    /// route - that is the pool the number is a statement about. The size is
+    /// worked out from the signal's own log plus the tick ladder already in
+    /// memory, so it costs no requests and nothing waits for it.
+    #[serde(default)]
+    pub impact_pct: Option<f64>,
     /// v4 pool ids, in swap order.
     pub pools: Vec<String>,
     /// Buy this route by itself whenever its trigger pool signals a big sell.
@@ -341,6 +357,17 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
                 secs > 0,
                 "route '{}': exit_after_secs must be > 0",
                 r.name
+            );
+        }
+        if let Some(i) = r.impact_pct {
+            // An impact at or past the slippage tolerance is a size the trade
+            // could not survive anyway: the move it makes would eat the whole
+            // budget meant for the market moving under it.
+            anyhow::ensure!(
+                i.is_finite() && i > 0.0 && i < r.max_slippage_pct,
+                "route '{}': impact_pct must be > 0 and below max_slippage_pct ({})",
+                r.name,
+                r.max_slippage_pct
             );
         }
         if let Some(tp) = r.take_profit_pct {

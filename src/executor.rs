@@ -185,6 +185,75 @@ pub struct Fill {
 /// one - and it belongs in the log line of every trade, not only in the warning
 /// of the trades that were refused. A distribution nobody can see is one nobody
 /// can tighten `max_slippage_pct` against.
+/// One hop of a route, with everything needed to walk it and nothing that has
+/// to be looked up again.
+struct Hopped {
+    pool: PoolRef,
+    zero_for_one: bool,
+    state: crate::depth::PoolState,
+    ladder: crate::depth::Ladder,
+}
+
+/// A whole route, gathered once so it can be walked many times.
+///
+/// Opaque on purpose: the strategy carries one from sizing to pricing without
+/// looking inside it, which is the point - both have to describe the same
+/// reading of the pools.
+///
+/// Gathering takes two locks and copies a ladder per hop; walking is
+/// arithmetic. Sizing a trade to a target impact means walking the same route
+/// at forty different amounts, and doing that against a fresh gather each time
+/// would be forty times the locking for the same numbers.
+pub struct Prepared {
+    hops: Vec<Hopped>,
+}
+
+/// What one walk of a prepared route produced.
+struct Walked {
+    amount_out: f64,
+    /// The price move each hop took, in route order. Kept per hop rather than
+    /// reduced, because sizing asks about ONE of them - the pool the signal
+    /// came from - while pricing asks about the worst.
+    impacts: Vec<(PoolRef, f64)>,
+    crossed: u32,
+}
+
+impl Prepared {
+    /// Walk the route at this size. Pure: no locks, no reads, no allocation
+    /// beyond the impacts it reports.
+    fn walk(&self, amount_in: f64) -> Option<Walked> {
+        let mut amount = amount_in;
+        let mut impacts = Vec::with_capacity(self.hops.len());
+        let mut crossed = 0u32;
+        for hop in &self.hops {
+            // `Beyond::HoldsUntil`, not `Unknown`: the scan read out to its own
+            // edge, so between the last rung and that edge there is nothing to
+            // cross. A pool provided across its whole range has no rungs at
+            // all, and reading that as ignorance refused every trade through
+            // the easiest pool there is.
+            let walked = crate::depth::swap_exact_in_along(
+                hop.state,
+                hop.zero_for_one,
+                amount,
+                &hop.ladder.rungs,
+                crate::depth::Beyond::HoldsUntil(hop.ladder.bound),
+            );
+            let r = match walked {
+                Ok(crate::depth::Walk::Done(r)) if r.amount_out > 0.0 => r,
+                _ => return None,
+            };
+            let impact = ((r.sqrt_p_after / hop.state.sqrt_p).powi(2) - 1.0).abs();
+            if !impact.is_finite() {
+                return None;
+            }
+            impacts.push((hop.pool, impact));
+            crossed += r.ticks_crossed;
+            amount = r.amount_out;
+        }
+        Some(Walked { amount_out: amount, impacts, crossed })
+    }
+}
+
 struct Modelled {
     amount_out: U256,
     /// Fraction, not percent: the largest price move any single hop takes.
@@ -331,6 +400,86 @@ struct Quoted {
     /// The nonce the node reported while the quote was in flight, if asked.
     nonce_seen: Option<u64>,
 }
+
+/// What the signal itself says about the pool it came from.
+///
+/// The fee the swap was actually charged when the log carries one (v4, hook
+/// override and all), else the pool's own fixed fee - a v3 log has no fee word
+/// because a v3 fee cannot change. A v4 pool that logged nothing is left to the
+/// calibration snapshot rather than priced from its PoolKey's dynamic-fee flag,
+/// which is a flag and not a fee.
+///
+/// v4 emits the fee the swap was CHARGED, already the protocol cut and the LP
+/// fee combined, so it goes in whole with no protocol fee left to add.
+fn live_hop(key: PoolRef, sig: &Signal, route: &Route) -> Option<(PoolRef, HopState)> {
+    let fee = sig.lp_fee.or_else(|| {
+        route
+            .hops
+            .iter()
+            .find(|h| h.pool_ref() == key)
+            .map(|h| h.fee)
+            .filter(|f| u64::from(*f) < PPM)
+    })?;
+    Some((
+        key,
+        HopState {
+            sqrt_p: crate::pool::sqrt_to_f64(sig.sqrt),
+            liquidity: sig.liquidity,
+            lp_fee: fee,
+            protocol_fee_0for1: 0,
+            protocol_fee_1for0: 0,
+        },
+    ))
+}
+
+/// The largest size whose impact does not exceed `target`, never above `cap`.
+///
+/// Pure, and separated from `Executor::size_for` because it decides how much
+/// money leaves the wallet and that is worth being able to test on its own.
+///
+/// `impact_at` returning `None` counts as too big. Being unable to price a size
+/// is not permission to send it, and it is what a size walking past the end of
+/// the read ticks looks like - which happens exactly when the ceiling is far
+/// larger than the ladder reaches, and where a smaller size is still perfectly
+/// answerable.
+fn size_to_impact(
+    cap: U256,
+    target: f64,
+    impact_at: impl Fn(U256) -> Option<f64>,
+) -> Option<U256> {
+    if cap.is_zero() {
+        return None;
+    }
+    // The ceiling is within the target: spend it and no more. The ordinary case
+    // on a deep pool, and not a refusal - it is the whole reason `amount_in`
+    // stays.
+    if impact_at(cap).is_some_and(|i| i <= target) {
+        return Some(cap);
+    }
+
+    // Bisect. Impact rises with size, so the answer is bracketed from the
+    // start: `hi` is always a size known to be too big and `lo` always one
+    // known not to be, which is why `lo` is what gets returned.
+    let (mut lo, mut hi) = (U256::zero(), cap);
+    for _ in 0..BISECT_STEPS {
+        let mid = lo + (hi - lo) / 2;
+        if mid == lo || mid == hi {
+            break;
+        }
+        match impact_at(mid) {
+            Some(i) if i <= target => lo = mid,
+            _ => hi = mid,
+        }
+    }
+    (!lo.is_zero()).then_some(lo)
+}
+
+/// Bisection steps when sizing a buy to a target impact.
+///
+/// Each halves the bracket, so forty take a `uint256` of room down to the last
+/// unit for any size this bot trades. They are pure arithmetic over a snapshot
+/// gathered once, so the whole search is microseconds and no requests.
+const BISECT_STEPS: u32 = 40;
 
 /// Fixed-point scale for `yield_ppm`.
 const PPM: u64 = 1_000_000;
@@ -852,6 +1001,51 @@ impl Executor {
         self.ticks.rungs(key, from, to)
     }
 
+    /// What to spend on this signal: the route's fixed `amount_in`, or - when
+    /// the route asks for one - the size that moves the TRIGGER pool by its
+    /// `impact_pct`, never past `amount_in`.
+    ///
+    /// Synchronous and free of requests on purpose. The tick loop decides how
+    /// much a buy costs before it sets the money aside, so that what is
+    /// reserved is what is spent: reserving a ceiling and refunding later would
+    /// hold the difference frozen through every buy, and getting the refund
+    /// wrong would drift the tracked balance away from the wallet for good.
+    ///
+    /// The trigger pool and not the worst hop, because that is the pool the
+    /// drop happened in and the one the size is a statement about. A route is
+    /// still refused outright if any hop cannot be walked - see `prepare`.
+    ///
+    /// `None` means "do not buy": no measurement, no usable state, or a size
+    /// that rounds to nothing.
+    pub fn size_for(&self, key: PoolRef, sig: &Signal) -> Option<(U256, Prepared)> {
+        let plan = self.plans.get(&key)?;
+        let route = &plan.route;
+        let ppm = plan.yield_ppm.load(Ordering::Relaxed);
+        if !self.unstated_fee_acceptable(plan, ppm) {
+            return None;
+        }
+        // Gathered ONCE and handed on to whoever prices the trade. Doing it
+        // again there would take the same locks and copy the same ladders for
+        // the same answer - and worse, would leave a window in which the
+        // background scan replaces a window between the size being worked out
+        // and the minimum being signed, so the money set aside and the price
+        // accepted would describe two different pools.
+        let prepared = self.prepare(plan, route, live_hop(key, sig, route), ppm)?;
+
+        let cap = route.amount_in;
+        let Some(target) = route.impact_pct.map(|p| p / 100.0) else {
+            return (!cap.is_zero()).then_some((cap, prepared));
+        };
+        let size = {
+            let impact_at = |amount: U256| -> Option<f64> {
+                let walked = prepared.walk(crate::route::u256_to_f64(amount))?;
+                walked.impacts.iter().find(|(p, _)| *p == key).map(|(_, i)| *i)
+            };
+            size_to_impact(cap, target, impact_at)?
+        };
+        Some((size, prepared))
+    }
+
     /// The address everything is signed and settled from.
     pub fn owner(&self) -> Address {
         self.owner
@@ -864,7 +1058,18 @@ impl Executor {
     }
 
     /// React to one big-sell signal: decide, price, sign, send.
-    pub async fn on_drop(self: &Arc<Self>, pool: &Pool, sig: &Signal) -> Result<Option<Fill>> {
+    /// `spend` is what the caller committed for this buy - `amount_in`, or the
+    /// size `size_for` worked out for the route's `impact_pct`. It arrives from
+    /// outside because the money was set aside before this was called, and
+    /// spending a different number than was reserved is how a tracked balance
+    /// drifts away from the wallet.
+    pub async fn on_drop(
+        self: &Arc<Self>,
+        pool: &Pool,
+        sig: &Signal,
+        spend: U256,
+        prepared: &Prepared,
+    ) -> Result<Option<Fill>> {
         let Some((key, plan)) = self.armed_for(pool) else {
             return Ok(None);
         };
@@ -875,7 +1080,7 @@ impl Executor {
         let route = &plan.route;
         let started = Instant::now();
         let deadline = execute::deadline_in(120);
-        let quoted = self.quote(plan, key, sig).await?;
+        let quoted = self.quote(plan, spend, prepared).await?;
 
         let min_out = execute::apply_slippage(quoted.amount_out, route.max_slippage_pct);
         anyhow::ensure!(
@@ -883,7 +1088,11 @@ impl Executor {
             "route '{}': amountOutMinimum rounds to zero",
             route.name
         );
-        let tx = execute::pending_swap(self.router, route, min_out, deadline)?;
+        // At the size that was priced and reserved, not at the route's ceiling:
+        // `execute_calldata` spends whatever `amount_in` says, so the sizing
+        // has to reach the calldata or it decides nothing at all.
+        let sized = route.at(spend);
+        let tx = execute::pending_swap(self.router, &sized, min_out, deadline)?;
 
         let amount = |v: U256, t: &crate::route::Token| {
             format!("{} {}", format_units(v, t.decimals), t.symbol)
@@ -892,7 +1101,7 @@ impl Executor {
             pool = %pool.name,
             route = %route.name,
             drop_pct = format!("-{:.3}%", sig.drop_pct),
-            spend = amount(route.amount_in, &route.input),
+            spend = amount(spend, &route.input),
             quoted = amount(quoted.amount_out, &route.output),
             priced_by = "model",
             // How hard this trade leaned on the in-range assumption, against
@@ -918,7 +1127,7 @@ impl Executor {
         }
         let amount_out = quoted.amount_out;
         let hash = self.broadcast(key, plan, &tx, quoted).await?;
-        Ok(Some(Fill { hash, sold: route.amount_in, amount_out }))
+        Ok(Some(Fill { hash, sold: spend, amount_out }))
     }
 
     /// Sell everything held of what a route buys, back down that same route.
@@ -1050,7 +1259,11 @@ impl Executor {
                     m => m,
                 };
                 match self.unstated_fee_acceptable(plan, ppm) {
-                    true => self.model_quote(plan, &sell, fresh, ppm),
+                    // A sale has no signal to be sized from, so it gathers its
+                    // own snapshot here rather than being handed one.
+                    true => self
+                        .prepare(plan, &sell, fresh, ppm)
+                        .and_then(|p| self.model_quote(&sell, &p, ppm, sell.amount_in)),
                     false => None,
                 }
             }
@@ -1201,53 +1414,15 @@ impl Executor {
     /// joined rather than sequenced, because the cases where one of them does
     /// have to go and look - a stale header, an empty counter - should cost the
     /// slower of the two rather than their sum.
-    async fn quote(
-        &self,
-        plan: &Plan,
-        key: PoolRef,
-        sig: &Signal,
-    ) -> Result<Quoted> {
+    async fn quote(&self, plan: &Plan, spend: U256, prepared: &Prepared) -> Result<Quoted> {
         let started = Instant::now();
         anyhow::ensure!(
             self.unstated_fee_acceptable(plan, plan.yield_ppm.load(Ordering::Relaxed)),
             "route '{}': not buying - see the fee check above",
             plan.route.name
         );
-        // The fee the swap was actually charged when the log carries one (v4,
-        // hook override and all), else the pool's own fixed fee (v3 logs have
-        // no fee word because the fee cannot change). A v4 pool that logged
-        // nothing is left to the calibration snapshot rather than priced with
-        // its PoolKey's dynamic-fee flag, which is a flag and not a fee.
-        let fee = sig.lp_fee.or_else(|| {
-            plan.route
-                .hops
-                .iter()
-                .find(|h| h.pool_ref() == key)
-                .map(|h| h.fee)
-                .filter(|f| u64::from(*f) < PPM)
-        });
-        // v4 emits the fee the swap was CHARGED, which is already the protocol
-        // cut and the LP fee combined (`Pool.swap`: `swapFee = protocolFee == 0
-        // ? lpFee : calculateSwapFee(protocolFee, lpFee)`), so it goes in whole
-        // with no protocol fee left to add. A v3 log carries no fee word at all
-        // and falls back to the pool's fixed `fee()`, where the protocol's cut
-        // comes out of the LPs' share and the swapper pays no more either way.
-        // `model_quote` checks this reading against the calibration snapshot
-        // and says so if the chain disagrees.
-        let fresh = fee.map(|charged| {
-            (
-                key,
-                HopState {
-                    sqrt_p: crate::pool::sqrt_to_f64(sig.sqrt),
-                    liquidity: sig.liquidity,
-                    lp_fee: charged,
-                    protocol_fee_0for1: 0,
-                    protocol_fee_1for0: 0,
-                },
-            )
-        });
         let ppm = plan.yield_ppm.load(Ordering::Relaxed);
-        let modelled = self.model_quote(plan, &plan.route, fresh, ppm);
+        let modelled = self.model_quote(&plan.route, prepared, ppm, spend);
         // The model prices every buy or none does: there is no router
         // fallback on this path. Skip the buy instead of guessing; it costs
         // nothing but this one drop, and there will be another.
@@ -1537,17 +1712,13 @@ impl Executor {
     /// for a hop, or a ladder that does not reach as far as the swap walks. A
     /// buy is then skipped and a sale asks the router. Being slow is
     /// recoverable; signing a wrong minimum is not.
-    fn model_quote(
+    fn prepare(
         &self,
         plan: &Plan,
         route: &Route,
         fresh: Option<(PoolRef, HopState)>,
         yield_ppm: u64,
-    ) -> Option<Modelled> {
-        // Measured against this route's own tolerance, so the two cannot drift
-        // apart - see `modelled_impact_cap`.
-        let mut worst_impact = 0.0f64;
-        let mut crossed = 0u32;
+    ) -> Option<Prepared> {
         // Never priced by a measurement that does not exist. The callers check
         // this too, and both of them refusing is the point.
         if yield_ppm == 0 {
@@ -1587,7 +1758,7 @@ impl Executor {
         // a whole route walk, with the calibration pass waiting to write.
         drop(guard);
 
-        let mut amount = crate::route::u256_to_f64(route.amount_in);
+        let mut prepared = Vec::with_capacity(route.hops.len());
         for hop in &route.hops {
             let mut here = match fresh {
                 Some((p, s)) if p == hop.pool_ref() => s,
@@ -1644,7 +1815,7 @@ impl Executor {
                 protocol_fee_1for0: here.protocol_fee_1for0,
             };
             let up = !hop.zero_for_one();
-            let Some(rungs) = self.ticks.ladder(hop.pool_ref(), here.sqrt_p, up) else {
+            let Some(ladder) = self.ticks.ladder(hop.pool_ref(), here.sqrt_p, up) else {
                 warn!(
                     route = %route.name,
                     pool = %hop.pool_ref(),
@@ -1653,72 +1824,53 @@ impl Executor {
                 );
                 return None;
             };
-            // The same walk `--quote` runs against the chain, over rungs read
-            // in advance instead of one at a time. `Beyond::Unknown` is what
-            // makes it safe: a swap reaching the end of the ladder is refused
-            // rather than finished at a liquidity nobody read.
-            let walked = crate::depth::swap_exact_in_along(
+            prepared.push(Hopped {
+                pool: hop.pool_ref(),
+                zero_for_one: hop.zero_for_one(),
                 state,
-                hop.zero_for_one(),
-                amount,
-                &rungs.rungs,
-                // Not `Unknown`: the scan read out to its own edge and found
-                // what it found, so between the last rung and that edge there
-                // is nothing to cross. A pool provided across its whole range
-                // has no rungs at all, and treating that as ignorance refused
-                // every trade through the easiest pool there is.
-                crate::depth::Beyond::HoldsUntil(rungs.bound),
-            );
-            let out = match walked {
-                Ok(crate::depth::Walk::Done(r)) if r.amount_out > 0.0 => {
-                    let impact = ((r.sqrt_p_after / here.sqrt_p).powi(2) - 1.0).abs();
-                    if !impact.is_finite() {
-                        warn!(route = %route.name, pool = %hop.pool_ref(),
-                              "not priced: this hop's price move is not a number");
-                        return None;
-                    }
-                    // The worst hop, not the last: a quote is only as
-                    // trustworthy as the pool it strained most.
-                    worst_impact = worst_impact.max(impact);
-                    crossed += r.ticks_crossed;
-                    r.amount_out
-                }
-                Ok(crate::depth::Walk::Done(_)) => {
-                    warn!(
-                        route = %route.name, pool = %hop.pool_ref(), amount_in = amount,
-                        "not priced: this hop returns nothing for that size"
-                    );
-                    return None;
-                }
-                Ok(crate::depth::Walk::NeedsRung) => {
-                    warn!(
-                        route = %route.name,
-                        pool = %hop.pool_ref(),
-                        amount_in = amount,
-                        rungs = rungs.rungs.len(),
-                        "not priced: this size walks past the last tick the scan read, so \
-                         where it ends is not known"
-                    );
-                    return None;
-                }
-                Err(e) => {
-                    warn!(route = %route.name, pool = %hop.pool_ref(),
-                          err = %format!("{e:#}"), "not priced: the walk refused this hop");
-                    return None;
-                }
-            };
-            amount = out;
+                ladder,
+            });
         }
+
+        Some(Prepared { hops: prepared })
+    }
+
+    /// Price a route at one size, or say why not.
+    ///
+    /// `yield_ppm` is what calibration measured this direction to actually pay
+    /// against what this same walk predicted, and it IS applied as a term:
+    /// whatever a hook takes on top of the pools' stated fees is real money,
+    /// and a quote that leaves it out is optimistic by exactly that much. It is
+    /// clamped at 1.0 - a route measured to pay more than the model says is a
+    /// stale snapshot or measurement noise, never a bonus to price in.
+    fn model_quote(
+        &self,
+        route: &Route,
+        prepared: &Prepared,
+        yield_ppm: u64,
+        amount_in: U256,
+    ) -> Option<Modelled> {
+        let walked = prepared.walk(crate::route::u256_to_f64(amount_in)).or_else(|| {
+            warn!(
+                route = %route.name,
+                amount_in = %format_units(amount_in, route.input.decimals),
+                "not priced: the walk returned nothing for this size - it walks past what \
+                 the tick scan read, or a hop has no liquidity in this direction"
+            );
+            None
+        })?;
 
         // What the pools state, less what this direction was measured to pay
         // beyond them.
-        let amount = amount * yield_ppm.min(PPM) as f64 / PPM as f64;
-
+        let amount = walked.amount_out * yield_ppm.min(PPM) as f64 / PPM as f64;
         let raw = crate::route::f64_to_u256_pub(amount);
+        // The worst hop, not the last: a quote is only as trustworthy as the
+        // pool it strained most.
+        let worst = walked.impacts.iter().map(|(_, i)| *i).fold(0.0f64, f64::max);
         (!raw.is_zero()).then_some(Modelled {
             amount_out: raw,
-            impact: worst_impact,
-            crossed,
+            impact: worst,
+            crossed: walked.crossed,
         })
     }
 
@@ -1905,6 +2057,48 @@ impl Approver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sizing decides how much money leaves the wallet, so what it must never
+    /// do is return a size bigger than asked for. Impact rises with size, and
+    /// the answer is always the low side of the bracket.
+    #[test]
+    fn a_size_never_overshoots_the_target() {
+        // A pool where impact is simply proportional: 1000 units move it 1%.
+        let linear = |a: U256| Some(a.as_u64() as f64 / 100_000.0);
+        let cap = U256::from(10_000u64);
+
+        // Target reachable well inside the ceiling.
+        let got = size_to_impact(cap, 0.01, linear).expect("sizeable");
+        assert!(linear(got).unwrap() <= 0.01, "must not overshoot");
+        assert!(got > U256::from(900u64) && got <= U256::from(1_000u64), "{got}");
+
+        // Target the ceiling cannot reach: spend the ceiling, which is the
+        // whole reason a ceiling is kept.
+        assert_eq!(size_to_impact(cap, 0.5, linear), Some(cap));
+
+        // A target so small nothing meaningful fits.
+        assert_eq!(size_to_impact(U256::from(1u64), 1e-12, linear), None);
+        assert_eq!(size_to_impact(U256::zero(), 0.01, linear), None);
+    }
+
+    /// A size the walk cannot price counts as too big. Being unable to answer
+    /// is not permission to send - and a ceiling far past what the tick scan
+    /// read looks exactly like this, while a smaller size is still answerable.
+    #[test]
+    fn an_unpriceable_size_is_treated_as_too_big() {
+        let cap = U256::from(10_000u64);
+        // Anything past 2000 walks off the end of what was read.
+        let short = |a: U256| {
+            (a <= U256::from(2_000u64)).then(|| a.as_u64() as f64 / 100_000.0)
+        };
+
+        let got = size_to_impact(cap, 0.05, short).expect("the smaller sizes are priceable");
+        assert!(got <= U256::from(2_000u64), "never past what could be priced: {got}");
+        assert!(got > U256::from(1_900u64), "and not needlessly small either: {got}");
+
+        // Nothing priceable at all is a refusal, not a guess.
+        assert_eq!(size_to_impact(cap, 0.05, |_| None), None);
+    }
 
     /// The bar that decides whether a token gets approved at startup has to sit
     /// above anything a position could ever reach and below what `--approve`

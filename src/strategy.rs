@@ -195,6 +195,10 @@ pub enum Report {
         /// A sale's proceeds - which token comes back and how much - credited
         /// to tracked cash the moment this is reserved. `None` for a buy.
         credit: Option<(ethers::types::Address, ethers::types::U256)>,
+        /// What `on_tick` set aside for a buy, so a rollback gives back the
+        /// amount actually taken rather than the route's ceiling. `None` for a
+        /// sale. See `inventory::Trade::committed`.
+        committed: Option<(ethers::types::Address, ethers::types::U256)>,
     },
     /// The chain answered, with what the receipt says actually moved.
     Settled {
@@ -210,8 +214,12 @@ pub enum Report {
         credit_moved: Option<ethers::types::U256>,
     },
     /// A buy was never broadcast - skipped, or failed before it went out.
-    /// Releases the spend `on_tick` committed when it decided to try.
-    BuyAborted { pool: PoolRef },
+    /// Carries exactly what `on_tick` committed, because with a size worked out
+    /// per signal there is no fixed figure to look up afterwards.
+    BuyAborted {
+        token: ethers::types::Address,
+        spend: ethers::types::U256,
+    },
     /// A sale could not even be broadcast.
     SellFailed { pool: PoolRef },
     /// A sale was not attempted after all - a dry run, or nothing held.
@@ -612,8 +620,24 @@ impl Strategy {
         // it was raised from.
         if let Some(exec) = self.exec.clone() {
             if let Some(route) = exec.route_for(tick.pool) {
-                let (spend_token, spend) = (route.input.address, route.amount_in);
+                let spend_token = route.input.address;
+                // Worked out BEFORE the money is touched, so what is set aside
+                // is what is spent. `size_for` is synchronous and asks the
+                // network for nothing: it walks the route over the signal's own
+                // log and the tick ladder already in memory.
+                // The snapshot comes back with the size, so the money set
+                // aside and the minimum eventually signed are worked out from
+                // one reading of the pools rather than two.
+                let Some((spend, prepared)) = exec.size_for(tick.pool, &sig) else {
+                    warn!(
+                        pool = %pool.name, route = %route.name,
+                        "not buying: this signal cannot be sized - see the reason above"
+                    );
+                    return;
+                };
                 let have = self.inventory.cash(spend_token);
+                // Not enough for the size this signal calls for is not a reason
+                // to buy a smaller one: the size is what the route asked for.
                 if have < spend {
                     warn!(
                         pool = %pool.name,
@@ -632,6 +656,18 @@ impl Strategy {
                     // saves anyway, and a crash before one arrives is healed by
                     // the balance re-read at startup.
                     self.inventory.debit_cash(spend_token, spend);
+                    if route.impact_pct.is_some() {
+                        info!(
+                            pool = %pool.name,
+                            route = %route.name,
+                            impact_pct = route.impact_pct.unwrap_or_default(),
+                            spend = %crate::route::format_units(spend, route.input.decimals),
+                            cap = %crate::route::format_units(
+                                route.amount_in, route.input.decimals
+                            ),
+                            "sized to impact"
+                        );
+                    }
 
                     // What the route buys, decided now rather than looked up
                     // after the fact: a fill has to be recorded whatever the
@@ -645,7 +681,7 @@ impl Strategy {
                     let back = self.reports.clone();
                     let (p, s, key) = (pool.clone(), sig.clone(), tick.pool);
                     tokio::spawn(async move {
-                        match exec.on_drop(&p, &s).await {
+                        match exec.on_drop(&p, &s, spend, &prepared).await {
                             Ok(Some(fill)) => {
                                 let _ = back
                                     .send(Report::Filled {
@@ -666,15 +702,20 @@ impl Strategy {
                                             spend_decimals,
                                         )),
                                         credit: None,
+                                        committed: Some((spend_token, spend)),
                                     })
                                     .await;
                             }
                             Ok(None) => {
-                                let _ = back.send(Report::BuyAborted { pool: key }).await;
+                                let _ = back
+                                    .send(Report::BuyAborted { token: spend_token, spend })
+                                    .await;
                             }
                             Err(e) => {
                                 warn!(pool = %p.name, err = %format!("{e:#}"), "auto-buy failed");
-                                let _ = back.send(Report::BuyAborted { pool: key }).await;
+                                let _ = back
+                                    .send(Report::BuyAborted { token: spend_token, spend })
+                                    .await;
                             }
                         }
                     });
@@ -696,7 +737,8 @@ impl Strategy {
     async fn on_report(&mut self, r: Report) {
         let s = match r {
             Report::Filled {
-                hash, pool, side, token, symbol, decimals, raw, price, spent, credit
+                hash, pool, side, token, symbol, decimals, raw, price, spent, credit,
+                committed,
             } => {
                 let credit_token = credit.map(|(t, _)| t);
                 let trade = crate::inventory::Trade {
@@ -708,6 +750,7 @@ impl Strategy {
                     price,
                     spent,
                     credit,
+                    committed,
                 };
                 if self.inventory.reserve(hash, trade) {
                     self.save();
@@ -729,8 +772,8 @@ impl Strategy {
                 }
                 return;
             }
-            Report::BuyAborted { pool } => {
-                self.release_buy_spend(pool);
+            Report::BuyAborted { token, spend } => {
+                self.inventory.credit_cash(token, spend);
                 return;
             }
             Report::SellSkipped { pool } => {
@@ -766,11 +809,10 @@ impl Strategy {
         } else {
             self.inventory.rollback(s.hash)
         };
-        // Broadcast, but reverted or dropped: the spend `on_tick` committed
-        // never left the wallet. Given back before the one save below.
-        if side == Some(Side::Buy) && !s.ok {
-            self.release_buy_spend(s.pool);
-        }
+        // A buy that was broadcast and then reverted or dropped never spent
+        // what was set aside for it. `rollback` gives back exactly that amount,
+        // recorded with the reservation - the route's `amount_in` is only a
+        // ceiling now, so there is nothing to look it up from.
         self.save();
 
         let Some(side) = side else {
@@ -851,19 +893,6 @@ impl Strategy {
         }
     }
 
-    /// Give a buy's committed spend back - by the route that would have spent
-    /// it, in case more than one shares this pool's input token. In memory
-    /// only: the debit it undoes was never written either, so there is nothing
-    /// on disk to correct.
-    fn release_buy_spend(&mut self, pool: PoolRef) {
-        match self.exec.as_ref().and_then(|e| e.route_for(pool)) {
-            Some(route) => self.inventory.credit_cash(route.input.address, route.amount_in),
-            None => warn!(
-                id = %pool,
-                "a buy's spend could not be given back: no route is armed against this pool"
-            ),
-        }
-    }
 }
 
 impl Strategy {
@@ -969,6 +998,7 @@ impl Strategy {
                     // available now rather than after a bisection's worth of
                     // waiting.
                     credit: Some((route.input.address, fill.amount_out)),
+                    committed: None,
                 },
                 Ok(None) => Report::SellSkipped { pool },
                 Err(e) => {

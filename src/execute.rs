@@ -692,6 +692,7 @@ mod tests {
             input: RouteToken { address: first, decimals: 18, symbol: "IN".into() },
             output: RouteToken { address: last, decimals: 18, symbol: "OUT".into() },
             amount_in: U256::from(1000u64),
+            impact_pct: None,
             max_slippage_pct: 1.0,
             hops,
         }

@@ -56,7 +56,15 @@ POOLS    = "0x385b36ff682ab4c76e7c37a66b96aabc466471d5"
 # [[routes]]
 # name = "buy CAMELTOE"
 # input = "USDG"
-# amount_in = "0.1"          # in USDG, which has 6 decimals: ten cents
+# amount_in = "0.1"          # in USDG, which has 6 decimals: ten cents.
+#                            # With impact_pct below it is a CEILING, not the
+#                            # size: the most one buy will ever spend.
+# impact_pct = 0.5           # optional. Size each buy to move the trigger
+#                            # pool's price by this much, rather than always
+#                            # spending amount_in. Must be below
+#                            # max_slippage_pct. Worked out from the signal's
+#                            # own log and the tick ladder already in memory,
+#                            # so it costs no requests. Omit for a fixed size.
 # max_slippage_pct = 1.0     # percent, not basis points
 # auto_buy = true            # buy when the trigger pool signals a drop
 # cooldown_secs = 60

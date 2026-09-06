@@ -143,7 +143,8 @@ Per route:
 
 | key | |
 |---|---|
-| `input`, `amount_in` | what to spend and how much |
+| `input`, `amount_in` | what to spend, and the most one buy ever spends |
+| `impact_pct` | optional. Size each buy to move the **trigger pool's** price by this much instead of always spending `amount_in`, which becomes the ceiling. Worked out per signal from its own log and the tick ladder already in memory, so it costs no requests and nothing waits for it. Must be below `max_slippage_pct`. If the tracked balance does not cover the size, the buy is skipped rather than shrunk |
 | `pools` | ordered list; a 32-byte v4 pool id or a 20-byte v3 pool address, mixed freely |
 | `max_slippage_pct` | percent, not basis points. Sets `amountOutMinimum`, and with it how far the model may be trusted: an auto-buy is priced from memory rather than by the router, so this budget covers the model being wrong as well as the market moving, and a trade is only modelled at all while it moves its pool by less than a third of it |
 | `auto_buy` | arm the route |

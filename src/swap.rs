@@ -562,15 +562,18 @@ pub fn received(logs: &[ethers::types::Log], token: Address, to: Address) -> Opt
     seen.then_some(total)
 }
 
-/// How often to ask whether a transaction has landed. Inclusion on this chain
-/// was measured at three to five blocks - four hundred milliseconds or so - so
-/// the first question is asked when the answer is due rather than on a timer
-/// that knows nothing about the chain.
-const RECEIPT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often to ask whether a transaction has landed.
+///
+/// The first question is asked when the answer is due rather than on a timer
+/// that knows nothing about the chain, so this tracks inclusion: it was three
+/// to five blocks and is now faster, and a receipt learnt late is a position
+/// held open and a pool held busy for no reason.
+const RECEIPT_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// How long to keep asking. Six questions at most, and in the ordinary case
-/// one: a transaction that has not landed in three seconds - thirty blocks -
-/// is not merely slow.
+/// How long to keep asking. In the ordinary case the first question answers it;
+/// a transaction that has not landed in three seconds - thirty blocks - is not
+/// merely slow, and the questions in between are the price of telling a slow
+/// one from a dropped one.
 const RECEIPT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A transaction that has stopped being pending.

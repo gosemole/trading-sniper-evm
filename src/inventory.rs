@@ -153,6 +153,15 @@ pub struct Trade {
     /// automatically if it turns out never to have happened - see `rollback`.
     /// `None` for a buy, which has nothing of the kind to credit.
     pub credit: Option<(ethers::types::Address, ethers::types::U256)>,
+    /// What was set aside for this trade before it was sent, to be given back
+    /// if it turns out never to have happened.
+    ///
+    /// Kept HERE rather than worked out again at rollback time, because with a
+    /// size chosen per signal there is no fixed figure to look up: the route's
+    /// `amount_in` is a ceiling, not what was spent. The debit and its refund
+    /// are the same number by construction, and this is where it lives.
+    /// `None` for a sale, which sets nothing aside.
+    pub committed: Option<(ethers::types::Address, ethers::types::U256)>,
 }
 
 /// A trade that has been broadcast but not yet confirmed.
@@ -184,6 +193,10 @@ pub struct Pending {
     /// receipt's real one once there is a receipt to read.
     #[serde(default)]
     credit: Option<(String, String)>,
+    /// See `Trade::committed`. Absent in an inventory written before it was
+    /// tracked, which then refunds nothing - the same as before it existed.
+    #[serde(default)]
+    committed: Option<(String, String)>,
 }
 
 impl Pending {
@@ -325,6 +338,7 @@ impl Inventory {
                 spent: t.spent,
                 at: now_secs(),
                 credit: t.credit.map(|(tok, amt)| (key(tok), amt.to_string())),
+                committed: t.committed.map(|(tok, amt)| (key(tok), amt.to_string())),
             },
         );
         true
@@ -461,6 +475,14 @@ impl Inventory {
                 self.cash.insert(ctoken.clone(), left.to_string());
             }
         }
+        // The money set aside for a trade that never happened, given back in
+        // exactly the amount it was taken - see `Trade::committed`.
+        if let Some((token, amount)) = &p.committed {
+            if let Ok(amt) = ethers::types::U256::from_dec_str(amount) {
+                let have = self.cash_at(token).saturating_add(amt);
+                self.cash.insert(token.clone(), have.to_string());
+            }
+        }
         Some(p.side)
     }
 
@@ -557,6 +579,7 @@ mod tests {
             price,
             spent: None,
             credit: None,
+            committed: None,
         }
     }
 
@@ -674,6 +697,73 @@ mod tests {
         let expect = (10.0 / 10.5 + 10.0 / 11.0) / 2.0;
         assert!((p.exit_ratio - expect).abs() < 1e-9, "{}", p.exit_ratio);
         assert!(p.exit_ratio < first, "the worse fill has to drag it down");
+    }
+
+    /// A buy that set money aside before it was sent, which is every buy once
+    /// the size is worked out per signal rather than fixed.
+    fn buy_committing(token: Address, units: f64, price: f64, spend: U256) -> Trade {
+        Trade {
+            committed: Some((addr(9), spend)),
+            ..buy(token, units, price)
+        }
+    }
+
+    /// The refund has to be the amount actually taken. With a size chosen per
+    /// signal there is no fixed figure to fall back on, so a rollback that
+    /// guessed would drift the tracked balance away from the wallet every time
+    /// a buy failed - upward if it guessed high, downward if it guessed low,
+    /// and never noticed either way.
+    #[test]
+    fn a_rollback_returns_exactly_what_was_set_aside() {
+        let mut inv = Inventory::default();
+        let cash = addr(9);
+        inv.set_cash(cash, U256::from(1_000u64));
+
+        // The tick loop debits what it decided to spend...
+        inv.debit_cash(cash, U256::from(250u64));
+        assert_eq!(inv.cash(cash), U256::from(750u64));
+
+        // ...and the reservation carries that figure with it.
+        assert!(inv.reserve(hash(1), buy_committing(addr(1), 10.0, 10.0, U256::from(250u64))));
+        assert_eq!(inv.cash(cash), U256::from(750u64), "reserving must not move it again");
+
+        assert_eq!(inv.rollback(hash(1)), Some(Side::Buy));
+        assert_eq!(inv.cash(cash), U256::from(1_000u64), "the whole 250 comes back");
+    }
+
+    /// A buy that lands keeps its money: the refund is for trades that never
+    /// happened, and settling one twice must not conjure a balance.
+    #[test]
+    fn a_settled_buy_keeps_what_it_spent() {
+        let mut inv = Inventory::default();
+        let cash = addr(9);
+        inv.set_cash(cash, U256::from(1_000u64));
+        inv.debit_cash(cash, U256::from(250u64));
+        assert!(inv.reserve(hash(1), buy_committing(addr(1), 10.0, 10.0, U256::from(250u64))));
+
+        inv.settle(hash(1), None, None, Some(10.5));
+        assert_eq!(inv.cash(cash), U256::from(750u64), "a spent 250 stays spent");
+
+        // The reservation is gone, so a second answer about it changes nothing.
+        assert_eq!(inv.rollback(hash(1)), None);
+        assert_eq!(inv.cash(cash), U256::from(750u64));
+    }
+
+    /// An inventory written before commitments were recorded rolls back without
+    /// refunding, which is what it did when it was written - not a crash and
+    /// not an invented credit.
+    #[test]
+    fn an_older_reservation_rolls_back_without_a_refund() {
+        let json = r#"{
+            "pending": {"0x0101010101010101010101010101010101010101010101010101010101010101": {
+                "side": "Buy", "token": "0x0101010101010101010101010101010101010101",
+                "symbol": "TKN", "decimals": 18, "raw": "1", "price": 1.0, "at": 0
+            }},
+            "cash": {"0x0909090909090909090909090909090909090909": "1000"}
+        }"#;
+        let mut inv: Inventory = serde_json::from_str(json).unwrap();
+        assert_eq!(inv.rollback(hash(1)), Some(Side::Buy));
+        assert_eq!(inv.cash(addr(9)), U256::from(1_000u64));
     }
 
     fn sale(token: Address, units: f64) -> Trade {
