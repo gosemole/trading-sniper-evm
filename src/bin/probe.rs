@@ -44,6 +44,7 @@
 //!   probe --heads  [--feed WSS] [--ws WSS] [--seconds 300] [--warmup 10]
 //!   probe --heads  --ws WSS --ws WSS [--seconds 300] [--warmup 10]
 //!   probe --selftest --send [--ws WSS] [--endpoint URL] [--feed WSS] [--rounds 5]
+//!   probe --selftest --send --from-feed --feed WSS [--endpoint URL] [--rounds 5]
 //!   probe --extsload [--address 0x..] [--read URL]
 //!
 //! `--selftest` closes the loop the bot actually runs, end to end and in the
@@ -53,6 +54,13 @@
 //! because that is when the bot sends, and a round trip begun mid-block would
 //! flatter the part that waits for inclusion. It needs `--send`: every round is
 //! a real signed transaction.
+//!
+//! `--from-feed` starts each round on the feed's own message instead, so the
+//! whole loop - signal, send, sighting - is the feed's, and no rpc websocket is
+//! read at all. That is the loop a feed-driven bot would run, and the gap
+//! between the two runs is what `--watch` measures in the abstract, paid out
+//! here in the only figure that decides a trade: how many blocks late the
+//! transaction lands.
 //!
 //! Takes what it needs from the environment, the same names the bot itself
 //! reads over its config file: `SUBMIT_URLS` (comma separated) for what to
@@ -356,11 +364,22 @@ fn two_labels(urls: &[String]) -> (String, String) {
 /// got round to it rather than the time it arrived. The backlog compounds,
 /// and the feed ends up looking seconds SLOWER than a stream it is in fact
 /// ahead of. So the reader does nothing but stamp and hand off.
+///
+/// The third return is every frame as it is decoded - its top sequence number
+/// and the instant the READER stamped it - which is what `--selftest
+/// --from-feed` starts a round on. A watch channel keeps only the latest, so a
+/// consumer busy with a round comes back to the present rather than to a queue
+/// of frames the chain has already left behind.
 fn feed_hashes(
     url: String,
     started: Instant,
     seen: Arc<Mutex<HashMap<H256, (Duration, u64)>>>,
-) -> (tokio::task::JoinHandle<Result<()>>, tokio::task::JoinHandle<()>) {
+) -> (
+    tokio::task::JoinHandle<Result<()>>,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Receiver<Option<(u64, Duration)>>,
+) {
+    let (frames, frames_rx) = tokio::sync::watch::channel(None);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Duration, String)>();
     let reader = tokio::spawn(async move {
         let stream = connect_feed(&url).await?;
@@ -394,6 +413,7 @@ fn feed_hashes(
                 tx_hashes(&raw, 0, &mut of_message);
                 hashes.extend(of_message.iter().map(|h| (*h, m.sequence_number)));
             }
+            let top = frame.messages.iter().map(|m| m.sequence_number).max();
             let mut seen = seen.lock().await;
             for (h, seq) in hashes {
                 // First sighting only: the feed replays recent history when a
@@ -401,9 +421,15 @@ fn feed_hashes(
                 // news the second time.
                 seen.entry(h).or_insert((at, seq));
             }
+            drop(seen);
+            // Announced only after the map holds this frame's hashes, so a
+            // round woken by it looks at a map that already includes them.
+            if let Some(top) = top {
+                let _ = frames.send(Some((top, at)));
+            }
         }
     });
-    (reader, decoder)
+    (reader, decoder, frames_rx)
 }
 
 /// Every transaction hash one websocket's log subscription reports, stamped on
@@ -494,7 +520,7 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     let mut tasks = Vec::new();
     let (first, second) = match &feed_url {
         Some(url) => {
-            let (reader, decode) = feed_hashes(url.clone(), started, Arc::clone(&from_a));
+            let (reader, decode, _) = feed_hashes(url.clone(), started, Arc::clone(&from_a));
             decoder = Some(decode);
             tasks.push(reader);
             tasks.push(ws_hashes(ws_urls[0].clone(), filter, started, Arc::clone(&from_b)));
@@ -868,10 +894,25 @@ async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
     Ok(())
 }
 
+/// What starts a round.
+///
+/// The bot sends on a block it heard about over the rpc websocket, so that is
+/// what `--selftest` measures by default. `Feed` asks the other question: if
+/// the signal came from the sequencer feed instead - which `--watch` shows is
+/// the earlier of the two - how much of the loop is left? Both ends of the
+/// measurement are then the feed's own, and no part of it waits on a block the
+/// rpc has finished executing and indexing.
+enum Trigger {
+    /// Heads from this rpc websocket.
+    Heads(String),
+    /// The feed's own messages, decoded. Needs `--feed`.
+    Feed,
+}
+
 /// Everything `--selftest` needs, gathered by `main` from the same flags,
 /// config and key that `--send` already reads.
 struct SelfTest {
-    ws_url: String,
+    trigger: Trigger,
     feed_url: Option<String>,
     submit: Provider<Http>,
     submit_label: String,
@@ -892,6 +933,9 @@ struct SelfTest {
 ///
 /// * `send` - from the head landing on the websocket to `eth_sendRawTransaction`
 ///   returning. This is the endpoint's, and it is what `--endpoint` changes.
+///   Under `--from-feed` it is counted from the frame ARRIVING, so it also
+///   carries the base64 and keccak that turn that frame into a signal - a cost
+///   a feed-driven bot pays too, and one no other measurement here shows.
 /// * `seen` - from the head to the transaction coming back. With a feed this is
 ///   a pushed sighting, so it is a real latency; without one it is polled
 ///   `eth_getTransactionByHash` and can never be finer than a round trip to the
@@ -905,17 +949,45 @@ struct SelfTest {
 async fn selftest(t: SelfTest) -> Result<()> {
     let started = Instant::now();
     let seen: Arc<Mutex<HashMap<H256, (Duration, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
-    let feed_tasks =
-        t.feed_url.as_ref().map(|url| feed_hashes(url.clone(), started, Arc::clone(&seen)));
+    let (mut feed_tasks, mut frames) = match t.feed_url.as_ref() {
+        Some(url) => {
+            let (reader, decoder, frames) = feed_hashes(url.clone(), started, Arc::clone(&seen));
+            (Some((reader, decoder)), Some(frames))
+        }
+        None => (None, None),
+    };
 
-    // Subscribed before the first send, so no round is triggered by a head that
-    // arrived while this was still connecting.
-    let provider =
-        Provider::<Ws>::connect(&t.ws_url).await.context("connecting to the rpc websocket")?;
-    let mut heads = provider.subscribe_blocks().await.context("eth_subscribe(newHeads)")?;
+    // Held for the whole run because the head stream borrows it, and connected
+    // before the first send, so no round is triggered by a head that arrived
+    // while this was still connecting. Under `--from-feed` there is no rpc
+    // websocket at all: the feed is both the trigger and the sighting, and a
+    // subscription opened only to be ignored would still be one more stream
+    // whose failure could end the run.
+    let provider = match &t.trigger {
+        Trigger::Heads(url) => {
+            Some(Provider::<Ws>::connect(url).await.context("connecting to the rpc websocket")?)
+        }
+        Trigger::Feed => None,
+    };
+    let mut heads = match &provider {
+        Some(p) => Some(p.subscribe_blocks().await.context("eth_subscribe(newHeads)")?),
+        None => None,
+    };
+
+    // What the numbers of this run mean. Triggered from the feed, both ends are
+    // sequence numbers and neither is a block height: `--offset` shows the two
+    // differ by a constant, so calling a sequence number a block would be off
+    // by exactly that much.
+    let (at_word, in_word, signal, counted_from) = match &t.trigger {
+        Trigger::Heads(_) => ("head", "block", "head", "the rpc head"),
+        Trigger::Feed => ("seq", "seq", "feed", "the sequencer"),
+    };
     println!(
-        "heads from {}, sending through {}, sightings {}",
-        label(&t.ws_url),
+        "rounds start {}, sending through {}, sightings {}",
+        match &t.trigger {
+            Trigger::Heads(url) => format!("on heads from {}", label(url)),
+            Trigger::Feed => "on the feed's own messages".to_string(),
+        },
         t.submit_label,
         match t.feed_url.is_some() {
             true => "from the feed".to_string(),
@@ -935,25 +1007,62 @@ async fn selftest(t: SelfTest) -> Result<()> {
     let mut blocks: Vec<i64> = Vec::new();
     let mut from_tip: Vec<i64> = Vec::new();
     for round in 1..=t.rounds {
+        // When this round began, what announced it, and where the sequencer was.
+        //
         // Whatever piled up while the last round was waiting is history, and
-        // dropped unread. A round triggered by a buffered head would send
-        // against a block the chain has already left behind, and would be
-        // stamped with the time it was READ rather than the time it arrived -
-        // both of which make the loop look later the longer the run goes on.
-        while heads.next().now_or_never().flatten().is_some() {}
-        let Some(head) = heads.next().await else {
-            anyhow::bail!("the head stream ended after {} round(s)", round - 1);
-        };
-        let at_head = Instant::now();
-        let height = head.number.map(|n| n.as_u64()).unwrap_or_default();
-        // Where the SEQUENCER was when this round began, which is not where the
-        // rpc says the head is: a block has to be executed and indexed before
-        // `newHeads` mentions it, and the sequencer is already past it by then.
-        // Counted from the rpc head alone, a transaction that was next in line
-        // still looks several blocks late.
-        let tip = match t.feed_url.is_some() {
-            true => seen.lock().await.values().map(|(_, seq)| *seq).max().unwrap_or_default(),
-            false => 0,
+        // dropped unread on both paths. A round triggered by a buffered head
+        // would send against a block the chain has already left behind, and
+        // would be stamped with the time it was READ rather than the time it
+        // arrived - both of which make the loop look later the longer the run
+        // goes on.
+        let (at_head, height, tip) = match &mut heads {
+            Some(heads) => {
+                while heads.next().now_or_never().flatten().is_some() {}
+                let Some(head) = heads.next().await else {
+                    anyhow::bail!("the head stream ended after {} round(s)", round - 1);
+                };
+                let at_head = Instant::now();
+                let height = head.number.map(|n| n.as_u64()).unwrap_or_default();
+                // Where the SEQUENCER was when this round began, which is not
+                // where the rpc says the head is: a block has to be executed and
+                // indexed before `newHeads` mentions it, and the sequencer is
+                // already past it by then. Counted from the rpc head alone, a
+                // transaction that was next in line still looks several blocks
+                // late.
+                let tip = match t.feed_url.is_some() {
+                    true => {
+                        seen.lock().await.values().map(|(_, seq)| *seq).max().unwrap_or_default()
+                    }
+                    false => 0,
+                };
+                (at_head, height, tip)
+            }
+            // Stamped by the reader as the frame landed, not by this loop when
+            // it got round to looking: everything between the two - the queue,
+            // the decode - is then inside the measurement, where it belongs.
+            None => {
+                let frames = frames.as_mut().expect("--from-feed is refused without a feed");
+                // Marks the current value seen, which is what makes the wait
+                // below wait for a frame that arrives from now on.
+                frames.borrow_and_update();
+                loop {
+                    if frames.changed().await.is_err() {
+                        // The sender is gone, so the reader has stopped, and
+                        // its own error says why: a feed that could not be
+                        // connected to reads as "ended" from here, and stopping
+                        // on that without the reason would be the least useful
+                        // thing this could report.
+                        if let Some((reader, _)) = feed_tasks.take() {
+                            reader.await.context("the feed reader")??;
+                        }
+                        anyhow::bail!("the feed ended after {} round(s)", round - 1);
+                    }
+                    let latest = *frames.borrow();
+                    if let Some((seq, at)) = latest {
+                        break (started + at, seq, seq);
+                    }
+                }
+            }
         };
 
         let req = Eip1559TransactionRequest::new()
@@ -974,7 +1083,7 @@ async fn selftest(t: SelfTest) -> Result<()> {
             // Signing is local and the nonce is fresh every round, so a refusal
             // is the endpoint's answer and worth stopping on rather than
             // averaging over.
-            println!("round {round} head {height}  REFUSED by {}: {e}", t.submit_label);
+            println!("round {round} {at_word} {height}  REFUSED by {}: {e}", t.submit_label);
             break;
         }
         let sent = at_head.elapsed();
@@ -1005,8 +1114,8 @@ async fn selftest(t: SelfTest) -> Result<()> {
         }
         let Some((back, block)) = landed else {
             println!(
-                "round {round} head {height}  send {:>4} ms, then NOT SEEN in {}s - stopping, \
-                 the nonce is stuck",
+                "round {round} {at_word} {height}  send {:>4} ms, then NOT SEEN in {}s - \
+                 stopping, the nonce is stuck",
                 sent.as_millis(),
                 INCLUSION_TIMEOUT.as_secs()
             );
@@ -1014,8 +1123,13 @@ async fn selftest(t: SelfTest) -> Result<()> {
         };
 
         let delta = block as i64 - height as i64;
-        // A zero tip is "the feed has said nothing yet", not "block zero".
-        let behind_tip = (tip != 0).then(|| block as i64 - tip as i64);
+        // A zero tip is "the feed has said nothing yet", not "block zero". Under
+        // `--from-feed` the trigger IS a sequencer message, so `delta` is already
+        // counted from the sequencer and repeating it would be one number twice.
+        let behind_tip = match t.trigger {
+            Trigger::Feed => None,
+            Trigger::Heads(_) => (tip != 0).then(|| block as i64 - tip as i64),
+        };
         send_ms.push(sent.as_millis() as i64);
         seen_ms.push(back.as_millis() as i64);
         blocks.push(delta);
@@ -1023,8 +1137,8 @@ async fn selftest(t: SelfTest) -> Result<()> {
             from_tip.push(d);
         }
         println!(
-            "round {round} head {height}  send {:>4} ms   seen {:>4} ms   in block {block} \
-             (+{delta} from the rpc head{})",
+            "round {round} {at_word} {height}  send {:>4} ms   seen {:>4} ms   in {in_word} \
+             {block} (+{delta} from {counted_from}{})",
             sent.as_millis(),
             back.as_millis(),
             behind_tip.map(|d| format!(", +{d} from the sequencer at {tip}")).unwrap_or_default()
@@ -1045,8 +1159,8 @@ async fn selftest(t: SelfTest) -> Result<()> {
         v[v.len() / 2]
     };
     println!(
-        "\n{} round(s): median head->send {} ms, head->seen {} ms, {} blocks late from the rpc \
-         head{}",
+        "\n{} round(s): median {signal}->send {} ms, {signal}->seen {} ms, {} blocks late from \
+         {counted_from}{}",
         send_ms.len(),
         median(&mut send_ms),
         median(&mut seen_ms),
@@ -1056,11 +1170,19 @@ async fn selftest(t: SelfTest) -> Result<()> {
             false => format!(", {} from the sequencer", median(&mut from_tip)),
         }
     );
-    println!(
-        "head->seen is the whole loop the bot lives in. The count from the SEQUENCER is the \
-         honest one: the rpc head is a block already executed and indexed, so counting from it \
-         charges this loop for blocks it was never in a position to reach."
-    );
+    match t.trigger {
+        Trigger::Heads(_) => println!(
+            "head->seen is the whole loop the bot lives in. The count from the SEQUENCER is the \
+             honest one: the rpc head is a block already executed and indexed, so counting from \
+             it charges this loop for blocks it was never in a position to reach."
+        ),
+        Trigger::Feed => println!(
+            "feed->seen is the whole loop as a feed-driven bot would run it, and feed->send \
+             includes decoding the frame that started the round - which is what it costs to \
+             learn there is anything to send. Both ends are the feed's own numbering, so nothing \
+             here is counted from a head the sequencer had already left behind."
+        ),
+    }
     Ok(())
 }
 
@@ -1249,6 +1371,19 @@ async fn main() -> Result<()> {
         !args.iter().any(|a| a == "--selftest") || send,
         "--selftest sends real transactions on every head: add --send to confirm"
     );
+    anyhow::ensure!(
+        !args.iter().any(|a| a == "--from-feed") || args.iter().any(|a| a == "--selftest"),
+        "--from-feed says what starts a round, and only --selftest has rounds"
+    );
+    // A feed-triggered run has nothing to trigger on without a feed, and
+    // falling back to heads would answer a different question under the flag
+    // that asked for this one.
+    anyhow::ensure!(
+        !args.iter().any(|a| a == "--from-feed")
+            || value("--feed").is_some()
+            || env_var("FEED_URL").is_some(),
+        "--from-feed has nothing to start a round on: pass --feed wss://... or set FEED_URL"
+    );
 
     // Every `--endpoint` given, else what the bot itself broadcasts through -
     // so a bare run measures the status quo rather than nothing.
@@ -1411,13 +1546,22 @@ async fn main() -> Result<()> {
         if targets.len() > 1 {
             println!("more than one endpoint given; sending through {} only\n", targets[0].label);
         }
-        let ws_url = value("--ws")
-            .or_else(|| env_var("WS_URL"))
-            .or(cfg.ws_url)
-            .context("no rpc websocket to take heads from: pass --ws wss://... or set WS_URL")?;
+        let feed_url = value("--feed").or_else(|| env_var("FEED_URL"));
+        let trigger = match args.iter().any(|a| a == "--from-feed") {
+            true => Trigger::Feed,
+            false => Trigger::Heads(
+                value("--ws")
+                    .or_else(|| env_var("WS_URL"))
+                    .or(cfg.ws_url)
+                    .context(
+                        "no rpc websocket to take heads from: pass --ws wss://..., set WS_URL, \
+                         or start rounds on the feed instead with --from-feed"
+                    )?,
+            ),
+        };
         return selftest(SelfTest {
-            ws_url,
-            feed_url: value("--feed").or_else(|| env_var("FEED_URL")),
+            trigger,
+            feed_url,
             submit: targets[0].http.clone(),
             submit_label: targets[0].label.clone(),
             read,
