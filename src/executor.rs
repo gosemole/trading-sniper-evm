@@ -683,6 +683,7 @@ impl Executor {
         match crate::depth::tick_window(&reader, state.sqrt_p).await {
             Ok(w) => {
                 let (lo, hi) = w.span();
+                let (llo, lhi) = w.ladder_span();
                 tracing::debug!(
                     pool = %key,
                     edges = w.edges(),
@@ -697,6 +698,12 @@ impl Executor {
                     // question is actually asked in.
                     covers_down = format!("{:.1}%", ((lo / state.sqrt_p).powi(2) - 1.0) * 100.0),
                     covers_up = format!("{:.1}%", ((hi / state.sqrt_p).powi(2) - 1.0) * 100.0),
+                    // And how far a swap may actually be WALKED, which is the
+                    // narrower of the two and the one that decides whether a
+                    // trade gets priced. On a densely provided pool the ladder
+                    // runs out long before the bitmap does.
+                    walkable_down = format!("{:.1}%", ((llo / state.sqrt_p).powi(2) - 1.0) * 100.0),
+                    walkable_up = format!("{:.1}%", ((lhi / state.sqrt_p).powi(2) - 1.0) * 100.0),
                     "tick window read"
                 );
                 self.ticks.put(key, Some(w)).await;

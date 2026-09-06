@@ -44,6 +44,22 @@ Run this after editing `[[routes]]`; a broken chain of pools fails here rather
 than at trade time.
 
 ```bash
+cargo run -- --depth
+```
+
+Prints, for every `[[pools]]` entry: its price, liquidity and the fee actually
+charged; what it costs to move that price by 0.5 to 10 percent in either
+direction; where the initialized ticks sit around it; and how far the ladder the
+bot keeps in memory reaches in **percent**. That last line is the one to read
+when a buy was refused with "walks past the last tick the scan read" - the
+ladder is bounded in ticks, and how much price that buys depends on how densely
+the pool is provided.
+
+Read-only, and heavier than anything the bot does by itself - it asks the whole
+question at once because somebody is waiting for the answer and nothing is
+racing.
+
+```bash
 cargo run -- --quote "buy CAMELTOE"
 ```
 

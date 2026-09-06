@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let check_routes = args.iter().any(|a| a == "--check-routes");
     let execute = args.iter().any(|a| a == "--execute");
     let depth_check = args.iter().any(|a| a == "--depth-check");
+    let depth_report = args.iter().any(|a| a == "--depth");
     let quote_route = flag_value("--quote");
     let swap_route = flag_value("--swap");
     let sell_token = flag_value("--sell-all");
@@ -86,6 +87,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if depth_check {
         return depth_check_cmd(&http, &cfg).await;
+    }
+    if depth_report {
+        return depth_report_cmd(&http, &cfg).await;
     }
     if let Some(name) = quote_route {
         return quote_route_cmd(&http, &cfg, &name, amount.as_deref()).await;
@@ -252,6 +256,167 @@ async fn chain_id(
 /// Resolve every configured route and print what was recovered, without
 /// touching a wallet. Every PoolKey is verified against its pool id, so a wrong
 /// id or a broken chain fails here rather than at swap time.
+/// Look at what every watched pool's liquidity actually looks like.
+///
+/// Read-only, manual, and deliberately heavier than anything the bot does on
+/// its own: it asks the questions a person asks when a trade was refused, and
+/// the answers are worth several requests each when somebody is waiting for
+/// them and nothing is racing.
+///
+/// Three things, in the order they get asked:
+///
+/// 1. what the pool is right now - price, tick, liquidity, and the fee that is
+///    actually charged rather than the one the PoolKey states;
+/// 2. what it costs to move it, both ways, at several sizes. This is the
+///    number that says whether a route's `amount_in` is sized for the pool;
+/// 3. where the liquidity boundaries sit, and - the reason this exists - HOW
+///    FAR the ladder the bot keeps in memory actually reaches in price. A quote
+///    is refused when a swap walks past that, and `LADDER_TICKS` bounds it in
+///    ticks while the swap cares about percent. On a densely provided pool the
+///    two are very different numbers.
+async fn depth_report_cmd(
+    http: &ethers::providers::Provider<ethers::providers::Http>,
+    cfg: &config::Config,
+) -> anyhow::Result<()> {
+    let manager = pool_manager(cfg).ok();
+    for pc in &cfg.pools {
+        let pool = match pool::Pool::resolve(http, pc, &cfg.tokens, manager).await {
+            Ok(p) => p,
+            Err(e) => {
+                println!("\n{}\n  skipped: {e:#}", pc.name);
+                continue;
+            }
+        };
+        let (Some(spacing), Some(source)) = (pool.tick_spacing, pool.tick_source()) else {
+            println!("\n{}\n  skipped: no tick source", pool.name);
+            continue;
+        };
+        let reader = depth::TickReader::new(http, source, spacing)?;
+        let state = match depth::read_state(&reader).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("\n{}\n  could not read state: {e:#}", pool.name);
+                continue;
+            }
+        };
+
+        let price = |sqrt: f64| {
+            price::from_sqrt(sqrt, pool.decimals0, pool.decimals1, pool.base_token)
+        };
+        let base = pool.base_symbol.clone().unwrap_or_else(|| "base".into());
+        let quote = pool.quote_symbol.clone().unwrap_or_else(|| "quote".into());
+        let base_decimals = match pool.base_token {
+            1 => pool.decimals1,
+            _ => pool.decimals0,
+        };
+
+        println!("\n{}  {}", pool.name, pool.pool_ref());
+        println!(
+            "  price      {:.10} {quote} per {base}    tick {}   spacing {spacing}",
+            price(state.sqrt_p),
+            depth::tick_at_sqrt(state.sqrt_p)
+        );
+        println!(
+            "  liquidity  {}    lp fee {} bps   swap fee {}/{} bps (0->1 / 1->0)",
+            state.liquidity,
+            state.lp_fee as f64 / 100.0,
+            state.swap_fee(true) as f64 / 100.0,
+            state.swap_fee(false) as f64 / 100.0,
+        );
+
+        // 2. What it costs to move it, in the token actually paid each way.
+        println!("\n  cost to move the {base} price");
+        println!("     move        buy ({quote} in)          sell ({base} in)");
+        for move_pct in [0.5f64, 1.0, 2.0, 5.0, 10.0] {
+            // Lifting the base price is paid in the quote token; pushing it
+            // down is paid in the base, which is the same walk mirrored - so
+            // the two differ only in which side is called the base.
+            let mut both = Vec::new();
+            for (side, decimals) in
+                [(pool.base_token, pool.quote_decimals()), (1 - pool.base_token, base_decimals)]
+            {
+                both.push(
+                    depth::pay_to_move(
+                        &reader,
+                        state.sqrt_p,
+                        state.liquidity,
+                        side,
+                        move_pct,
+                        state.swap_fee(side != 0),
+                    )
+                    .await
+                    .map(|v| v / 10f64.powi(decimals as i32)),
+                );
+            }
+            let down = both.pop().expect("two sides");
+            let up = both.pop().expect("two sides");
+            let show = |r: &anyhow::Result<f64>| match r {
+                Ok(v) => format!("{v:>18.6}"),
+                Err(_) => format!("{:>18}", "-"),
+            };
+            println!("    {:>5.1}%   {}   {}", move_pct, show(&up), show(&down));
+        }
+
+        // 3. Where the boundaries are, and how far the bot can walk from here.
+        let window = match depth::tick_window(&reader, state.sqrt_p).await {
+            Ok(w) => w,
+            Err(e) => {
+                println!("\n  could not scan ticks: {e:#}");
+                continue;
+            }
+        };
+        let (lo, hi) = window.span();
+        let (llo, lhi) = window.ladder_span();
+        let pct = |s: f64| ((s / state.sqrt_p).powi(2) - 1.0) * 100.0;
+        println!(
+            "\n  scan       {} tick(s) found, {} with liquidity read",
+            window.edges(),
+            window.ladder()
+        );
+        println!(
+            "  bitmap     {:+.1}% .. {:+.1}%   (where the ticks ARE)",
+            pct(lo),
+            pct(hi)
+        );
+        if window.ladder() == 0 {
+            println!("  walkable   nothing - no quote can be modelled from this pool");
+        } else {
+            println!(
+                "  walkable   {:+.1}% .. {:+.1}%   (how far a swap may be PRICED from memory)",
+                pct(llo),
+                pct(lhi)
+            );
+        }
+
+        println!("\n     tick        price          from here    liquidityNet");
+        let mut shown = 0;
+        for (sqrt, net) in window.profile() {
+            let away = pct(sqrt);
+            // Only the neighbourhood: a wide scan on a busy pool has hundreds,
+            // and the ones a trade could reach are the ones worth reading.
+            if away.abs() > 25.0 {
+                continue;
+            }
+            println!(
+                "  {:>9}   {:>12.10}   {:>+9.2}%   {}",
+                depth::tick_at_sqrt(sqrt),
+                price(sqrt),
+                away,
+                match net {
+                    Some(n) => n.to_string(),
+                    None => "not read".to_string(),
+                }
+            );
+            shown += 1;
+        }
+        if shown == 0 {
+            println!("     (none within 25% of the price)");
+        }
+    }
+    cache::flush();
+    Ok(())
+}
+
 /// Prove that reading storage in batches changed no number.
 ///
 /// `TickReader` now pulls a whole scan window through the manager's

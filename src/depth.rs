@@ -596,6 +596,26 @@ impl TickWindow {
         (self.lo, self.hi)
     }
 
+    /// The sqrt prices a walk may actually be run between - narrower than
+    /// `span`, and the one that binds. Knowing where a tick is costs a shared
+    /// bitmap word; knowing what it does costs a word each, so the ladder
+    /// reaches only as far as `LADDER_TICKS` ticks do, which on a densely
+    /// provided pool can be a much shorter stretch of price than the bitmap
+    /// covers.
+    pub fn ladder_span(&self) -> (f64, f64) {
+        (self.ladder_lo, self.ladder_hi)
+    }
+
+    /// Every tick the scan found, ascending, with what crossing it does where
+    /// that was read and `None` where it was not.
+    ///
+    /// For inspection only. The trading path takes ladders through
+    /// `ladder_from`, which is direction-aware and refuses what it did not
+    /// read; this hands the raw picture to a human instead.
+    pub fn profile(&self) -> impl Iterator<Item = (f64, Option<i128>)> + '_ {
+        self.edges.iter().map(|e| (e.sqrt, e.net))
+    }
+
     /// How many places liquidity changes inside it.
     pub fn edges(&self) -> usize {
         self.edges.len()
