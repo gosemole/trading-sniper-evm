@@ -92,6 +92,19 @@ pub struct Config {
     /// written after every fill, so a restart does not forget an entry price.
     #[serde(default = "default_inventory")]
     pub inventory_path: String,
+    /// Native currency to keep back for gas, in whole units - "0.05" is 0.05
+    /// ETH.
+    ///
+    /// Only bites on a route that SPENDS the native currency, where the trade
+    /// and the gas come out of the same balance: sizing a buy to the whole of
+    /// it buys a swap that cannot pay for itself. A route spending an ERC-20
+    /// is unaffected, because nothing it trades with is what gas is paid in.
+    ///
+    /// A flat figure rather than an estimate per trade. An estimate is only as
+    /// good as the last gas price seen and has to be right every time; a
+    /// reserve large enough for many transactions has to be right once.
+    #[serde(default = "default_gas_reserve")]
+    pub gas_reserve: String,
     /// Uniswap Universal Router, the contract swaps are sent to.
     #[serde(default)]
     pub universal_router: Option<String>,
@@ -206,6 +219,10 @@ fn default_calibrate() -> u64 {
     300
 }
 
+fn default_gas_reserve() -> String {
+    "0.05".to_string()
+}
+
 fn default_pool_cache() -> String {
     "pools.json".to_string()
 }
@@ -304,6 +321,11 @@ fn env_var(name: &str) -> Option<String> {
 
 fn validate(cfg: &Config) -> anyhow::Result<()> {
     anyhow::ensure!(!cfg.pools.is_empty(), "no pools configured");
+    // Parsed here rather than at the first buy: a reserve that turns out not to
+    // be a number is a config mistake, and it should be one somebody is reading
+    // a message about rather than one a trade discovers.
+    crate::route::parse_units(&cfg.gas_reserve, 18)
+        .with_context(|| format!("gas_reserve \"{}\" is not an amount", cfg.gas_reserve))?;
     anyhow::ensure!(
         !cfg.ws_url.trim().is_empty(),
         "no ws endpoint: set the WS_URL environment variable, or ws_url in config"
@@ -512,6 +534,31 @@ mod tests {
         ))
         .expect("an address per pool is still allowed");
         assert_eq!(cfg.pools[0].address.as_deref(), Some(MANAGER));
+    }
+
+    /// The reserve is a wallet-level amount in whole native units, and a
+    /// mistyped one has to fail while somebody is reading the message rather
+    /// than when a buy discovers it.
+    #[test]
+    fn the_gas_reserve_is_read_as_an_amount() {
+        let cfg = with(&format!(
+            "gas_reserve = \"0.05\"\n[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"{MANAGER}\"\n"
+        ))
+        .expect("0.05 is an amount");
+        assert_eq!(cfg.gas_reserve, "0.05");
+
+        // Omitted, a default stands in rather than nothing being kept back.
+        let cfg = with(&format!(
+            "[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"{MANAGER}\"\n"
+        ))
+        .expect("optional");
+        assert_eq!(cfg.gas_reserve, "0.05");
+
+        let e = with(&format!(
+            "gas_reserve = \"plenty\"\n[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"{MANAGER}\"\n"
+        ))
+        .expect_err("not an amount");
+        assert!(format!("{e:#}").contains("gas_reserve"), "{e:#}");
     }
 
     /// A misspelled address is caught while someone is reading the message, not

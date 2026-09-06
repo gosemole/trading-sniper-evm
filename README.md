@@ -136,6 +136,7 @@ Global:
 | `threshold_pct` | drop inside one block that counts as a signal |
 | `max_move_pct` | what the depth line in a signal is measured against |
 | `calibrate_secs` | how often to re-measure what a route takes on top of its pools' stated fees, and how often the pool snapshot a buy is priced from is refreshed. Both a price input and a safety check: an unmeasured route is not bought, and one keeping over 5% is refused. `0` disables it, so nothing is ever bought. The snapshot is trusted for twice this interval, so raising it makes buys price off older state |
+| `gas_reserve` | native currency never spent on a trade, e.g. `"0.05"`. Only bites on a route that **spends** the native currency, where the swap and its gas come out of the same balance - an ERC-20 route is unaffected. Defaults to `0.05` |
 | `pool_cache_path` | where recovered PoolKeys, decimals and symbols are kept |
 | `inventory_path` | where positions and unsettled trades are kept |
 | `universal_router`, `pool_manager`, `permit2` | contracts. `pool_manager` is shared by every v4 pool and every v4 route, so it is written once here and omitted from the pools themselves |

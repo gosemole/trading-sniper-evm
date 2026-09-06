@@ -525,6 +525,8 @@ pub struct Executor {
     permit2: Address,
     /// Seconds between yield measurements; 0 turns them off.
     calibrate_secs: u64,
+    /// Native currency held back from a route that spends it - see `spendable`.
+    gas_reserve: U256,
     wallet: LocalWallet,
     owner: Address,
     /// Sign and send, rather than only reporting what would have been sent.
@@ -726,6 +728,8 @@ impl Executor {
             manager,
             permit2,
             calibrate_secs: cfg.calibrate_secs,
+            gas_reserve: crate::route::parse_units(&cfg.gas_reserve, 18)
+                .context("gas_reserve")?,
             wallet,
             owner,
             execute,
@@ -1041,8 +1045,12 @@ impl Executor {
         // accepted would describe two different pools.
         let prepared = self.prepare(plan, route, live_hop(key, sig, route), ppm)?;
 
-        // The ceiling is what there is to spend: a route carries no size, and
-        // the wallet is the only honest limit on one.
+        // The ceiling is what there is to spend, less what the transaction
+        // needs to exist. On a route that spends native ETH those come out of
+        // the SAME balance, so sizing to the whole of it buys a swap that
+        // cannot pay for its own gas - and the tracked figure does not even
+        // know about the gas, because nothing debits it.
+        let cap = self.spendable(plan, cap)?;
         let target = route.impact_pct / 100.0;
         let size = {
             let impact_at = |amount: U256| -> Option<f64> {
@@ -1067,6 +1075,39 @@ impl Executor {
             sized
         };
         Some((size, prepared))
+    }
+
+    /// How much of a balance a trade may actually use.
+    ///
+    /// Everything, unless the route spends the native currency - in which case
+    /// the gas comes out of the same balance and `gas_reserve` has to be left
+    /// behind. Nothing debits gas from the tracked figure, so without this the
+    /// ceiling would grow a little more wrong with every buy and eventually
+    /// size a trade that cannot pay for itself.
+    ///
+    /// A flat reserve rather than an estimate. An estimate is only as good as
+    /// the last gas price seen and must be right on every trade; a reserve
+    /// worth many transactions must be right once, in the config.
+    ///
+    /// `None` when there is not even that much, which is a wallet that cannot
+    /// trade rather than a size to shrink.
+    fn spendable(&self, plan: &Plan, balance: U256) -> Option<U256> {
+        if plan.route.input.address != Address::zero() {
+            return Some(balance);
+        }
+        let keep = self.gas_reserve;
+        let left = balance.saturating_sub(keep);
+        if left.is_zero() {
+            warn!(
+                route = %plan.route.name,
+                balance = %format_units(balance, plan.route.input.decimals),
+                gas_reserve = %format_units(keep, plan.route.input.decimals),
+                "not buying: this route spends the same currency the gas comes out of, and \
+                 there is nothing above the reserve to trade with"
+            );
+            return None;
+        }
+        Some(left)
     }
 
     /// A size to measure a route's unstated fee at.

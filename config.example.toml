@@ -10,6 +10,9 @@
 #   set -a; source ~/.config/mm-fall.env; set +a
 
 threshold_pct = 3     # signal on a drop this big (%) inside one block
+gas_reserve = "0.05"  # native currency never spent on a trade. Only bites on a
+                      # route that SPENDS the native currency, where the swap
+                      # and its gas come out of the same balance
 max_move_pct = 1.0    # depth line: what it costs to move the price this much (%)
 
 # universal_router is needed for --approve, --swap and auto_buy; not for the
