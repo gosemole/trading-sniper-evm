@@ -36,9 +36,54 @@ pub struct Tick {
     pub price: f64,
 }
 
-/// Follow one pool until the subscription ends, sending a tick per swap.
-pub async fn run_pool(pool: Pool, ws_url: String, out: mpsc::Sender<Tick>) -> Result<()> {
+/// Follow every pool over ONE websocket until the connection ends.
+///
+/// One socket, not one per pool. Each pool still gets its own subscription and
+/// its own task - the decoding and the backpressure are unchanged - but they
+/// share the connection underneath, because `Provider<Ws>` is a handle to it
+/// and cloning hands out another handle rather than dialling again.
+///
+/// Endpoints commonly meter connections separately from requests, and the old
+/// shape spent one per pool plus a fourth on the gas-price stream. Worse, a
+/// dead endpoint produced a reconnect storm multiplied by the number of pools,
+/// each with its own backoff, all hammering the thing that was already
+/// refusing. Now the connection is retried once for all of them.
+///
+/// The cost is that they now fall together: a dropped socket stops every pool
+/// at once. That is close to what happened anyway - sockets fail because the
+/// endpoint or the network did, not one pool at a time.
+pub async fn run_all(pools: Vec<Pool>, ws_url: String, out: mpsc::Sender<Tick>) -> Result<()> {
     let provider = Provider::<Ws>::connect(&ws_url).await.context("connect ws")?;
+    info!(pools = pools.len(), "websocket connected");
+
+    let mut following = Vec::with_capacity(pools.len());
+    for pool in pools {
+        // A clone shares the socket. Each task owns one so it can hold the
+        // borrow its own subscription needs.
+        let provider = provider.clone();
+        let out = out.clone();
+        following.push(tokio::spawn(async move { follow(&provider, pool, out).await }));
+    }
+    anyhow::ensure!(!following.is_empty(), "no pools to follow");
+
+    // Held until they are all done, because the last handle dropped is the
+    // connection closed.
+    let ended = futures_util::future::join_all(following).await;
+    drop(provider);
+
+    // A pool whose subscription was refused says so and does not stop the rest:
+    // one bad filter should not take the other pools off the air, and the next
+    // reconnect gives it another try.
+    let failed = ended.iter().filter(|r| !matches!(r, Ok(Ok(())))).count();
+    anyhow::ensure!(
+        failed < ended.len(),
+        "every pool's subscription ended in failure"
+    );
+    Ok(())
+}
+
+/// One pool's subscription, over a connection somebody else owns.
+async fn follow(provider: &Provider<Ws>, pool: Pool, out: mpsc::Sender<Tick>) -> Result<()> {
     let topic = match pool.version.as_str() {
         "v4" => v4_swap_topic(),
         _ => v3_swap_topic(),
@@ -49,7 +94,10 @@ pub async fn run_pool(pool: Pool, ws_url: String, out: mpsc::Sender<Tick>) -> Re
     if let Some(pid) = pool.pool_id {
         filter = filter.topic1(ethers::types::ValueOrArray::Value(pid));
     }
-    let mut stream = provider.subscribe_logs(&filter).await.context("subscribe logs")?;
+    let mut stream = provider
+        .subscribe_logs(&filter)
+        .await
+        .with_context(|| format!("subscribe logs for {}", pool.name))?;
 
     info!(
         pool = %pool.name, version = %pool.version, addr = ?pool.address,

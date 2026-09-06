@@ -137,7 +137,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("inventory restored from {}", cfg.inventory_path);
     }
     let mut strategy = strategy::Strategy::new(http.clone(), auto, inv, reports_tx);
-    let mut feeds = Vec::new();
+    // Resolved first, subscribed after: every pool shares one websocket, so
+    // there is nothing to open until it is known which pools there are.
+    let mut watched: Vec<pool::Pool> = Vec::new();
     let tokens = cfg.tokens.clone();
     for pool_cfg in cfg.pools {
         let pool = match pool::Pool::resolve(&http, &pool_cfg, &tokens, Some(manager)).await {
@@ -167,33 +169,8 @@ async fn main() -> anyhow::Result<()> {
             armed.and_then(|r| r.take_profit_pct),
             armed.and_then(|r| r.exit_after_secs),
         );
-        let ws = cfg.ws_url.clone();
-        let out = ticks.clone();
-        feeds.push(tokio::spawn(async move {
-            // Exponential backoff so a persistently failing endpoint is not
-            // hammered; reset once a subscription has run for a while.
-            let mut backoff = std::time::Duration::from_secs(3);
-            loop {
-                let started = std::time::Instant::now();
-                match feed::run_pool(pool.clone(), ws.clone(), out.clone()).await {
-                    Ok(()) => tracing::warn!(pool = %pool.name, "stream closed, reconnecting"),
-                    Err(e) => {
-                        tracing::error!(pool = %pool.name, err = %e, "feed error, reconnecting")
-                    }
-                }
-                if started.elapsed() >= std::time::Duration::from_secs(60) {
-                    backoff = std::time::Duration::from_secs(3);
-                }
-                tracing::info!(pool = %pool.name, delay_s = backoff.as_secs(), "backing off");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
-            }
-        }));
+        watched.push(pool);
     }
-    // The last sender in this scope has to go, or the strategy would wait on a
-    // channel nobody can ever write to again.
-    drop(ticks);
-
     // Every pool failing to resolve used to leave this empty, which made the
     // process exit 0 in silence.
     anyhow::ensure!(
@@ -201,6 +178,31 @@ async fn main() -> anyhow::Result<()> {
         "no pools could be resolved; nothing to watch"
     );
     tracing::info!(pools = strategy.watching(), "watching");
+
+    // One task for all of them, and one backoff. Per pool it was a reconnect
+    // storm multiplied by their number against an endpoint already refusing.
+    let feeds = tokio::spawn({
+        let ws = cfg.ws_url.clone();
+        async move {
+            // Exponential backoff so a persistently failing endpoint is not
+            // hammered; reset once the connection has run for a while.
+            let mut backoff = std::time::Duration::from_secs(3);
+            loop {
+                let started = std::time::Instant::now();
+                match feed::run_all(watched.clone(), ws.clone(), ticks.clone()).await {
+                    Ok(()) => tracing::warn!("feed closed, reconnecting"),
+                    Err(e) => tracing::error!(err = %format!("{e:#}"), "feed error, reconnecting"),
+                }
+                if started.elapsed() >= std::time::Duration::from_secs(60) {
+                    backoff = std::time::Duration::from_secs(3);
+                }
+                tracing::info!(delay_s = backoff.as_secs(), "backing off");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+            }
+        }
+    });
+
     // Everything that had to be looked up has been; keep it for next time.
     cache::flush();
     strategy.resolve_pending().await;
@@ -208,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
     let decisions = tokio::spawn(strategy.run(rx, reports_rx));
 
     tokio::select! {
-        _ = futures_util::future::join_all(feeds) => {}
+        _ = feeds => {}
         _ = decisions => {}
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("ctrl-c received, shutting down");

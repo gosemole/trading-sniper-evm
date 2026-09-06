@@ -167,9 +167,10 @@ feed ──ticks──▶ strategy ──▶ executor ──▶ chain
                    └────── reports ─────────┘
 ```
 
-- **feed** - one task per pool. Turns each swap log into a tick and has no
-  opinion about what it means. Price, liquidity and the fee actually charged all
-  come out of the log itself, so the freshest state costs nothing.
+- **feed** - one websocket for every pool, with a subscription and a task each.
+  Turns each swap log into a tick and has no opinion about what it means. Price,
+  liquidity and the fee actually charged all come out of the log itself, so the
+  freshest state costs nothing.
 - **strategy** - runs the drop meter, holds the inventory, decides to buy or to
   sell. Nothing in its loop waits on the network: trades and tick walks go to
   tasks of their own and report back over a channel.
