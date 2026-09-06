@@ -595,30 +595,37 @@ impl TickWindow {
     /// the two must select the same ticks: going up the starting price is
     /// exclusive, going down it is inclusive.
     pub fn ladder_from(&self, sqrt_p: f64, up: bool) -> Option<Ladder> {
-        if !sqrt_p.is_finite() || sqrt_p < self.ladder_lo || sqrt_p > self.ladder_hi {
+        if !sqrt_p.is_finite() || sqrt_p < self.lo || sqrt_p > self.hi {
             return None;
         }
-        // Bounded by the ladder, not by the window. The bitmap reaches further
-        // than the liquidity reads do, so an unbounded selection would pick up
-        // ticks whose effect was never looked up - and then refuse the whole
-        // ladder over them, on exactly the densely provided pools where the cap
-        // bites. What lies past the bound is carried as `bound` instead, where
-        // the walk can stop at it rather than choke on it.
-        let selected = self.edges.iter().filter(|e| match up {
-            true => e.sqrt > sqrt_p && e.sqrt <= self.ladder_hi,
-            false => e.sqrt <= sqrt_p && e.sqrt >= self.ladder_lo,
-        });
-        // Still collected through `Option`: within the bound every net was
-        // read, so a hole means something is wrong and the answer is "ask the
-        // chain" rather than a walk with a tick silently missing.
-        let rungs: Vec<Rung> = match up {
-            true => selected.map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect::<Option<_>>()?,
-            false => selected.rev().map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect::<Option<_>>()?,
+        // Taken in the order a walk meets them, and STOPPED at the first tick
+        // whose effect was not read rather than thrown away because of it.
+        //
+        // Discarding the lot over one hole was wrong twice over. A pool read
+        // one call at a time - a v3 one - gets a hole from any single request
+        // that failed, and then priced nothing at all; and even a clean read
+        // has a hole at the edge of what it looked at, which is not a fault but
+        // simply where looking stopped. What is known up to that point is
+        // perfectly good, and `bound` is exactly the word for where it ends.
+        let mut rungs = Vec::new();
+        let mut bound = if up { self.hi } else { self.lo };
+        let ordered: Box<dyn Iterator<Item = &Edge>> = match up {
+            true => Box::new(self.edges.iter().filter(|e| e.sqrt > sqrt_p)),
+            false => Box::new(self.edges.iter().rev().filter(|e| e.sqrt <= sqrt_p)),
         };
-        Some(Ladder {
-            rungs,
-            bound: if up { self.ladder_hi } else { self.ladder_lo },
-        })
+        for edge in ordered {
+            match edge.net {
+                Some(net) => rungs.push(Rung { sqrt: edge.sqrt, net }),
+                None => {
+                    // Liquidity holds right up to here - there is no other tick
+                    // between, or it would be in this list - and what happens
+                    // at this one is not known.
+                    bound = edge.sqrt;
+                    break;
+                }
+            }
+        }
+        Some(Ladder { rungs, bound })
     }
 
     /// The sqrt prices the scan covered, for logs and tests.
@@ -1485,9 +1492,8 @@ mod tests {
     }
 
     /// The bitmap reaches further than the liquidity reads do, so a densely
-    /// provided pool has ticks whose effect was never looked up. Selecting them
-    /// anyway made `ladder_from` refuse over them - silently disabling the
-    /// model on exactly the pools where the cap on reads bites.
+    /// provided pool has ticks whose effect was never looked up. Those must not
+    /// cost the rungs nearer the price - only bound the walk where they sit.
     #[test]
     fn ticks_past_the_ladder_do_not_poison_the_ones_inside_it() {
         let at = sqrt_at_tick;
@@ -1508,11 +1514,11 @@ mod tests {
 
         let up = w.ladder_from(at(0), true).expect("the near ticks were read");
         assert_eq!(up.rungs, vec![Rung { sqrt: at(600), net: -3 }]);
-        assert_eq!(up.bound, at(600), "and the walk must stop where they end");
+        assert_eq!(up.bound, at(6000), "bounded by the first tick nobody looked up");
 
         let down = w.ladder_from(at(0), false).expect("the near ticks were read");
         assert_eq!(down.rungs, vec![Rung { sqrt: at(-600), net: 5 }]);
-        assert_eq!(down.bound, at(-600));
+        assert_eq!(down.bound, at(-6000));
     }
 
     /// A pool whose reads cannot be batched still has to be walkable. Skipping
@@ -1524,12 +1530,8 @@ mod tests {
         // What the scan builds for one: fewer rungs than a batched pool, but a
         // real range rather than an empty one.
         let w = laddered(&[(-600, 5), (0, 7), (600, -3)], -6000, 6000);
-        assert!(w.ladder_from(sqrt_at_tick(0), true).is_some());
-
-        // And a window that read NOTHING is the case that must still refuse -
-        // the two have to stay distinguishable.
-        let bare = window(&[-600, 600], -6000, 6000);
-        assert!(bare.ladder_from(sqrt_at_tick(0), true).is_none());
+        let got = w.ladder_from(sqrt_at_tick(0), true).expect("walkable");
+        assert!(!got.rungs.is_empty(), "zero rungs everywhere is what refused every price");
     }
 
     /// A pool provided across its whole range has NO initialized ticks near
@@ -1617,32 +1619,39 @@ mod tests {
         }
     }
 
-    /// The distinction the whole design rests on: a stretch the scan covered
-    /// and found empty is a FACT, one it never read is not. An empty ladder
-    /// means "nothing to cross round here" and is walkable; `None` means
-    /// "nothing was read round here" and is not. Confusing them would hand the
-    /// walk a swap it finishes at a liquidity nobody looked up.
+    /// The distinction the whole design rests on, and where it actually lives.
+    ///
+    /// The BITMAP knows where every tick in the scanned range is, so "there is
+    /// nothing between here and that tick" is a fact. What may be missing is
+    /// what CROSSING one does. So an unread tick does not make the ladder
+    /// useless - it makes it end there, and the walk may go right up to it.
+    ///
+    /// It ends in a different place depending on which, and that is the whole
+    /// answer: read-and-empty ends at the edge of the scan, unread ends at the
+    /// first tick nobody looked up.
     #[test]
-    fn unread_is_not_the_same_answer_as_empty() {
+    fn a_ladder_ends_where_knowledge_ends_not_where_ticks_are() {
         let at = sqrt_at_tick;
 
-        // Read, and genuinely empty around the price - a pool provided across
-        // its whole range looks exactly like this, and it is the easiest pool
-        // there is to price, not the hardest.
+        // Read, and genuinely nothing around the price: the walk may go as far
+        // as the scan looked.
         let empty = laddered(&[], -6000, 6000);
         let up = empty.ladder_from(at(0), true).expect("read and empty is an answer");
         assert!(up.rungs.is_empty());
-        assert_eq!(up.bound, at(6000), "empty still knows how far it looked");
-        assert!(empty.ladder_from(at(0), false).is_some());
+        assert_eq!(up.bound, at(6000), "nothing to cross, so as far as it looked");
 
-        // Positions known, effects not - an unbatched pool.
+        // Positions known, effects not: the walk may go up to the first of
+        // them and no further.
         let bare = window(&[-600, 600], -6000, 6000);
-        assert!(bare.ladder_from(at(0), true).is_none(), "positions alone cannot be walked");
+        let up = bare.ladder_from(at(0), true).expect("what is between here and 600 is known");
+        assert!(up.rungs.is_empty(), "nothing crossable was read");
+        assert_eq!(up.bound, at(600), "and it stops at the tick nobody looked up");
+        let down = bare.ladder_from(at(0), false).expect("the other way too");
+        assert_eq!(down.bound, at(-600));
 
-        // Laddered, but asked about a price outside what was read.
-        let near = laddered(&[(0, 7)], -600, 600);
-        assert!(near.ladder_from(at(6000), true).is_none());
-        assert!(near.ladder_from(at(100), true).is_some());
+        // A price outside what was scanned at all is still no answer.
+        assert!(bare.ladder_from(at(60_000), true).is_none());
+        assert!(bare.ladder_from(f64::NAN, true).is_none());
     }
 
     /// The cached ladder and the chain-read walk must select the same ticks,
@@ -1718,6 +1727,8 @@ mod tests {
     fn a_ladder_that_does_not_reach_refuses() {
         let w = laddered(&[(0, 7)], -600, 600);
         assert!(w.ladder_from(sqrt_at_tick(0), true).is_some());
+        // Outside the SCAN, not merely outside the ladder: nothing is known
+        // about where the ticks are there, let alone what they do.
         assert!(w.ladder_from(sqrt_at_tick(-6000), true).is_none());
         assert!(w.ladder_from(f64::NAN, true).is_none());
     }
