@@ -13,6 +13,7 @@
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::{Address, Bytes, TransactionRequest, H256, U256};
+use ethers::abi::{decode, encode, ParamType, Token as AbiToken};
 use ethers::utils::keccak256;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -31,6 +32,20 @@ const POOLS_SLOT: u64 = 6;
 const MAX_BITMAP_WORDS: u32 = 32;
 const TICKS_OFFSET: u64 = 4;
 const BITMAP_OFFSET: u64 = 5;
+
+/// Multicall3, at the deterministic address it is deployed to on essentially
+/// every chain. It batches arbitrary `eth_call`s into one, which is what a v3
+/// pool needs and does not have of its own: v4 keeps every pool's state in one
+/// contract and offers `extsload`, while a v3 pool is its own contract with
+/// nothing but per-item views.
+///
+/// Not required. A chain without it, or an endpoint that will not serve the
+/// batch, falls back to one request per read - which is what this did before,
+/// only slower.
+const MULTICALL3: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+/// Calls per `aggregate3`. The whole of one pool's scan fits well inside it.
+const CALLS_PER_MULTICALL: usize = 64;
 
 /// How many slots to ask for in one `extsload`. The whole scan window is 32
 /// words plus a slot per initialized tick found in them, which fits comfortably;
@@ -90,6 +105,15 @@ pub struct TickReader<'a> {
     /// Scan windows already fetched, so a walk that crosses many ticks inside
     /// one window does not re-derive the same request on every crossing.
     windows: Mutex<std::collections::HashSet<(i32, bool)>>,
+    /// `eth_call` answers already in hand, keyed by what was asked. The same
+    /// job `words` does for storage, for the pools whose state is only
+    /// reachable through their own view functions.
+    calls: Mutex<HashMap<(Address, Vec<u8>), Bytes>>,
+    /// Whether the batching contract is worth asking again. One refusal is
+    /// enough to stop trying for the life of this reader: a chain without it
+    /// will not grow one mid-scan, and every retry is a wasted request on top
+    /// of the individual ones that follow anyway.
+    multicall: Mutex<bool>,
     /// Whether to fetch storage in batches through the manager's `extsload`.
     /// Only ever turned off to check that batching changed no answers.
     batched: bool,
@@ -109,6 +133,8 @@ impl<'a> TickReader<'a> {
             spacing,
             words: Mutex::new(HashMap::new()),
             windows: Mutex::new(std::collections::HashSet::new()),
+            calls: Mutex::new(HashMap::new()),
+            multicall: Mutex::new(true),
             batched: true,
             at: None,
         })
@@ -372,6 +398,23 @@ impl<'a> TickReader<'a> {
         self.prefetch(&ticks).await;
     }
 
+    /// What reading one bitmap word costs on a pool with no batch storage read
+    /// of its own - the call itself, so it can be asked for in advance.
+    fn bitmap_call(&self, word_pos: i32) -> Option<(Address, Vec<u8>)> {
+        let Source::V3 { pool } = &self.source else { return None };
+        let mut data = selector("tickBitmap(int16)").to_vec();
+        data.extend_from_slice(&signed_word(word_pos as i64));
+        Some((*pool, data))
+    }
+
+    /// The same for one tick's data.
+    fn tick_call(&self, tick: i32) -> Option<(Address, Vec<u8>)> {
+        let Source::V3 { pool } = &self.source else { return None };
+        let mut data = selector("ticks(int24)").to_vec();
+        data.extend_from_slice(&signed_word(tick as i64));
+        Some((*pool, data))
+    }
+
     /// The storage slot of one bitmap word, for the batch reader.
     fn bitmap_slot(&self, word_pos: i32) -> Option<U256> {
         match &self.source {
@@ -395,9 +438,124 @@ impl<'a> TickReader<'a> {
     }
 
     async fn call(&self, to: Address, data: Vec<u8>) -> Result<Bytes> {
-        let tx = TransactionRequest::new().to(to).data(Bytes::from(data));
+        if let Ok(seen) = self.calls.lock() {
+            if let Some(hit) = seen.get(&(to, data.clone())) {
+                return Ok(hit.clone());
+            }
+        }
+        let tx = TransactionRequest::new().to(to).data(Bytes::from(data.clone()));
         let at = self.at.map(ethers::types::BlockId::from);
-        self.http.call(&tx.into(), at).await.context("eth_call")
+        let out = self.http.call(&tx.into(), at).await.context("eth_call")?;
+        if let Ok(mut seen) = self.calls.lock() {
+            seen.insert((to, data), out.clone());
+        }
+        Ok(out)
+    }
+
+    /// Ask all of these at once, so the reads that follow find them in hand.
+    ///
+    /// Best effort, exactly like `prefetch`: whatever does not come back is
+    /// simply read one at a time afterwards. A pool whose state is only
+    /// reachable through view functions - a v3 one - otherwise costs a request
+    /// per bitmap word and another per tick, which is two dozen for one pass
+    /// over one pool.
+    async fn prefetch_calls(&self, calls: &[(Address, Vec<u8>)]) {
+        let Ok(target) = MULTICALL3.parse::<Address>() else { return };
+        match self.multicall.lock() {
+            Ok(ok) if *ok => {}
+            _ => return,
+        }
+        let wanted: Vec<(Address, Vec<u8>)> = {
+            let Ok(seen) = self.calls.lock() else { return };
+            let mut once = std::collections::HashSet::new();
+            calls
+                .iter()
+                .filter(|c| !seen.contains_key(*c) && once.insert((*c).clone()))
+                .cloned()
+                .collect()
+        };
+        for chunk in wanted.chunks(CALLS_PER_MULTICALL) {
+            match self.aggregate3(target, chunk).await {
+                Ok(answers) => {
+                    if let Ok(mut seen) = self.calls.lock() {
+                        for (c, out) in chunk.iter().zip(answers) {
+                            // A call that failed inside the batch is left out
+                            // rather than cached as an empty answer, so the
+                            // read that wants it asks for itself.
+                            if let Some(bytes) = out {
+                                seen.insert(c.clone(), bytes);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(err = %format!("{e:#}"), "batched calls unavailable");
+                    if let Ok(mut ok) = self.multicall.lock() {
+                        *ok = false;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `aggregate3((address,bool,bytes)[])`: one answer per call, in order.
+    ///
+    /// Every call is sent with `allowFailure`, so one that reverts costs its
+    /// own answer and not the whole batch - a tick that is not there must not
+    /// take the bitmap down with it.
+    async fn aggregate3(
+        &self,
+        target: Address,
+        calls: &[(Address, Vec<u8>)],
+    ) -> Result<Vec<Option<Bytes>>> {
+        let body = AbiToken::Array(
+            calls
+                .iter()
+                .map(|(to, data)| {
+                    AbiToken::Tuple(vec![
+                        AbiToken::Address(*to),
+                        AbiToken::Bool(true),
+                        AbiToken::Bytes(data.clone()),
+                    ])
+                })
+                .collect(),
+        );
+        let mut data = selector("aggregate3((address,bool,bytes)[])").to_vec();
+        data.extend_from_slice(&encode(&[body]));
+
+        let tx = TransactionRequest::new().to(target).data(Bytes::from(data));
+        let at = self.at.map(ethers::types::BlockId::from);
+        let res = self.http.call(&tx.into(), at).await.context("multicall3")?;
+        anyhow::ensure!(!res.0.is_empty(), "no code at the batching contract");
+
+        let out = decode(
+            &[ParamType::Array(Box::new(ParamType::Tuple(vec![
+                ParamType::Bool,
+                ParamType::Bytes,
+            ])))],
+            &res,
+        )
+        .context("decoding the batch")?;
+        let AbiToken::Array(rows) = &out[0] else {
+            anyhow::bail!("the batch did not answer with an array")
+        };
+        anyhow::ensure!(
+            rows.len() == calls.len(),
+            "asked for {} calls and got {} answers",
+            calls.len(),
+            rows.len()
+        );
+        Ok(rows
+            .iter()
+            .map(|row| match row {
+                AbiToken::Tuple(t) => match (&t[0], &t[1]) {
+                    (AbiToken::Bool(true), AbiToken::Bytes(b)) => Some(Bytes::from(b.clone())),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect())
     }
 
     /// Base storage slot of `_pools[poolId]` for a v4 pool.
@@ -793,6 +951,11 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
     let raw: Vec<U256> = match batched {
         true => reader.bitmap_words_batched(&positions).await?,
         false => {
+            // One request for all of them where the chain has a batching
+            // contract; the reads below then find every word in hand. Without
+            // one they simply happen individually, as they always did.
+            let calls: Vec<_> = positions.iter().filter_map(|w| reader.bitmap_call(*w)).collect();
+            reader.prefetch_calls(&calls).await;
             let mut out = Vec::with_capacity(positions.len());
             for w in &positions {
                 out.push(reader.bitmap_word(*w).await?);
@@ -851,6 +1014,11 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
         let slots: Vec<U256> =
             found[first..last].iter().filter_map(|(t, _)| reader.tick_slot(*t)).collect();
         reader.prefetch(&slots).await;
+        // And the same for a pool that has no storage to batch: its ticks are
+        // view calls, and a batching contract can carry all of them at once.
+        let calls: Vec<_> =
+            found[first..last].iter().filter_map(|(t, _)| reader.tick_call(*t)).collect();
+        reader.prefetch_calls(&calls).await;
     }
     let mut nets = Vec::with_capacity(last.saturating_sub(first));
     for (tick, _) in &found[first..last] {
@@ -1143,6 +1311,12 @@ pub async fn read_state(reader: &TickReader<'_>) -> Result<PoolState> {
             })
         }
         Source::V3 { pool } => {
+            // Three calls that are known in advance, so they go as one.
+            let wanted: Vec<_> = ["slot0()", "liquidity()", "fee()"]
+                .iter()
+                .map(|sig| (*pool, selector(sig).to_vec()))
+                .collect();
+            reader.prefetch_calls(&wanted).await;
             let s0 = reader.call(*pool, selector("slot0()")).await?;
             anyhow::ensure!(s0.len() >= 32, "short slot0() return");
             let sqrt_x96 = U256::from_big_endian(&s0[0..32]);
@@ -1617,6 +1791,56 @@ mod tests {
             assert!(w.ladder_from(sqrt_at_tick(tick), true).is_some(), "at tick {tick}");
             assert!(w.ladder_from(sqrt_at_tick(tick), false).is_some(), "at tick {tick}");
         }
+    }
+
+    /// The batch's answers have to line up with the calls one for one, and a
+    /// call that reverted inside it must come back as "no answer" rather than
+    /// as an empty one - an empty answer cached is a wrong answer remembered.
+    #[test]
+    fn a_batched_answer_belongs_to_the_call_that_asked() {
+        // What `aggregate3` returns: (success, returnData) per call, in order.
+        let rows = AbiToken::Array(vec![
+            AbiToken::Tuple(vec![AbiToken::Bool(true), AbiToken::Bytes(vec![1, 2, 3])]),
+            AbiToken::Tuple(vec![AbiToken::Bool(false), AbiToken::Bytes(vec![])]),
+            AbiToken::Tuple(vec![AbiToken::Bool(true), AbiToken::Bytes(vec![9])]),
+        ]);
+        let encoded = encode(&[rows]);
+
+        let out = decode(
+            &[ParamType::Array(Box::new(ParamType::Tuple(vec![
+                ParamType::Bool,
+                ParamType::Bytes,
+            ])))],
+            &encoded,
+        )
+        .unwrap();
+        let AbiToken::Array(got) = &out[0] else { panic!("not an array") };
+        assert_eq!(got.len(), 3, "one answer per call, or the pairing is guesswork");
+
+        let answers: Vec<Option<Vec<u8>>> = got
+            .iter()
+            .map(|row| match row {
+                AbiToken::Tuple(t) => match (&t[0], &t[1]) {
+                    (AbiToken::Bool(true), AbiToken::Bytes(b)) => Some(b.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers[0], Some(vec![1, 2, 3]));
+        assert_eq!(answers[1], None, "a call that reverted has no answer to cache");
+        assert_eq!(answers[2], Some(vec![9]));
+    }
+
+    /// The address is the one Multicall3 is deployed to everywhere, and a typo
+    /// in it would look exactly like "this chain has no batching contract".
+    #[test]
+    fn the_batching_contract_is_the_canonical_one() {
+        let a: Address = MULTICALL3.parse().expect("an address");
+        assert_eq!(
+            format!("{a:?}").to_lowercase(),
+            "0xca11bde05977b3631167028862be2a173976ca11"
+        );
     }
 
     /// The distinction the whole design rests on, and where it actually lives.
