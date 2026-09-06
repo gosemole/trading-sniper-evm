@@ -92,13 +92,18 @@ pub struct Config {
     /// written after every fill, so a restart does not forget an entry price.
     #[serde(default = "default_inventory")]
     pub inventory_path: String,
-    /// Native currency to keep back for gas, in whole units - "0.05" is 0.05
-    /// ETH.
+    /// Native currency that must be on hand for gas, in whole units - "0.05"
+    /// is 0.05 ETH.
     ///
-    /// Only bites on a route that SPENDS the native currency, where the trade
-    /// and the gas come out of the same balance: sizing a buy to the whole of
-    /// it buys a swap that cannot pay for itself. A route spending an ERC-20
-    /// is unaffected, because nothing it trades with is what gas is paid in.
+    /// Chiefly a GATE on buying. Below it no route buys anything, whatever it
+    /// spends: a position bought with the last of the gas is a position that
+    /// cannot be sold, and a bag nobody can put down is worse than a dip nobody
+    /// caught. Getting in is optional; getting out is not.
+    ///
+    /// Nothing else: a route may not spend the native currency at all, so the
+    /// balance a trade comes out of and the balance gas comes out of are never
+    /// the same pot. A pool holding native ETH is traded by holding the wrapped
+    /// token - see `weth`.
     ///
     /// A flat figure rather than an estimate per trade. An estimate is only as
     /// good as the last gas price seen and has to be right every time; a

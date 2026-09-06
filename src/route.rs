@@ -205,6 +205,19 @@ impl Route {
     ) -> Result<Self> {
         let input_addr = resolve_token(tokens, &cfg.input)
             .with_context(|| format!("route '{}': bad input token", cfg.name))?;
+        // A route never spends the native currency. That balance is what gas is
+        // paid from, and trading it means the money for a sale and the money
+        // for the swap are one pot - so a buy can leave a position that cannot
+        // be closed. A pool holding native ETH is still perfectly tradable:
+        // hold the wrapped token and let the router unwrap on the way in, which
+        // is what `weth` and `Route::wrap` are for.
+        anyhow::ensure!(
+            input_addr != Address::zero(),
+            "route '{}': a route may not spend the native currency - that balance is for gas. \
+             Set `weth` at the top of the config and write `input = \"WETH\"`; the router \
+             unwraps into a native pool inside the same transaction",
+            cfg.name
+        );
 
         let mut hops = Vec::with_capacity(cfg.pools.len());
         let mut cursor = input_addr;
@@ -562,6 +575,36 @@ mod tests {
             max_slippage_pct: 1.0,
             hops: vec![hop(1, 2, 1, 2, 6, 8), hop(2, 3, 2, 3, 8, 18)],
         }
+    }
+
+    /// A route may not spend the native currency: that balance is what gas is
+    /// paid from, and trading it makes the money for a swap and the money for
+    /// the sale that follows one pot. The refusal names the way round it,
+    /// because a pool holding native ETH is perfectly tradable - just not by
+    /// paying in it.
+    #[tokio::test]
+    async fn a_route_may_not_spend_the_native_currency() {
+        let http = Provider::<Http>::try_from("http://127.0.0.1:1").unwrap();
+        let cfg = RouteConfig {
+            name: "t".into(),
+            input: "0x0000000000000000000000000000000000000000".into(),
+            max_slippage_pct: 1.0,
+            impact_pct: 0.5,
+            pools: vec![format!("0x{}", "11".repeat(32))],
+            auto_buy: false,
+            trigger_pool: None,
+            take_profit_pct: None,
+            exit_after_secs: None,
+            cooldown_secs: 60,
+        };
+        // Refused before anything is read, so the unreachable endpoint above is
+        // never touched.
+        let e = Route::resolve(&http, Address::zero(), &cfg, &HashMap::new(), None)
+            .await
+            .expect_err("the native currency is for gas");
+        let said = format!("{e:#}");
+        assert!(said.contains("native currency"), "{said}");
+        assert!(said.contains("weth"), "the refusal has to name the way round it: {said}");
     }
 
     #[test]

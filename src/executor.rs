@@ -525,8 +525,12 @@ pub struct Executor {
     permit2: Address,
     /// Seconds between yield measurements; 0 turns them off.
     calibrate_secs: u64,
-    /// Native currency held back from a route that spends it - see `spendable`.
+    /// Native currency that must be there before a buy - see `spendable`.
     gas_reserve: U256,
+    /// What the wallet holds of the native currency, refreshed in the
+    /// background. Read on every signal and never on the network, because the
+    /// question is asked between a drop and a broadcast.
+    gas_balance: std::sync::Mutex<U256>,
     wallet: LocalWallet,
     owner: Address,
     /// Sign and send, rather than only reporting what would have been sent.
@@ -731,6 +735,11 @@ impl Executor {
             calibrate_secs: cfg.calibrate_secs,
             gas_reserve: crate::route::parse_units(&cfg.gas_reserve, 18)
                 .context("gas_reserve")?,
+            // Read once here so the first signal is judged on a real figure
+            // rather than on a zero that would refuse it.
+            gas_balance: std::sync::Mutex::new(
+                swap::balance_of(http, Address::zero(), owner).await.unwrap_or_default(),
+            ),
             wallet,
             owner,
             execute,
@@ -811,6 +820,14 @@ impl Executor {
                 // Every hop of every armed route, deduplicated: one pool shared
                 // by two routes is one window, and a route and its reverse are
                 // the same pools either way.
+                // Read on the same pass as the windows: it decides whether a
+                // buy happens at all, and it is one request for every pool
+                // rather than one each.
+                if let Ok(native) = swap::balance_of(&me.http, Address::zero(), me.owner).await {
+                    if let Ok(mut slot) = me.gas_balance.lock() {
+                        *slot = native;
+                    }
+                }
                 let mut done = std::collections::HashSet::new();
                 for plan in me.plans.values() {
                     for hop in &plan.route.hops {
@@ -1080,35 +1097,38 @@ impl Executor {
 
     /// How much of a balance a trade may actually use.
     ///
-    /// Everything, unless the route spends the native currency - in which case
-    /// the gas comes out of the same balance and `gas_reserve` has to be left
-    /// behind. Nothing debits gas from the tracked figure, so without this the
-    /// ceiling would grow a little more wrong with every buy and eventually
-    /// size a trade that cannot pay for itself.
+    /// How much of a balance a trade may actually use, and whether to trade at
+    /// all.
+    ///
+    /// Whether there is enough native currency to trade at all.
+    ///
+    /// Not about paying for the BUY - about paying for the sale that has to
+    /// follow it. A position bought with the last of the gas is a position that
+    /// cannot be closed, and a bag nobody can put down is a worse outcome than
+    /// a dip nobody caught. Getting in is optional; getting out is not.
+    ///
+    /// It has nothing to say about the size, because a route may not spend the
+    /// native currency at all - `Route::resolve` refuses one that tries. A pool
+    /// holding native ETH is traded by holding the wrapped token and letting
+    /// the router unwrap on the way in, so the balance a trade comes out of and
+    /// the balance gas comes out of are never the same pot.
     ///
     /// A flat reserve rather than an estimate. An estimate is only as good as
     /// the last gas price seen and must be right on every trade; a reserve
     /// worth many transactions must be right once, in the config.
-    ///
-    /// `None` when there is not even that much, which is a wallet that cannot
-    /// trade rather than a size to shrink.
     fn spendable(&self, plan: &Plan, balance: U256) -> Option<U256> {
-        if plan.route.input.address != Address::zero() {
-            return Some(balance);
-        }
-        let keep = self.gas_reserve;
-        let left = balance.saturating_sub(keep);
-        if left.is_zero() {
+        let native = self.gas_balance.lock().ok().map(|g| *g).unwrap_or_default();
+        if native < self.gas_reserve {
             warn!(
                 route = %plan.route.name,
-                balance = %format_units(balance, plan.route.input.decimals),
-                gas_reserve = %format_units(keep, plan.route.input.decimals),
-                "not buying: this route spends the same currency the gas comes out of, and \
-                 there is nothing above the reserve to trade with"
+                native = %format_units(native, 18),
+                gas_reserve = %format_units(self.gas_reserve, 18),
+                "NOT BUYING: too little native currency left to be sure of paying for the \
+                 sale - a position that cannot be closed is worse than a dip not caught"
             );
             return None;
         }
-        Some(left)
+        Some(balance)
     }
 
     /// A size to measure a route's unstated fee at.

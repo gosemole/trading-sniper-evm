@@ -10,9 +10,10 @@
 #   set -a; source ~/.config/mm-fall.env; set +a
 
 threshold_pct = 3     # signal on a drop this big (%) inside one block
-gas_reserve = "0.05"  # native currency never spent on a trade. Only bites on a
-                      # route that SPENDS the native currency, where the swap
-                      # and its gas come out of the same balance
+gas_reserve = "0.05"  # native currency that must be on hand for gas. Below it
+                      # nothing is bought at all - a position bought with the
+                      # last of the gas cannot be sold. A route may not spend
+                      # the native currency itself; use weth below
 max_move_pct = 1.0    # depth line: what it costs to move the price this much (%)
 
 # universal_router is needed for --approve, --swap and auto_buy; not for the
@@ -26,8 +27,9 @@ max_move_pct = 1.0    # depth line: what it costs to move the price this much (%
 #   one holding WETH and there is no choice about which to use - but with this
 #   set, a route can write `input = "WETH"` for a native pool and the router
 #   unwraps on the way in and wraps on the way out, inside the same
-#   transaction. The native balance is then left alone for gas, and gas_reserve
-#   stops applying to that route.
+#   transaction. This is the ONLY way to trade a native pool: a route that
+#   spends the native currency directly is refused, because that balance is
+#   what gas is paid from.
 
 [tokens]
 ETH      = "0x0000000000000000000000000000000000000000"

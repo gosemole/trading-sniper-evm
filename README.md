@@ -147,10 +147,10 @@ Global:
 | `threshold_pct` | drop inside one block that counts as a signal |
 | `max_move_pct` | what the depth line in a signal is measured against |
 | `calibrate_secs` | how often to re-measure what a route takes on top of its pools' stated fees, and how often the pool snapshot a buy is priced from is refreshed. Both a price input and a safety check: an unmeasured route is not bought, and one keeping over 5% is refused. `0` disables it, so nothing is ever bought. The snapshot is trusted for twice this interval, so raising it makes buys price off older state |
-| `gas_reserve` | native currency never spent on a trade, e.g. `"0.05"`. Only bites on a route that **spends** the native currency, where the swap and its gas come out of the same balance - an ERC-20 route is unaffected. Defaults to `0.05` |
+| `gas_reserve` | native currency that must be on hand for gas, e.g. `"0.05"`. Below it **nothing is bought**: a position bought with the last of the gas cannot be sold, and that is worse than a dip not caught. Defaults to `0.05` |
 | `pool_cache_path` | where recovered PoolKeys, decimals and symbols are kept |
 | `inventory_path` | where positions and unsettled trades are kept |
-| `weth` | wrapped native token. Set it to trade a **native** pool while holding the wrapped one: a route writes `input = "WETH"`, and the router unwraps on the way in and wraps on the way out inside the same transaction. The native balance is then only ever touched for gas, and `gas_reserve` stops applying to that route |
+| `weth` | wrapped native token, and the **only** way to trade a pool that holds the native one: a route writes `input = "WETH"`, and the router unwraps on the way in and wraps on the way out inside the same transaction. A route spending the native currency directly is refused - that balance is what gas is paid from, and trading it makes one pot of the money for a swap and the money for the sale after it |
 | `universal_router`, `pool_manager`, `permit2` | contracts. `pool_manager` is shared by every v4 pool and every v4 route, so it is written once here and omitted from the pools themselves |
 
 Per route:
