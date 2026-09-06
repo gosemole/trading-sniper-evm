@@ -84,6 +84,12 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(err = %format!("{e:#}"), "pool cache unusable, ignoring it"),
     }
 
+    // Before any reader exists, because it is one address for the whole run.
+    depth::set_multicall(match cfg.multicall.as_deref() {
+        Some(a) => Some(a.parse().context("multicall")?),
+        None => depth::MULTICALL3_DEFAULT.parse().ok(),
+    });
+
     // Whatever the config already knows, before anything goes looking for it.
     // A pool older than the endpoint's log history cannot be recovered from the
     // chain at all, and this is the only way to hand it over.

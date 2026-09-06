@@ -130,6 +130,14 @@ pub struct Config {
     /// Permit2. Defaults to the canonical deterministic deployment.
     #[serde(default)]
     pub permit2: Option<String>,
+    /// Multicall3, used to read a pool that has no batch read of its own - a v3
+    /// one, whose state is only reachable through its own view functions.
+    /// Defaults to the canonical deterministic deployment.
+    ///
+    /// Never required: a chain without it, or an address with nothing at it,
+    /// simply means one request per read instead of one for all of them.
+    #[serde(default)]
+    pub multicall: Option<String>,
     /// v4 PoolManager. Every v4 pool on a chain shares one, so it belongs here
     /// beside the router rather than repeated as each pool's `address` - which
     /// is what `[[pools]]` used to require, one identical line per pool.
@@ -358,6 +366,10 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
             !u.trim().is_empty(),
             "submit_urls[{i}] is empty - remove the entry rather than leaving a blank one"
         );
+    }
+    if let Some(m) = &cfg.multicall {
+        m.parse::<ethers::types::Address>()
+            .map_err(|e| anyhow::anyhow!("multicall \"{m}\" is not an address: {e}"))?;
     }
     if let Some(w) = &cfg.weth {
         w.parse::<ethers::types::Address>()

@@ -42,7 +42,30 @@ const BITMAP_OFFSET: u64 = 5;
 /// Not required. A chain without it, or an endpoint that will not serve the
 /// batch, falls back to one request per read - which is what this did before,
 /// only slower.
-const MULTICALL3: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+///
+/// Overridable in config for the same reason `permit2` is: deterministic is not
+/// the same as universal.
+pub const MULTICALL3_DEFAULT: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+/// Where the batching contract is, once the config has been read.
+///
+/// A process-wide setting rather than an argument, the way the pool cache is:
+/// it is one address for the whole run, and threading it through every reader
+/// would be six call sites carrying a constant.
+static MULTICALL: std::sync::OnceLock<Option<Address>> = std::sync::OnceLock::new();
+
+/// Point the batch reader at a contract, or at nothing. Called once, before any
+/// reader exists; without it the canonical address is used.
+pub fn set_multicall(at: Option<Address>) {
+    let _ = MULTICALL.set(at);
+}
+
+fn multicall() -> Option<Address> {
+    match MULTICALL.get() {
+        Some(chosen) => *chosen,
+        None => MULTICALL3_DEFAULT.parse().ok(),
+    }
+}
 
 /// Calls per `aggregate3`. The whole of one pool's scan fits well inside it.
 const CALLS_PER_MULTICALL: usize = 64;
@@ -460,7 +483,7 @@ impl<'a> TickReader<'a> {
     /// per bitmap word and another per tick, which is two dozen for one pass
     /// over one pool.
     async fn prefetch_calls(&self, calls: &[(Address, Vec<u8>)]) {
-        let Ok(target) = MULTICALL3.parse::<Address>() else { return };
+        let Some(target) = multicall() else { return };
         match self.multicall.lock() {
             Ok(ok) if *ok => {}
             _ => return,
@@ -1836,7 +1859,7 @@ mod tests {
     /// in it would look exactly like "this chain has no batching contract".
     #[test]
     fn the_batching_contract_is_the_canonical_one() {
-        let a: Address = MULTICALL3.parse().expect("an address");
+        let a: Address = MULTICALL3_DEFAULT.parse().expect("an address");
         assert_eq!(
             format!("{a:?}").to_lowercase(),
             "0xca11bde05977b3631167028862be2a173976ca11"

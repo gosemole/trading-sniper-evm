@@ -151,6 +151,7 @@ Global:
 | `pool_cache_path` | where recovered PoolKeys, decimals and symbols are kept |
 | `inventory_path` | where positions and unsettled trades are kept |
 | `weth` | wrapped native token, and the **only** way to trade a pool that holds the native one: a route writes `input = "WETH"`, and the router unwraps on the way in and wraps on the way out inside the same transaction. A route spending the native currency directly is refused - that balance is what gas is paid from, and trading it makes one pot of the money for a swap and the money for the sale after it |
+| `multicall` | Multicall3, used to read a v3 pool in one request rather than two dozen - v4 has `extsload` for this, v3 has only its own view functions. Defaults to the canonical deterministic deployment, and is never required: a chain without it simply costs more requests |
 | `universal_router`, `pool_manager`, `permit2` | contracts. `pool_manager` is shared by every v4 pool and every v4 route, so it is written once here and omitted from the pools themselves |
 
 Per route:
