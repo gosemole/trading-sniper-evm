@@ -466,9 +466,12 @@ impl<'a> TickReader<'a> {
                 return Ok(hit.clone());
             }
         }
-        let tx = TransactionRequest::new().to(to).data(Bytes::from(data.clone()));
         let at = self.at.map(ethers::types::BlockId::from);
-        let out = self.http.call(&tx.into(), at).await.context("eth_call")?;
+        let out = crate::rpc::retrying("eth_call", || {
+            let tx = TransactionRequest::new().to(to).data(Bytes::from(data.clone()));
+            async move { self.http.call(&tx.into(), at).await.context("eth_call") }
+        })
+        .await?;
         if let Ok(mut seen) = self.calls.lock() {
             seen.insert((to, data), out.clone());
         }
@@ -547,9 +550,12 @@ impl<'a> TickReader<'a> {
         let mut data = selector("aggregate3((address,bool,bytes)[])").to_vec();
         data.extend_from_slice(&encode(&[body]));
 
-        let tx = TransactionRequest::new().to(target).data(Bytes::from(data));
         let at = self.at.map(ethers::types::BlockId::from);
-        let res = self.http.call(&tx.into(), at).await.context("multicall3")?;
+        let res = crate::rpc::retrying("multicall3", || {
+            let tx = TransactionRequest::new().to(target).data(Bytes::from(data.clone()));
+            async move { self.http.call(&tx.into(), at).await.context("multicall3") }
+        })
+        .await?;
         anyhow::ensure!(!res.0.is_empty(), "no code at the batching contract");
 
         let out = decode(

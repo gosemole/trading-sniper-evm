@@ -9,6 +9,7 @@ mod strategy;
 mod pool;
 mod price;
 mod route;
+mod rpc;
 mod swap;
 
 use anyhow::Context;

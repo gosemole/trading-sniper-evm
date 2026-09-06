@@ -327,7 +327,9 @@ pub fn build_unwrap(weth: Address, amount: U256) -> Result<PendingTx> {
 pub async fn fee_params(http: &Provider<Http>) -> Result<(U256, U256)> {
     // Two independent questions, so one round trip rather than two.
     let (block, tip) = tokio::join!(
-        http.get_block(BlockNumber::Latest),
+        crate::rpc::retrying("eth_getBlockByNumber(latest)", || async {
+            Ok(http.get_block(BlockNumber::Latest).await?)
+        }),
         http.request::<_, U256>("eth_maxPriorityFeePerGas", ()),
     );
     let base = block
@@ -575,10 +577,12 @@ pub fn keep_warm(http: Provider<Http>) {
 /// The next nonce to use, counting transactions already broadcast but not yet
 /// mined - `latest` would hand out one that is already spoken for.
 pub async fn pending_nonce(http: &Provider<Http>, owner: Address) -> Result<u64> {
-    let n = http
-        .get_transaction_count(owner, Some(BlockNumber::Pending.into()))
-        .await
-        .context("eth_getTransactionCount(pending)")?;
+    let n = crate::rpc::retrying("eth_getTransactionCount(pending)", || async {
+        http.get_transaction_count(owner, Some(BlockNumber::Pending.into()))
+            .await
+            .context("eth_getTransactionCount(pending)")
+    })
+    .await?;
     Ok(n.as_u64())
 }
 
@@ -836,10 +840,15 @@ pub async fn check_approvals(
     let mut a = selector("allowance(address,address)");
     a.extend_from_slice(&addr_word(owner));
     a.extend_from_slice(&addr_word(permit2));
-    let res = http
-        .call(&TransactionRequest::new().to(token).data(Bytes::from(a)).into(), None)
-        .await
-        .context("erc20 allowance()")?;
+    let res = crate::rpc::retrying("erc20 allowance()", || {
+        let a = a.clone();
+        async move {
+            http.call(&TransactionRequest::new().to(token).data(Bytes::from(a)).into(), None)
+                .await
+                .context("erc20 allowance()")
+        }
+    })
+    .await?;
     let erc20_allowance = if res.len() >= 32 {
         U256::from_big_endian(&res[0..32])
     } else {
@@ -850,10 +859,15 @@ pub async fn check_approvals(
     p.extend_from_slice(&addr_word(owner));
     p.extend_from_slice(&addr_word(token));
     p.extend_from_slice(&addr_word(router));
-    let res = http
-        .call(&TransactionRequest::new().to(permit2).data(Bytes::from(p)).into(), None)
-        .await
-        .context("permit2 allowance()")?;
+    let res = crate::rpc::retrying("permit2 allowance()", || {
+        let p = p.clone();
+        async move {
+            http.call(&TransactionRequest::new().to(permit2).data(Bytes::from(p)).into(), None)
+                .await
+                .context("permit2 allowance()")
+        }
+    })
+    .await?;
     // returns (uint160 amount, uint48 expiration, uint48 nonce)
     let permit2_allowance = if res.len() >= 32 {
         U256::from_big_endian(&res[0..32])
@@ -867,14 +881,22 @@ pub async fn check_approvals(
 /// balance instead of an ERC-20.
 pub async fn balance_of(http: &Provider<Http>, token: Address, owner: Address) -> Result<U256> {
     if token == Address::zero() {
-        return http.get_balance(owner, None).await.context("eth_getBalance");
+        return crate::rpc::retrying("eth_getBalance", || async {
+            http.get_balance(owner, None).await.context("eth_getBalance")
+        })
+        .await;
     }
     let mut data = selector("balanceOf(address)");
     data.extend_from_slice(&addr_word(owner));
-    let res = http
-        .call(&TransactionRequest::new().to(token).data(Bytes::from(data)).into(), None)
-        .await
-        .context("erc20 balanceOf()")?;
+    let res = crate::rpc::retrying("erc20 balanceOf()", || {
+        let data = data.clone();
+        async move {
+            http.call(&TransactionRequest::new().to(token).data(Bytes::from(data)).into(), None)
+                .await
+                .context("erc20 balanceOf()")
+        }
+    })
+    .await?;
     anyhow::ensure!(res.len() >= 32, "short balanceOf() return");
     Ok(U256::from_big_endian(&res[0..32]))
 }

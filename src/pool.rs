@@ -598,7 +598,11 @@ fn classify(msg: &str) -> Option<Refused> {
 /// The window narrows itself against a stricter provider and gives up cleanly
 /// against one whose history simply does not reach, saying how far it got.
 async fn find_init_log(http: &Provider<Http>, manager: Address, pool_id: H256) -> Result<Log> {
-    let head = http.get_block_number().await?.as_u64();
+    let head = crate::rpc::retrying("eth_blockNumber", || async {
+        Ok(http.get_block_number().await?)
+    })
+    .await?
+    .as_u64();
     // Starts narrow and widens as it walks back, so a pool created today costs
     // one small query and an old one still gets there. The other way round -
     // one enormous query first - is what asked this endpoint for exactly the
@@ -875,7 +879,11 @@ pub async fn symbol_of(http: &Provider<Http>, currency: Address) -> Result<Strin
     let tx = TransactionRequest::new()
         .to(currency)
         .data(selector("symbol()"));
-    let res: Bytes = http.call(&tx.into(), None).await.context("eth_call symbol()")?;
+    let res: Bytes = crate::rpc::retrying("eth_call symbol()", || {
+        let tx = tx.clone();
+        async move { http.call(&tx.into(), None).await.context("eth_call symbol()") }
+    })
+    .await?;
     anyhow::ensure!(res.len() >= 32, "short return for symbol()");
     // ABI string: [offset][len][bytes...]
     if res.len() >= 64 {
@@ -917,22 +925,31 @@ async fn remember_symbol(http: &Provider<Http>, currency: Address, symbol: &str)
 
 /// Read a small unsigned integer return value (uint24/int24/uint8...).
 async fn call_uint(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<u32> {
-    let tx = TransactionRequest::new().to(to).data(data.clone());
-    let res: Bytes = provider.call(&tx.into(), None).await.context("eth_call uint")?;
+    let res: Bytes = crate::rpc::retrying("eth_call uint", || {
+        let tx = TransactionRequest::new().to(to).data(data.clone());
+        async move { provider.call(&tx.into(), None).await.context("eth_call uint") }
+    })
+    .await?;
     anyhow::ensure!(res.len() >= 32, "short return for uint call");
     Ok(U256::from_big_endian(&res[0..32]).low_u32())
 }
 
 async fn call_address(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<Address> {
-    let tx = TransactionRequest::new().to(to).data(data.clone());
-    let res: Bytes = provider.call(&tx.into(), None).await.context("eth_call address")?;
+    let res: Bytes = crate::rpc::retrying("eth_call address", || {
+        let tx = TransactionRequest::new().to(to).data(data.clone());
+        async move { provider.call(&tx.into(), None).await.context("eth_call address") }
+    })
+    .await?;
     anyhow::ensure!(res.len() >= 32, "short return for address call");
     Ok(Address::from_slice(&res[12..32]))
 }
 
 async fn call_u8(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<u8> {
-    let tx = TransactionRequest::new().to(to).data(data.clone());
-    let res: Bytes = provider.call(&tx.into(), None).await.context("eth_call u8")?;
+    let res: Bytes = crate::rpc::retrying("eth_call u8", || {
+        let tx = TransactionRequest::new().to(to).data(data.clone());
+        async move { provider.call(&tx.into(), None).await.context("eth_call u8") }
+    })
+    .await?;
     anyhow::ensure!(!res.is_empty(), "empty return for u8 call");
     Ok(res[res.len() - 1])
 }

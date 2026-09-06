@@ -491,22 +491,32 @@ async fn probe(
     deadline: U256,
     at: Option<u64>,
 ) -> Result<Probe> {
-    let tx = TransactionRequest::new()
-        .from(from)
-        .to(router)
-        .value(call_value(route, amount_in))
-        .data(execute_calldata(route, amount_in, min_out, deadline)?);
-    match http.call(&tx.into(), at.map(ethers::types::BlockId::from)).await {
-        Ok(_) => Ok(Probe::Ok),
-        Err(e) => {
-            let msg = e.to_string();
-            if is_revert(&msg) {
-                Ok(Probe::Reverted(msg))
-            } else {
-                Err(anyhow::anyhow!(msg)).context("eth_call could not be made at all")
+    let data = execute_calldata(route, amount_in, min_out, deadline)?;
+    let value = call_value(route, amount_in);
+    let at = at.map(ethers::types::BlockId::from);
+    // A revert comes back as `Ok(Probe::Reverted)`, so it is an answer and is
+    // never asked again; only a refusal to run the call at all is.
+    crate::rpc::retrying("eth_call probe", || {
+        let tx = TransactionRequest::new()
+            .from(from)
+            .to(router)
+            .value(value)
+            .data(data.clone());
+        async move {
+            match http.call(&tx.into(), at).await {
+                Ok(_) => Ok(Probe::Ok),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_revert(&msg) {
+                        Ok(Probe::Reverted(msg))
+                    } else {
+                        Err(anyhow::anyhow!(msg)).context("eth_call could not be made at all")
+                    }
+                }
             }
         }
-    }
+    })
+    .await
 }
 
 /// `V4TooLittleReceived(uint256 minRequested, uint256 amountReceived)` names the

@@ -829,7 +829,11 @@ impl Executor {
                 // request, and better: two routes measured against different
                 // blocks are two measurements of different markets, which is
                 // the very confusion `measure_yield` pins a block to avoid.
-                match me.http.get_block_number().await {
+                let head = crate::rpc::retrying("eth_blockNumber", || async {
+                    Ok(me.http.get_block_number().await?)
+                })
+                .await;
+                match head {
                     Ok(at) => {
                         for plan in me.plans.values() {
                             if let Err(e) = me.measure_yield(plan, at.as_u64()).await {
