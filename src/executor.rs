@@ -636,7 +636,8 @@ impl Executor {
             info!(
                 route = %rc.name,
                 trigger = %trigger,
-                spend = format!("{} {}", format_units(route.amount_in, route.input.decimals), route.input.symbol),
+                spend = %route.input.symbol,
+                impact_pct = route.impact_pct,
                 buy = %route.output.symbol,
                 slippage_pct = route.max_slippage_pct,
                 cooldown_s = rc.cooldown_secs,
@@ -646,7 +647,8 @@ impl Executor {
             // Measured now, while nobody is waiting, so the hot path never has
             // to ask. A route that cannot be estimated yet still gets armed:
             // the fallback is generous and the next send re-measures.
-            let probe = execute::pending_swap(router, &route, U256::one(), execute::deadline_in(600))?;
+            let probe =
+                execute::pending_swap(router, &route, U256::one(), U256::one(), execute::deadline_in(600))?;
             let gas_limit = match swap::measure_gas(http, owner, &probe).await {
                 Ok(g) => g.min(U256::from(u64::MAX)).as_u64(),
                 Err(e) => {
@@ -911,8 +913,14 @@ impl Executor {
     /// rather than a fee: that is exactly how a 1% cut first measured as 2.46%.
     async fn measure_yield(&self, plan: &Plan, at: u64) -> Result<()> {
         let route = &plan.route;
+        // Measured at the size a signal would actually send, so the fee it
+        // finds is the fee that size pays.
+        let cap = swap::balance_of(&self.http, route.input.address, self.owner)
+            .await
+            .context("reading what there is to measure with")?;
+        let size = self.calibration_size(plan, cap)?;
         let local = route
-            .quote(&self.http, self.manager, Some(at))
+            .quote(&self.http, self.manager, Some(at), size)
             .await
             .context("local tick walk")?;
         let onchain = execute::verify(
@@ -920,6 +928,7 @@ impl Executor {
             self.router,
             self.owner,
             route,
+            size,
             local.amount_out,
             execute::deadline_in(600),
             Some(at),
@@ -1017,7 +1026,7 @@ impl Executor {
     ///
     /// `None` means "do not buy": no measurement, no usable state, or a size
     /// that rounds to nothing.
-    pub fn size_for(&self, key: PoolRef, sig: &Signal) -> Option<(U256, Prepared)> {
+    pub fn size_for(&self, key: PoolRef, sig: &Signal, cap: U256) -> Option<(U256, Prepared)> {
         let plan = self.plans.get(&key)?;
         let route = &plan.route;
         let ppm = plan.yield_ppm.load(Ordering::Relaxed);
@@ -1032,18 +1041,58 @@ impl Executor {
         // accepted would describe two different pools.
         let prepared = self.prepare(plan, route, live_hop(key, sig, route), ppm)?;
 
-        let cap = route.amount_in;
-        let Some(target) = route.impact_pct.map(|p| p / 100.0) else {
-            return (!cap.is_zero()).then_some((cap, prepared));
-        };
+        // The ceiling is what there is to spend: a route carries no size, and
+        // the wallet is the only honest limit on one.
+        let target = route.impact_pct / 100.0;
         let size = {
             let impact_at = |amount: U256| -> Option<f64> {
                 let walked = prepared.walk(crate::route::u256_to_f64(amount))?;
                 walked.impacts.iter().find(|(p, _)| *p == key).map(|(_, i)| *i)
             };
-            size_to_impact(cap, target, impact_at)?
+            let sized = size_to_impact(cap, target, impact_at)?;
+            // The whole balance still does not move the pool as far as asked.
+            // A smaller trade is not a smaller version of this one - it is a
+            // different trade nobody asked for - so it is skipped.
+            let reached = impact_at(sized).is_some_and(|i| i >= target * (1.0 - 1e-6));
+            if !reached {
+                warn!(
+                    route = %route.name,
+                    want_pct = route.impact_pct,
+                    have = %format_units(cap, route.input.decimals),
+                    token = %route.input.symbol,
+                    "not buying: the whole tracked balance cannot move this pool that far"
+                );
+                return None;
+            }
+            sized
         };
         Some((size, prepared))
+    }
+
+    /// A size to measure a route's unstated fee at.
+    ///
+    /// The fee a hook charges can depend on the size, so measuring at an
+    /// arbitrary one measures the wrong thing. This asks the same question a
+    /// signal would: what moves the trigger pool by the route's `impact_pct`,
+    /// against the pool as the last snapshot saw it. There is no live state
+    /// here - calibration runs on a timer, not on a drop - and that is fine,
+    /// because it is measuring a ratio rather than pricing a trade.
+    fn calibration_size(&self, plan: &Plan, cap: U256) -> Result<U256> {
+        let route = &plan.route;
+        let key = route
+            .hops
+            .last()
+            .map(|h| h.pool_ref())
+            .context("route has no hops")?;
+        let prepared = self
+            .prepare(plan, route, None, PPM)
+            .context("no usable pool state to size the measurement from")?;
+        let target = route.impact_pct / 100.0;
+        let impact_at = |amount: U256| -> Option<f64> {
+            let walked = prepared.walk(crate::route::u256_to_f64(amount))?;
+            walked.impacts.iter().find(|(p, _)| *p == key).map(|(_, i)| *i)
+        };
+        size_to_impact(cap, target, impact_at).context("the wallet cannot move this pool that far")
     }
 
     /// The address everything is signed and settled from.
@@ -1091,8 +1140,7 @@ impl Executor {
         // At the size that was priced and reserved, not at the route's ceiling:
         // `execute_calldata` spends whatever `amount_in` says, so the sizing
         // has to reach the calldata or it decides nothing at all.
-        let sized = route.at(spend);
-        let tx = execute::pending_swap(self.router, &sized, min_out, deadline)?;
+        let tx = execute::pending_swap(self.router, route, spend, min_out, deadline)?;
 
         let amount = |v: U256, t: &crate::route::Token| {
             format!("{} {}", format_units(v, t.decimals), t.symbol)
@@ -1184,7 +1232,7 @@ impl Executor {
                 balance
             }
         };
-        let sell = route.reversed(size);
+        let sell = route.reversed();
         let plan = self.plans.get(&key);
         // Two `eth_call`s that answer the same way every time once `--approve`
         // has been run, and answering them here cost a sale two round trips of
@@ -1263,7 +1311,7 @@ impl Executor {
                     // own snapshot here rather than being handed one.
                     true => self
                         .prepare(plan, &sell, fresh, ppm)
-                        .and_then(|p| self.model_quote(&sell, &p, ppm, sell.amount_in)),
+                        .and_then(|p| self.model_quote(&sell, &p, ppm, size)),
                     false => None,
                 }
             }
@@ -1275,7 +1323,7 @@ impl Executor {
             Some(m) => (m.amount_out, "model", Some(m.impact)),
             None => (
                 execute::verify(
-                    &self.http, self.router, self.owner, &sell, U256::zero(), deadline, None,
+                    &self.http, self.router, self.owner, &sell, size, U256::zero(), deadline, None,
                 )
                 .await
                 .context("quoting the sale")?
@@ -1286,7 +1334,7 @@ impl Executor {
         };
         let min_out = execute::apply_slippage(amount_out, slippage_pct);
         anyhow::ensure!(!min_out.is_zero(), "the sale's amountOutMinimum rounds to zero");
-        let tx = execute::pending_swap(self.router, &sell, min_out, deadline)?;
+        let tx = execute::pending_swap(self.router, &sell, size, min_out, deadline)?;
 
         info!(
             route = %sell.name,
@@ -1556,7 +1604,7 @@ impl Executor {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             let Some(plan) = me.plans.get(&key) else { return };
-            let sell = plan.route.reversed(size);
+            let sell = plan.route.reversed();
             if sell.input.address != Address::zero() {
                 match swap::check_approvals(
                     &me.http, sell.input.address, me.owner, me.permit2, me.router,
@@ -1591,6 +1639,7 @@ impl Executor {
             let probe = match execute::pending_swap(
                 me.router,
                 &sell,
+                size,
                 U256::one(),
                 execute::deadline_in(600),
             ) {
@@ -1614,6 +1663,7 @@ impl Executor {
                 me.router,
                 &plan.route,
                 U256::one(),
+                U256::one(),
                 execute::deadline_in(600),
             ) {
                 Ok(p) => p,
@@ -1636,8 +1686,8 @@ impl Executor {
             Ok(h) if !h.is_zero() => h,
             _ => return,
         };
-        let sell = route.reversed(held);
-        let local = match sell.quote(&self.http, self.manager, Some(at)).await {
+        let sell = route.reversed();
+        let local = match sell.quote(&self.http, self.manager, Some(at), held).await {
             Ok(q) if !q.amount_out.is_zero() => q,
             _ => return,
         };
@@ -1646,6 +1696,7 @@ impl Executor {
             self.router,
             self.owner,
             &sell,
+            held,
             local.amount_out,
             execute::deadline_in(600),
             Some(at),
@@ -1911,14 +1962,15 @@ impl Executor {
 /// the first sale can skip the two `eth_call`s that ask - see `Plan`'s
 /// `sell_approved`, which is what the answer is kept in.
 async fn preflight(approve: &mut Approver<'_>, route: &Route) -> Result<bool> {
+    // No fixed size to compare against any more: what a buy costs is worked out
+    // per signal and bounded by whatever is here. An empty wallet is still worth
+    // saying out loud, because it means no drop can be acted on at all.
     let balance = swap::balance_of(approve.http, route.input.address, approve.owner).await?;
-    if balance < route.amount_in {
+    if balance.is_zero() {
         warn!(
             route = %route.name,
-            have = %format_units(balance, route.input.decimals),
-            need = %format_units(route.amount_in, route.input.decimals),
             token = %route.input.symbol,
-            "not enough to buy with; the first drop will fail unless this is topped up"
+            "nothing to buy with; every drop will be skipped until this is topped up"
         );
     }
     approve

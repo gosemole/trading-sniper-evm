@@ -628,16 +628,15 @@ impl Strategy {
                 // The snapshot comes back with the size, so the money set
                 // aside and the minimum eventually signed are worked out from
                 // one reading of the pools rather than two.
-                let Some((spend, prepared)) = exec.size_for(tick.pool, &sig) else {
+                // The ceiling is what is actually there to spend.
+                let have = self.inventory.cash(spend_token);
+                let Some((spend, prepared)) = exec.size_for(tick.pool, &sig, have) else {
                     warn!(
                         pool = %pool.name, route = %route.name,
                         "not buying: this signal cannot be sized - see the reason above"
                     );
                     return;
                 };
-                let have = self.inventory.cash(spend_token);
-                // Not enough for the size this signal calls for is not a reason
-                // to buy a smaller one: the size is what the route asked for.
                 if have < spend {
                     warn!(
                         pool = %pool.name,
@@ -656,18 +655,14 @@ impl Strategy {
                     // saves anyway, and a crash before one arrives is healed by
                     // the balance re-read at startup.
                     self.inventory.debit_cash(spend_token, spend);
-                    if route.impact_pct.is_some() {
-                        info!(
-                            pool = %pool.name,
-                            route = %route.name,
-                            impact_pct = route.impact_pct.unwrap_or_default(),
-                            spend = %crate::route::format_units(spend, route.input.decimals),
-                            cap = %crate::route::format_units(
-                                route.amount_in, route.input.decimals
-                            ),
-                            "sized to impact"
-                        );
-                    }
+                    info!(
+                        pool = %pool.name,
+                        route = %route.name,
+                        impact_pct = route.impact_pct,
+                        spend = %crate::route::format_units(spend, route.input.decimals),
+                        of = %crate::route::format_units(have, route.input.decimals),
+                        "sized to impact"
+                    );
 
                     // What the route buys, decided now rather than looked up
                     // after the fact: a fill has to be recorded whatever the
