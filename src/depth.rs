@@ -25,6 +25,9 @@ const POOLS_SLOT: u64 = 6;
 
 /// How many bitmap words to scan for the next initialized tick. One word spans
 /// 256 tick spacings, so this covers a wide span while bounding the RPC cost.
+///
+/// A ceiling, not the figure used: see `TickReader::scan_words`, which cuts it
+/// to what the pool's spacing can actually hold.
 const MAX_BITMAP_WORDS: u32 = 32;
 const TICKS_OFFSET: u64 = 4;
 const BITMAP_OFFSET: u64 = 5;
@@ -132,6 +135,22 @@ impl<'a> TickReader<'a> {
     /// `eth_call` of its own however this is configured. Confusing the two is
     /// how a scan sized for one batched request turns into a thousand separate
     /// ones.
+    /// Bitmap words one scan reads, for this pool's spacing.
+    ///
+    /// The ceiling is a fixed 32, but a widely spaced pool has fewer words than
+    /// that in EXISTENCE: at spacing 200 one word covers 51200 ticks and the
+    /// whole tick range is eighteen of them, so a 32-word scan spent fourteen
+    /// reads on slots that cannot hold a tick.
+    ///
+    /// It also sharpens what a scan finding nothing means. Where this covers
+    /// the whole range, `next_initialized` returning `None` is "there is no
+    /// such tick" rather than "none within what I looked at" - which is exactly
+    /// the difference between concluding constant liquidity and guessing it.
+    fn scan_words(&self) -> u32 {
+        let whole_range = MAX_TICK / (self.spacing.max(1) as i64 * 256) + 1;
+        (whole_range as u32).clamp(1, MAX_BITMAP_WORDS)
+    }
+
     fn can_batch(&self) -> bool {
         self.batched && matches!(self.source, Source::V4 { .. })
     }
@@ -913,7 +932,7 @@ async fn rungs_towards(
     // The bound is generous: a 100% move at spacing 1 is ~6900 ticks, and
     // initialized ticks are far sparser.
     for _ in 0..1_000 {
-        let Some(t) = reader.next_initialized(tick, up, MAX_BITMAP_WORDS).await? else {
+        let Some(t) = reader.next_initialized(tick, up, reader.scan_words()).await? else {
             break;
         };
         let sqrt = sqrt_at_tick(t);
@@ -1361,7 +1380,7 @@ pub async fn swap_exact_in(
     for _ in 0..MAX_WALK_TICKS {
         match swap_exact_in_along(state, zero_for_one, amount_in, &rungs, Beyond::Unknown)? {
             Walk::Done(r) => return Ok(r),
-            Walk::NeedsRung => match reader.next_initialized(tick, up, MAX_BITMAP_WORDS).await? {
+            Walk::NeedsRung => match reader.next_initialized(tick, up, reader.scan_words()).await? {
                 Some(t) => {
                     rungs.push(Rung { sqrt: sqrt_at_tick(t), net: reader.liquidity_net(t).await? });
                     tick = if up { t } else { t - 1 };
@@ -1420,6 +1439,26 @@ mod tests {
             ladder_lo: sqrt_at_tick(lo),
             ladder_hi: sqrt_at_tick(hi),
         }
+    }
+
+    /// A widely spaced pool has fewer bitmap words in EXISTENCE than the fixed
+    /// ceiling, and reading past the end of the tick range is pure cost. It
+    /// also sharpens the answer: where the scan covers everything, finding no
+    /// tick means there is none, rather than none nearby.
+    #[test]
+    fn a_scan_never_reads_past_the_end_of_the_tick_range() {
+        let words = |spacing: i32| {
+            let whole = MAX_TICK / (spacing.max(1) as i64 * 256) + 1;
+            (whole as u32).clamp(1, MAX_BITMAP_WORDS)
+        };
+        // At the spacing these pools use, the whole range is well under the cap.
+        assert_eq!(words(200), 18, "spacing 200 has eighteen words in total");
+        assert!(words(200) < MAX_BITMAP_WORDS, "so the cap must not be used");
+        // Finely spaced pools still stop at the ceiling.
+        assert_eq!(words(1), MAX_BITMAP_WORDS);
+        assert_eq!(words(60), MAX_BITMAP_WORDS);
+        // And a scan is never zero words wide.
+        assert_eq!(words(1_000_000), 1);
     }
 
     /// A pool provided across its whole range has NO initialized ticks near

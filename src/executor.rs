@@ -598,11 +598,21 @@ impl Executor {
         tokio::spawn(async move {
             let every = Duration::from_secs(me.calibrate_secs);
             loop {
-                for plan in me.plans.values() {
-                    if let Err(e) = me.measure_yield(plan).await {
-                        warn!(route = %plan.route.name, err = %format!("{e:#}"),
-                              "could not measure route yield");
+                // One block for the whole pass, not one per route. Cheaper by a
+                // request, and better: two routes measured against different
+                // blocks are two measurements of different markets, which is
+                // the very confusion `measure_yield` pins a block to avoid.
+                match me.http.get_block_number().await {
+                    Ok(at) => {
+                        for plan in me.plans.values() {
+                            if let Err(e) = me.measure_yield(plan, at.as_u64()).await {
+                                warn!(route = %plan.route.name, err = %format!("{e:#}"),
+                                      "could not measure route yield");
+                            }
+                        }
                     }
+                    Err(e) => warn!(err = %format!("{e:#}"),
+                                    "could not read the block to calibrate against"),
                 }
                 tokio::time::sleep(every).await;
             }
@@ -737,18 +747,12 @@ impl Executor {
         }
     }
 
-    async fn measure_yield(&self, plan: &Plan) -> Result<()> {
+    /// `at` is the block the whole calibration pass is pinned to. Taken at the
+    /// head per reading they would land on different blocks whenever the pool
+    /// is busy, and the difference between them would then be the price moving
+    /// rather than a fee: that is exactly how a 1% cut first measured as 2.46%.
+    async fn measure_yield(&self, plan: &Plan, at: u64) -> Result<()> {
         let route = &plan.route;
-        // Both readings are pinned to one block. Taken at the head they would
-        // land on different ones whenever the pool is busy, and the difference
-        // between them would then be the price moving rather than a fee: that
-        // is exactly how a 1% cut first measured as 2.46%.
-        let at = self
-            .http
-            .get_block_number()
-            .await
-            .context("eth_blockNumber")?
-            .as_u64();
         let local = route
             .quote(&self.http, self.manager, Some(at))
             .await
