@@ -129,12 +129,14 @@ pub struct Route {
     pub input: Token,
     pub output: Token,
     /// Amount to spend, in raw units of the input token.
-    /// The most this route ever spends on one buy.
-    pub amount_in: U256,
-    /// When set, each buy is sized to move its trigger pool by this much rather
-    /// than to spend `amount_in` - which becomes the ceiling. See
-    /// `executor::Executor::size_for`.
-    pub impact_pct: Option<f64>,
+    /// Move the trigger pool's price by this much on every buy. The size that
+    /// does it is worked out per signal - see `executor::Executor::size_for`.
+    ///
+    /// A route carries no size of its own. It describes a PATH: which pools, in
+    /// which order, spending which token. How much to send through it is a
+    /// question about one trade and one moment, and it is answered where that
+    /// is known and passed to whoever needs it.
+    pub impact_pct: f64,
     pub max_slippage_pct: f64,
     pub hops: Vec<Hop>,
 }
@@ -262,15 +264,11 @@ impl Route {
 
         let input = describe(http, input_addr).await?;
         let output = describe(http, cursor).await?;
-        let amount_in = parse_units(&cfg.amount_in, input.decimals)
-            .with_context(|| format!("route '{}': bad amount_in", cfg.name))?;
-        anyhow::ensure!(!amount_in.is_zero(), "route '{}': amount_in is zero", cfg.name);
 
         Ok(Route {
             name: cfg.name.clone(),
             input,
             output,
-            amount_in,
             impact_pct: cfg.impact_pct,
             max_slippage_pct: cfg.max_slippage_pct,
             hops,
@@ -280,23 +278,12 @@ impl Route {
 }
 
 impl Route {
-    /// The same route at a different size.
-    ///
-    /// `amount_in` is what the calldata actually spends - `execute_calldata`
-    /// reads it for the SETTLE amount and for a v3 leg's input - so a buy sized
-    /// per signal has to travel as a route carrying that size. Sizing without
-    /// this would compute one number, reserve it, and then send a transaction
-    /// spending the route's ceiling instead.
-    pub fn at(&self, amount_in: U256) -> Route {
-        Route { amount_in, ..self.clone() }
-    }
-
     /// The same pools walked the other way, to sell what this route buys.
     ///
     /// Only the direction changes: the pool ids, fees, tick spacings and hooks
     /// are the ones already recovered and verified against their ids, so a
     /// reversed route needs no further on-chain resolution.
-    pub fn reversed(&self, amount_in: U256) -> Route {
+    pub fn reversed(&self) -> Route {
         let hops = self
             .hops
             .iter()
@@ -313,10 +300,10 @@ impl Route {
             name: format!("{} (reversed)", self.name),
             input: self.output.clone(),
             output: self.input.clone(),
-            amount_in,
-            // A sale sells the whole position, so there is no size to work out
-            // and nothing for a target impact to size.
-            impact_pct: None,
+            // A sale sells the whole position, so nothing about it is sized to
+            // an impact; the target is carried anyway so a reversal round trip
+            // is the original.
+            impact_pct: self.impact_pct,
             max_slippage_pct: self.max_slippage_pct,
             hops,
         }
@@ -402,8 +389,9 @@ impl Route {
         http: &Provider<Http>,
         manager: Address,
         at: Option<u64>,
+        amount_in: U256,
     ) -> Result<Quote> {
-        let mut amount = u256_to_f64(self.amount_in);
+        let mut amount = u256_to_f64(amount_in);
         let mut out_hops = Vec::with_capacity(self.hops.len());
 
         for (i, hop) in self.hops.iter().enumerate() {
@@ -528,8 +516,7 @@ mod tests {
             name: "buy C".into(),
             input: tok(1, 6, "A"),
             output: tok(3, 18, "C"),
-            amount_in: U256::from(100u64),
-            impact_pct: None,
+            impact_pct: 0.5,
             max_slippage_pct: 1.0,
             hops: vec![hop(1, 2, 1, 2, 6, 8), hop(2, 3, 2, 3, 8, 18)],
         }
@@ -538,11 +525,11 @@ mod tests {
     #[test]
     fn reversing_walks_the_same_pools_the_other_way() {
         let r = two_hop();
-        let back = r.reversed(U256::from(7u64));
+        let back = r.reversed();
 
         assert_eq!(back.input.symbol, "C", "sells what the route bought");
         assert_eq!(back.output.symbol, "A");
-        assert_eq!(back.amount_in, U256::from(7u64));
+
 
         // Same pools, opposite order, and every hop flipped end to end.
         let ids: Vec<_> = back.hops.iter().map(|h| h.pool_ref()).collect();
@@ -567,7 +554,7 @@ mod tests {
     #[test]
     fn reversing_twice_is_the_original() {
         let r = two_hop();
-        let there_and_back = r.reversed(U256::one()).reversed(r.amount_in);
+        let there_and_back = r.reversed().reversed();
         assert_eq!(there_and_back.input.address, r.input.address);
         assert_eq!(there_and_back.output.address, r.output.address);
         assert_eq!(

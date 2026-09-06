@@ -118,9 +118,9 @@ fn u128_arg(v: U256, what: &str) -> Result<U256> {
 }
 
 /// Native ETH is paid as `msg.value`; every other input is pulled via Permit2.
-pub fn call_value(route: &Route) -> U256 {
+pub fn call_value(route: &Route, amount_in: U256) -> U256 {
     if route.input.address == Address::zero() {
-        route.amount_in
+        amount_in
     } else {
         U256::zero()
     }
@@ -165,12 +165,18 @@ fn v3_path(leg: &[&Hop]) -> Result<Vec<u8>> {
 /// entry per pool in the path or the router rejects it with
 /// `V3HopPriceAndPathLengthMismatch`. Omitting the field altogether - as
 /// upstream UniversalRouter's ABI would - reverts with `SliceOutOfBounds`.
-fn v3_leg(route: &Route, leg: &[&Hop], first: bool, last: bool, min_out: U256) -> Result<Vec<u8>> {
+fn v3_leg(
+    amount_in: U256,
+    leg: &[&Hop],
+    first: bool,
+    last: bool,
+    min_out: U256,
+) -> Result<Vec<u8>> {
     Ok(encode(&[
         AbiToken::Address(if last { msg_sender() } else { address_this() }),
         // Not the first leg means the tokens are already sitting on the router,
         // and this sentinel tells it to spend all of them.
-        AbiToken::Uint(if first { route.amount_in } else { contract_balance() }),
+        AbiToken::Uint(if first { amount_in } else { contract_balance() }),
         AbiToken::Uint(min_out),
         AbiToken::Bytes(v3_path(leg)?),
         AbiToken::Bool(first),
@@ -218,7 +224,13 @@ fn exact_in_single(hop: &Hop, amount_in: U256, min_out: U256) -> Result<Vec<u8>>
 /// `SETTLE` puts the input currency onto the pool manager, every hop then
 /// swaps the whole open credit, and a final take moves the output out. Only
 /// where the money comes from and where it goes changes.
-fn v4_leg(route: &Route, leg: &[&Hop], first: bool, last: bool, min_out: U256) -> Result<Vec<u8>> {
+fn v4_leg(
+    amount_in: U256,
+    leg: &[&Hop],
+    first: bool,
+    last: bool,
+    min_out: U256,
+) -> Result<Vec<u8>> {
     let mut actions = vec![ACTION_SETTLE];
     actions.extend(std::iter::repeat_n(ACTION_SWAP_EXACT_IN_SINGLE, leg.len()));
     actions.push(if last { ACTION_TAKE_ALL } else { ACTION_TAKE });
@@ -228,7 +240,7 @@ fn v4_leg(route: &Route, leg: &[&Hop], first: bool, last: bool, min_out: U256) -
     // router casts that credit to uint128. Refusing it locally beats sending a
     // transaction that reverts on an UnsafeCast.
     let settle_amount = if first {
-        u128_arg(route.amount_in, "amount_in")?
+        u128_arg(amount_in, "amount_in")?
     } else {
         contract_balance()
     };
@@ -263,7 +275,12 @@ fn v4_leg(route: &Route, leg: &[&Hop], first: bool, last: bool, min_out: U256) -
 }
 
 /// Full calldata for `UniversalRouter.execute(bytes,bytes[],uint256)`.
-pub fn execute_calldata(route: &Route, min_out: U256, deadline: U256) -> Result<Bytes> {
+pub fn execute_calldata(
+    route: &Route,
+    amount_in: U256,
+    min_out: U256,
+    deadline: U256,
+) -> Result<Bytes> {
     anyhow::ensure!(!route.hops.is_empty(), "route has no hops");
     let legs = legs(route);
     let mut commands = Vec::with_capacity(legs.len());
@@ -276,10 +293,10 @@ pub fn execute_calldata(route: &Route, min_out: U256, deadline: U256) -> Result<
         let leg_min = if last { min_out } else { U256::zero() };
         if leg[0].venue.is_v4() {
             commands.push(CMD_V4_SWAP);
-            inputs.push(AbiToken::Bytes(v4_leg(route, leg, first, last, leg_min)?));
+            inputs.push(AbiToken::Bytes(v4_leg(amount_in, leg, first, last, leg_min)?));
         } else {
             commands.push(CMD_V3_SWAP_EXACT_IN);
-            inputs.push(AbiToken::Bytes(v3_leg(route, leg, first, last, leg_min)?));
+            inputs.push(AbiToken::Bytes(v3_leg(amount_in, leg, first, last, leg_min)?));
         }
     }
 
@@ -306,6 +323,7 @@ pub fn deadline_in(secs: u64) -> U256 {
 pub fn pending_swap(
     router: Address,
     route: &Route,
+    amount_in: U256,
     min_out: U256,
     deadline: U256,
 ) -> Result<crate::swap::PendingTx> {
@@ -316,8 +334,8 @@ pub fn pending_swap(
             legs(route).len()
         ),
         to: router,
-        data: execute_calldata(route, min_out, deadline)?,
-        value: call_value(route),
+        data: execute_calldata(route, amount_in, min_out, deadline)?,
+        value: call_value(route, amount_in),
     })
 }
 
@@ -363,11 +381,13 @@ fn is_revert(msg: &str) -> bool {
     m.contains("revert") || m.contains("code: 3,") || m.contains("code: 3 ")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn probe(
     http: &Provider<Http>,
     router: Address,
     from: Address,
     route: &Route,
+    amount_in: U256,
     min_out: U256,
     deadline: U256,
     at: Option<u64>,
@@ -375,8 +395,8 @@ async fn probe(
     let tx = TransactionRequest::new()
         .from(from)
         .to(router)
-        .value(call_value(route))
-        .data(execute_calldata(route, min_out, deadline)?);
+        .value(call_value(route, amount_in))
+        .data(execute_calldata(route, amount_in, min_out, deadline)?);
     match http.call(&tx.into(), at.map(ethers::types::BlockId::from)).await {
         Ok(_) => Ok(Probe::Ok),
         Err(e) => {
@@ -412,11 +432,13 @@ fn amount_from_too_little(msg: &str) -> Option<U256> {
 /// route is worth ending on a v4 pool where there is a choice.
 ///
 /// Read-only either way: `eth_call` moves nothing.
+#[allow(clippy::too_many_arguments)]
 pub async fn verify(
     http: &Provider<Http>,
     router: Address,
     from: Address,
     route: &Route,
+    amount_in: U256,
     hint: U256,
     deadline: U256,
     at: Option<u64>,
@@ -424,7 +446,7 @@ pub async fn verify(
     let mut probes = 1u32;
     // Above any real output, and still inside the uint128 the hops accept.
     let impossible = U256::from(u128::MAX);
-    if let Probe::Reverted(msg) = probe(http, router, from, route, impossible, deadline, at).await? {
+    if let Probe::Reverted(msg) = probe(http, router, from, route, amount_in, impossible, deadline, at).await? {
         if let Some(amount) = amount_from_too_little(&msg) {
             anyhow::ensure!(
                 !amount.is_zero(),
@@ -443,7 +465,7 @@ pub async fn verify(
     // the swap returned nothing at all, which would look like success.
     let mut lo = U256::one();
     probes += 1;
-    if let Probe::Reverted(msg) = probe(http, router, from, route, lo, deadline, at).await? {
+    if let Probe::Reverted(msg) = probe(http, router, from, route, amount_in, lo, deadline, at).await? {
         anyhow::bail!(
             "the swap reverts even with amountOutMinimum = 1, so nothing about it is \
              executable right now: {}",
@@ -456,7 +478,7 @@ pub async fn verify(
     let mut hi = if hint > lo { hint } else { U256::from(2) };
     loop {
         probes += 1;
-        match probe(http, router, from, route, hi, deadline, at).await? {
+        match probe(http, router, from, route, amount_in, hi, deadline, at).await? {
             Probe::Reverted(_) => break,
             Probe::Ok => {
                 lo = hi;
@@ -484,7 +506,7 @@ pub async fn verify(
             break;
         }
         probes += 1;
-        match probe(http, router, from, route, mid, deadline, at).await? {
+        match probe(http, router, from, route, amount_in, mid, deadline, at).await? {
             Probe::Ok => lo = mid,
             Probe::Reverted(_) => hi = mid,
         }
@@ -505,10 +527,11 @@ pub async fn dry_run(
     router: Address,
     from: Address,
     route: &Route,
+    amount_in: U256,
     min_out: U256,
     deadline: U256,
 ) -> Result<()> {
-    match probe(http, router, from, route, min_out, deadline, None).await? {
+    match probe(http, router, from, route, amount_in, min_out, deadline, None).await? {
         Probe::Ok => Ok(()),
         Probe::Reverted(msg) => Err(anyhow::anyhow!(
             "the transaction as built reverts: {}",
@@ -691,8 +714,7 @@ mod tests {
             name: "t".into(),
             input: RouteToken { address: first, decimals: 18, symbol: "IN".into() },
             output: RouteToken { address: last, decimals: 18, symbol: "OUT".into() },
-            amount_in: U256::from(1000u64),
-            impact_pct: None,
+            impact_pct: 0.5,
             max_slippage_pct: 1.0,
             hops,
         }
@@ -807,7 +829,7 @@ mod tests {
         assert_eq!(l[0].len(), 1, "the v3 run");
         assert_eq!(l[1].len(), 2, "both v4 hops share one command");
 
-        let (commands, inputs) = unwrap(&execute_calldata(&r, U256::from(9u64), U256::zero()).unwrap());
+        let (commands, inputs) = unwrap(&execute_calldata(&r, U256::from(1000u64), U256::from(9u64), U256::zero()).unwrap());
         assert_eq!(commands, vec![CMD_V3_SWAP_EXACT_IN, CMD_V4_SWAP]);
         assert_eq!(inputs.len(), 2);
     }
@@ -815,7 +837,7 @@ mod tests {
     #[test]
     fn a_v4_only_route_settles_from_the_caller_and_pays_the_caller() {
         let r = route_of(vec![v4_hop(1, 2, 3477), v4_hop(2, 3, 0)]);
-        let data = execute_calldata(&r, U256::from(950u64), U256::from(1234u64)).unwrap();
+        let data = execute_calldata(&r, U256::from(1000u64), U256::from(950u64), U256::from(1234u64)).unwrap();
         assert_eq!(hex::encode(&data[..4]), "3593564c");
         let (commands, inputs) = unwrap(&data);
         assert_eq!(commands, vec![CMD_V4_SWAP]);
@@ -862,7 +884,7 @@ mod tests {
     #[test]
     fn a_v3_only_route_packs_the_whole_path_into_one_command() {
         let r = route_of(vec![v3_hop(1, 2, 10000), v3_hop(2, 3, 3000)]);
-        let (commands, inputs) = unwrap(&execute_calldata(&r, U256::from(7u64), U256::zero()).unwrap());
+        let (commands, inputs) = unwrap(&execute_calldata(&r, U256::from(1000u64), U256::from(7u64), U256::zero()).unwrap());
         assert_eq!(commands, vec![CMD_V3_SWAP_EXACT_IN]);
 
         let d = ethers::abi::decode(&v3_input_type(), &inputs[0]).unwrap();
@@ -890,7 +912,7 @@ mod tests {
         // v3 -> v4: the v3 leg must leave its output on the router, and the v4
         // leg must pay itself from that balance rather than from the caller.
         let r = route_of(vec![v3_hop(1, 2, 10000), v4_hop(2, 3, 0)]);
-        let (commands, inputs) = unwrap(&execute_calldata(&r, U256::from(5u64), U256::zero()).unwrap());
+        let (commands, inputs) = unwrap(&execute_calldata(&r, U256::from(1000u64), U256::from(5u64), U256::zero()).unwrap());
         assert_eq!(commands, vec![CMD_V3_SWAP_EXACT_IN, CMD_V4_SWAP]);
 
         let v3 = ethers::abi::decode(&v3_input_type(), &inputs[0]).unwrap();
@@ -920,7 +942,7 @@ mod tests {
     #[test]
     fn a_v4_leg_that_is_not_last_parks_its_output_on_the_router() {
         let r = route_of(vec![v4_hop(1, 2, 3477), v3_hop(2, 3, 10000)]);
-        let (commands, inputs) = unwrap(&execute_calldata(&r, U256::from(5u64), U256::zero()).unwrap());
+        let (commands, inputs) = unwrap(&execute_calldata(&r, U256::from(1000u64), U256::from(5u64), U256::zero()).unwrap());
         assert_eq!(commands, vec![CMD_V4_SWAP, CMD_V3_SWAP_EXACT_IN]);
 
         let (actions, params) = v4_actions(&inputs[0]);
@@ -956,14 +978,14 @@ mod tests {
 
         // v4 -> v3: the v3 leg spends what the v4 leg parked on the router.
         let r = route_of(vec![v4_hop(1, 2, 3477), v3_hop(2, 3, 10000)]);
-        let (_, inputs) = unwrap(&execute_calldata(&r, U256::from(5u64), U256::zero()).unwrap());
+        let (_, inputs) = unwrap(&execute_calldata(&r, U256::from(1000u64), U256::from(5u64), U256::zero()).unwrap());
         let v3 = ethers::abi::decode(&v3_input_type(), &inputs[1]).unwrap();
         assert_eq!(v3[1], AbiToken::Uint(contract_balance()), "v3 amountIn");
 
         // v3 -> v4: the settle picks the balance up, and the hop after it
         // swaps the credit that settle created.
         let r = route_of(vec![v3_hop(1, 2, 10000), v4_hop(2, 3, 0)]);
-        let (_, inputs) = unwrap(&execute_calldata(&r, U256::from(5u64), U256::zero()).unwrap());
+        let (_, inputs) = unwrap(&execute_calldata(&r, U256::from(1000u64), U256::from(5u64), U256::zero()).unwrap());
         let (_, params) = v4_actions(&inputs[1]);
         let settle = ethers::abi::decode(
             &[ParamType::Address, ParamType::Uint(256), ParamType::Bool],
@@ -991,16 +1013,16 @@ mod tests {
     #[test]
     fn native_input_is_paid_as_value() {
         let mut r = route_of(vec![v4_hop(1, 2, 3477)]);
-        assert_eq!(call_value(&r), U256::zero());
+        assert_eq!(call_value(&r, U256::from(1000u64)), U256::zero());
         r.input.address = Address::zero();
-        assert_eq!(call_value(&r), r.amount_in);
+        assert_eq!(call_value(&r, U256::from(1000u64)), U256::from(1000u64));
     }
 
     #[test]
     fn amounts_wider_than_uint128_are_refused() {
-        let mut r = route_of(vec![v4_hop(1, 2, 3477)]);
-        r.amount_in = U256::from(u128::MAX) + 1;
-        assert!(execute_calldata(&r, U256::one(), U256::zero()).is_err());
+        let r = route_of(vec![v4_hop(1, 2, 3477)]);
+        let huge = U256::from(u128::MAX) + 1;
+        assert!(execute_calldata(&r, huge, U256::one(), U256::zero()).is_err());
     }
 
     #[test]

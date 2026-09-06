@@ -126,8 +126,6 @@ pub struct RouteConfig {
     pub name: String,
     /// Ticker or address of the token being spent.
     pub input: String,
-    /// Human units of the input token, e.g. "1.0".
-    pub amount_in: String,
     /// Tolerated shortfall against the quote, used for amountOutMinimum. It is
     /// applied to the quote this trade was actually priced from and to nothing
     /// measured earlier, so it caps the slippage of this pair alone - but WHICH
@@ -146,22 +144,19 @@ pub struct RouteConfig {
     /// unrelated numbers, and tightening this one silently left the modelling
     /// cap sized for the old one.
     pub max_slippage_pct: f64,
-    /// Size every buy so it moves the TRIGGER pool's price by this much,
-    /// instead of always spending `amount_in`.
+    /// Size every buy so it moves the TRIGGER pool's price by this much.
     ///
-    /// `amount_in` stays, as the ceiling: a deep pool can absorb far more than
-    /// the wallet holds before it moves a percent, and a route without a limit
-    /// would work out a size that does not exist. So this is "aim for this
-    /// impact, and never spend more than `amount_in` doing it".
-    ///
-    /// Unset means the old behaviour exactly: every signal spends `amount_in`.
+    /// There is no fixed amount and no ceiling written here: the ceiling is the
+    /// tracked balance. A size is worked out per signal, and if the whole
+    /// balance still cannot move the pool this far the buy is skipped rather
+    /// than shrunk - a size that does not do what was asked is not a smaller
+    /// version of the trade, it is a different one.
     ///
     /// Measured on the pool the drop happened in, not on the worst hop of the
-    /// route - that is the pool the number is a statement about. The size is
-    /// worked out from the signal's own log plus the tick ladder already in
-    /// memory, so it costs no requests and nothing waits for it.
-    #[serde(default)]
-    pub impact_pct: Option<f64>,
+    /// route: that is the pool the number is a statement about. Worked out from
+    /// the signal's own log and the tick ladder already in memory, so it costs
+    /// no requests and nothing waits for it.
+    pub impact_pct: f64,
     /// v4 pool ids, in swap order.
     pub pools: Vec<String>,
     /// Buy this route by itself whenever its trigger pool signals a big sell.
@@ -359,17 +354,15 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
                 r.name
             );
         }
-        if let Some(i) = r.impact_pct {
-            // An impact at or past the slippage tolerance is a size the trade
-            // could not survive anyway: the move it makes would eat the whole
-            // budget meant for the market moving under it.
-            anyhow::ensure!(
-                i.is_finite() && i > 0.0 && i < r.max_slippage_pct,
-                "route '{}': impact_pct must be > 0 and below max_slippage_pct ({})",
-                r.name,
-                r.max_slippage_pct
-            );
-        }
+        // An impact at or past the slippage tolerance is a size the trade could
+        // not survive anyway: the move it makes would eat the whole budget meant
+        // for the market moving under it.
+        anyhow::ensure!(
+            r.impact_pct.is_finite() && r.impact_pct > 0.0 && r.impact_pct < r.max_slippage_pct,
+            "route '{}': impact_pct must be > 0 and below max_slippage_pct ({})",
+            r.name,
+            r.max_slippage_pct
+        );
         if let Some(tp) = r.take_profit_pct {
             anyhow::ensure!(
                 tp.is_finite() && tp > 0.0,

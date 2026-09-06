@@ -70,7 +70,8 @@ it as an estimate.
 cargo run -- --quote "buy CAMELTOE" --amount 5
 ```
 
-Same, at a size other than the route's own `amount_in`. Works with `--swap` too.
+`--amount` is required: a route carries no size of its own, because the bot
+sizes each buy from the drop that triggered it. Works with `--swap` too.
 
 ```bash
 cargo run -- --swap "buy CAMELTOE"
@@ -143,8 +144,8 @@ Per route:
 
 | key | |
 |---|---|
-| `input`, `amount_in` | what to spend, and the most one buy ever spends |
-| `impact_pct` | optional. Size each buy to move the **trigger pool's** price by this much instead of always spending `amount_in`, which becomes the ceiling. Worked out per signal from its own log and the tick ladder already in memory, so it costs no requests and nothing waits for it. Must be below `max_slippage_pct`. If the tracked balance does not cover the size, the buy is skipped rather than shrunk |
+| `input` | what to spend |
+| `impact_pct` | size each buy to move the **trigger pool's** price by this much. A route carries no size of its own, and there is no ceiling here: the ceiling is the tracked balance, and if the whole of it still cannot move the pool that far the buy is skipped rather than shrunk. Worked out per signal from its own log and the tick ladder already in memory, so it costs no requests and nothing waits for it. Must be below `max_slippage_pct` |
 | `pools` | ordered list; a 32-byte v4 pool id or a 20-byte v3 pool address, mixed freely |
 | `max_slippage_pct` | percent, not basis points. Sets `amountOutMinimum`, and with it how far the model may be trusted: an auto-buy is priced from memory rather than by the router, so this budget covers the model being wrong as well as the market moving, and a trade is only modelled at all while it moves its pool by less than a third of it |
 | `auto_buy` | arm the route |

@@ -587,8 +587,8 @@ async fn check_all_routes(
             Ok(r) => {
                 println!("\nroute \"{}\"  OK", r.name);
                 println!(
-                    "  spend {} {}  ->  receive {} (slippage cap {}%)",
-                    route::format_units(r.amount_in, r.input.decimals),
+                    "  aim to move the trigger pool {}%  spending {}  ->  receive {} (slippage cap {}%)",
+                    r.impact_pct,
                     r.input.symbol,
                     r.output.symbol,
                     r.max_slippage_pct
@@ -639,14 +639,14 @@ async fn quote_route_cmd(
         .find(|r| r.name == name)
         .with_context(|| format!("no route named '{name}' in config"))?;
     let manager = pool_manager(cfg)?;
-    let mut r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
-    override_amount(&mut r, amount)?;
-    let q = r.quote(http, manager, None).await?;
+    let r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
+    let amount_in = manual_amount(&r, amount)?;
+    let q = r.quote(http, manager, None, amount_in).await?;
 
     println!("\nroute \"{}\"", r.name);
     println!(
         "  spend  {} {}",
-        route::format_units(r.amount_in, r.input.decimals),
+        route::format_units(amount_in, r.input.decimals),
         r.input.symbol
     );
     for (i, h) in q.hops.iter().enumerate() {
@@ -731,14 +731,23 @@ async fn approve_cmd(
 /// not model hooks, and a hook that charges a fee (or a pool that has moved
 /// since the quote) shows up here as a smaller output rather than as a failed
 /// transaction later.
-/// Replace a route's configured size, when the caller named one.
-fn override_amount(r: &mut route::Route, amount: Option<&str>) -> anyhow::Result<()> {
-    let Some(raw) = amount else { return Ok(()) };
+/// The size a manual command trades at.
+///
+/// Required, because a route no longer carries one: it describes a path, and
+/// the bot sizes each buy from the drop that triggered it. A command run by
+/// hand has no drop to size from, so the size comes from the hand that ran it.
+fn manual_amount(r: &route::Route, amount: Option<&str>) -> anyhow::Result<ethers::types::U256> {
+    let raw = amount.with_context(|| {
+        format!(
+            "give a size with --amount: route '{}' is sized per signal when the bot runs, \
+             so it has none of its own",
+            r.name
+        )
+    })?;
     let parsed = route::parse_units(raw, r.input.decimals)
         .with_context(|| format!("--amount {raw}"))?;
     anyhow::ensure!(!parsed.is_zero(), "--amount {raw} is zero");
-    r.amount_in = parsed;
-    Ok(())
+    Ok(parsed)
 }
 
 async fn swap_cmd(
@@ -759,8 +768,8 @@ async fn swap_cmd(
     let router = swap::resolve_addr(&cfg.universal_router, None, "universal_router")?;
     let permit2 = swap::resolve_addr(&cfg.permit2, Some(swap::PERMIT2_DEFAULT), "permit2")?;
 
-    let mut r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
-    override_amount(&mut r, amount)?;
+    let r = route::Route::resolve(http, manager, rc, &cfg.tokens).await?;
+    let amount_in = manual_amount(&r, amount)?;
     let chain_id = http.get_chainid().await?.as_u64();
     let wallet = swap::load_wallet(cfg, chain_id)?;
     let owner = ethers::signers::Signer::address(&wallet);
@@ -768,7 +777,7 @@ async fn swap_cmd(
     println!("\nroute \"{}\"  {} hop(s)", r.name, r.hops.len());
     println!(
         "  spend {} {}  from {owner:?}",
-        route::format_units(r.amount_in, r.input.decimals),
+        route::format_units(amount_in, r.input.decimals),
         r.input.symbol
     );
 
@@ -776,17 +785,17 @@ async fn swap_cmd(
     // rather than as an opaque revert inside the router.
     let balance = swap::balance_of(http, r.input.address, owner).await?;
     anyhow::ensure!(
-        balance >= r.amount_in,
+        balance >= amount_in,
         "balance is {} {} but the route spends {}",
         route::format_units(balance, r.input.decimals),
         r.input.symbol,
-        route::format_units(r.amount_in, r.input.decimals)
+        route::format_units(amount_in, r.input.decimals)
     );
     if r.input.address != ethers::types::Address::zero() {
         let (erc20_now, permit2_now) =
             swap::check_approvals(http, r.input.address, owner, permit2, router).await?;
         anyhow::ensure!(
-            erc20_now >= r.amount_in && permit2_now >= r.amount_in,
+            erc20_now >= amount_in && permit2_now >= amount_in,
             "{} is not approved for the router (erc20->permit2 {erc20_now}, permit2->router \
              {permit2_now}); run --approve {} --execute first",
             r.input.symbol,
@@ -796,7 +805,7 @@ async fn swap_cmd(
 
     // The local walk only seeds the bracket; a wrong hint costs a few extra
     // eth_calls and nothing else.
-    let hint = match r.quote(http, manager, None).await {
+    let hint = match r.quote(http, manager, None, amount_in).await {
         Ok(q) => {
             println!(
                 "  local  {} {}   (tick walk, hooks not modelled)",
@@ -812,7 +821,7 @@ async fn swap_cmd(
     };
 
     let deadline = execute::deadline_in(600);
-    let onchain = execute::verify(http, router, owner, &r, hint, deadline, None).await?;
+    let onchain = execute::verify(http, router, owner, &r, amount_in, hint, deadline, None).await?;
     println!(
         "  actual {} {}   ({}, {} eth_call{})",
         route::format_units(onchain.amount_out, r.output.decimals),
@@ -841,9 +850,9 @@ async fn swap_cmd(
 
     // The last check is the transaction itself: if this call goes through, the
     // only thing left that can move against it is the chain.
-    execute::dry_run(http, router, owner, &r, min_out, deadline).await?;
+    execute::dry_run(http, router, owner, &r, amount_in, min_out, deadline).await?;
 
-    let tx = execute::pending_swap(router, &r, min_out, deadline)?;
+    let tx = execute::pending_swap(router, &r, amount_in, min_out, deadline)?;
     println!("\ntransaction:");
     tx.print(0);
     println!("  deadline {deadline} (unix seconds)");
@@ -911,7 +920,7 @@ async fn sell_all_cmd(
         !balance.is_zero(),
         "{token_ref} balance is zero; there is nothing to sell"
     );
-    let sell = buy.reversed(balance);
+    let sell = buy.reversed();
 
     println!("\nsell all {} {}", route::format_units(balance, sell.input.decimals), sell.input.symbol);
     println!("  from   {owner:?}");
@@ -943,7 +952,7 @@ async fn sell_all_cmd(
 
     // Quoting is only to show what the sale is worth. It does not protect it,
     // and a failure here must not stop the sale being built.
-    match execute::verify(http, router, owner, &sell, U256::zero(), deadline, None).await {
+    match execute::verify(http, router, owner, &sell, balance, U256::zero(), deadline, None).await {
         Ok(q) => println!(
             "  worth  {} {}   (quoted on chain, not enforced)",
             route::format_units(q.amount_out, sell.output.decimals),
@@ -957,8 +966,8 @@ async fn sell_all_cmd(
         sell.output.symbol
     );
 
-    execute::dry_run(http, router, owner, &sell, min_out, deadline).await?;
-    let tx = execute::pending_swap(router, &sell, min_out, deadline)?;
+    execute::dry_run(http, router, owner, &sell, balance, min_out, deadline).await?;
+    let tx = execute::pending_swap(router, &sell, balance, min_out, deadline)?;
     println!("\ntransaction:");
     tx.print(0);
     println!("  deadline {deadline} (unix seconds)");
