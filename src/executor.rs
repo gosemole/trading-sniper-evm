@@ -265,7 +265,7 @@ impl TickBook {
     }
 
     /// The ladder a swap through this pool would walk, in its direction.
-    async fn ladder(&self, key: PoolRef, sqrt_p: f64, up: bool) -> Option<Vec<crate::depth::Rung>> {
+    async fn ladder(&self, key: PoolRef, sqrt_p: f64, up: bool) -> Option<crate::depth::Ladder> {
         let book = self.inner.lock().await;
         let entry = book.get(&key)?;
         if entry.at.elapsed() > TICK_WINDOW_STALE_AFTER {
@@ -1637,8 +1637,13 @@ impl Executor {
                 state,
                 hop.zero_for_one(),
                 amount,
-                &rungs,
-                crate::depth::Beyond::Unknown,
+                &rungs.rungs,
+                // Not `Unknown`: the scan read out to its own edge and found
+                // what it found, so between the last rung and that edge there
+                // is nothing to cross. A pool provided across its whole range
+                // has no rungs at all, and treating that as ignorance refused
+                // every trade through the easiest pool there is.
+                crate::depth::Beyond::HoldsUntil(rungs.bound),
             );
             let out = match walked {
                 Ok(crate::depth::Walk::Done(r)) if r.amount_out > 0.0 => {
@@ -1666,7 +1671,7 @@ impl Executor {
                         route = %route.name,
                         pool = %hop.pool_ref(),
                         amount_in = amount,
-                        rungs = rungs.len(),
+                        rungs = rungs.rungs.len(),
                         "not priced: this size walks past the last tick the scan read, so \
                          where it ends is not known"
                     );

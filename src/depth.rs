@@ -575,7 +575,7 @@ impl TickWindow {
     /// The direction convention is `TickReader::next_initialized`'s, because
     /// the two must select the same ticks: going up the starting price is
     /// exclusive, going down it is inclusive.
-    pub fn ladder_from(&self, sqrt_p: f64, up: bool) -> Option<Vec<Rung>> {
+    pub fn ladder_from(&self, sqrt_p: f64, up: bool) -> Option<Ladder> {
         if !sqrt_p.is_finite() || sqrt_p < self.ladder_lo || sqrt_p > self.ladder_hi {
             return None;
         }
@@ -585,10 +585,14 @@ impl TickWindow {
         });
         // Collected through `Option` so a hole in the ladder comes back as "ask
         // the chain" rather than as a walk with a tick silently missing.
-        match up {
-            true => selected.map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect(),
-            false => selected.rev().map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect(),
-        }
+        let rungs: Vec<Rung> = match up {
+            true => selected.map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect::<Option<_>>()?,
+            false => selected.rev().map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect::<Option<_>>()?,
+        };
+        Some(Ladder {
+            rungs,
+            bound: if up { self.ladder_hi } else { self.ladder_lo },
+        })
     }
 
     /// The sqrt prices the scan covered, for logs and tests.
@@ -633,12 +637,25 @@ impl TickWindow {
     }
 }
 
-/// Initialized ticks on each side of the price whose `liquidityNet` is read.
+/// Initialized ticks whose `liquidityNet` one scan reads.
 ///
-/// A walk of the sizes this bot trades crosses a handful; this is generous past
-/// that and still one batched request. Beyond it the scan knows where the ticks
-/// are but not what they do, and a walk that reaches there asks the chain.
-const LADDER_TICKS: usize = 32;
+/// The whole window, up to what a single `extsload` carries. There is no reason
+/// to read less: the bitmap comes back FIRST, so the exact number of ticks in
+/// the window is known before this is decided, and an ordinary pool has fewer
+/// than this in total - so the ladder covers everything the bitmap does and a
+/// swap can be walked wherever the price goes.
+///
+/// An earlier version took 32 a side by analogy with `prefetch_scan`'s
+/// read-ahead, which caps a LAZY walk and is a different problem. It made how
+/// far a trade could be priced depend on how finely the pool happened to be
+/// provided - a dense pool's 64 ticks can sit inside a fraction of a percent,
+/// so a dip would move the price out of the ladder while staying well inside
+/// the window, and the model would refuse at exactly the moment it exists for.
+///
+/// Only a pool with more ticks than this in the window is capped, and then the
+/// ones nearest the price are kept - which is the case where a short ladder is
+/// unavoidable rather than chosen.
+const LADDER_SLOTS: usize = SLOTS_PER_CALL;
 
 /// The furthest tick either protocol allows. A pool cannot have an initialized
 /// tick beyond it, so a scan reaching this far on both sides has read the pool
@@ -769,12 +786,17 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
     // `eth_call` per tick, which is the flood this whole scan is written to
     // avoid - so a v3 pool keeps the bitmap and loses the ladder, and a walk
     // through it goes to the chain as it always did.
+    // Centred on the price, and spending the whole budget: a side with fewer
+    // ticks than its share leaves room the other side takes, rather than the
+    // scan reading less than it could.
     let pivot = found.partition_point(|(_, s)| *s < sqrt_p);
     let (first, last) = match batched {
-        true => (
-            pivot.saturating_sub(LADDER_TICKS),
-            (pivot + LADDER_TICKS).min(found.len()),
-        ),
+        true => {
+            let want = LADDER_SLOTS.min(found.len());
+            let first = pivot.saturating_sub(want / 2);
+            let last = (first + want).min(found.len());
+            (last.saturating_sub(want), last)
+        }
         false => (0, 0),
     };
     if first < last {
@@ -903,6 +925,19 @@ async fn rungs_towards(
         tick = if up { t } else { t - 1 };
     }
     Ok(out)
+}
+
+/// The rungs a walk may use, and how far they are known to be complete.
+///
+/// The bound matters as much as the rungs. A pool provided across its whole
+/// range has NO initialized ticks near the price, so the rungs are empty - and
+/// empty is not "I know nothing", it is "there is nothing to cross between here
+/// and the edge of what I read". Only the bound can carry that difference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ladder {
+    pub rungs: Vec<Rung>,
+    /// Sqrt price the rungs are complete up to, in the direction of travel.
+    pub bound: f64,
 }
 
 /// One initialized tick as a walk meets it.
@@ -1131,15 +1166,27 @@ pub struct SwapResult {
 }
 
 /// What lies past the last rung a walk was handed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Beyond {
     /// Nothing further changes liquidity, so the rest of the input trades at
     /// constant `L`. This is what a chain scan concludes when its search finds
     /// no more initialized ticks - a full-range position looks exactly like it,
     /// its only ticks sitting far outside the scanned window.
     ConstantLiquidity,
+    /// Liquidity holds up to this sqrt price, and past it nothing is known.
+    ///
+    /// What a window scan can honestly say: it read every tick out to its own
+    /// edge and found no more, so between the last rung and that edge there is
+    /// nothing to cross - but beyond the edge it did not look. Without this,
+    /// "no more rungs" from a cached ladder was indistinguishable from "I
+    /// stopped reading", and a pool whose liquidity is FULL RANGE - no
+    /// initialized ticks anywhere near the price, the easiest case there is -
+    /// could not be priced at all.
+    HoldsUntil(f64),
     /// The ladder simply stops here. A swap that reaches it has NOT been
     /// modelled, and saying otherwise would report a price nothing computed.
+    /// Used by the chain-reading driver, whose answer to running out is to go
+    /// and fetch one more.
     Unknown,
 }
 
@@ -1202,26 +1249,44 @@ pub fn swap_exact_in_along(
         }
         let next = match ladder.next() {
             Some(r) => r,
-            None => match beyond {
-                Beyond::Unknown => return Ok(Walk::NeedsRung),
-                Beyond::ConstantLiquidity => {
-                    if liquidity > 0.0 {
-                        let sqrt_new = if up {
-                            sqrt_cur + remaining / liquidity
-                        } else {
-                            1.0 / (1.0 / sqrt_cur + remaining / liquidity)
-                        };
-                        out += if up {
-                            liquidity * (1.0 / sqrt_cur - 1.0 / sqrt_new)
-                        } else {
-                            liquidity * (sqrt_cur - sqrt_new)
-                        };
-                        sqrt_cur = sqrt_new;
-                        remaining = 0.0;
-                    }
+            None => {
+                if let Beyond::Unknown = beyond {
+                    return Ok(Walk::NeedsRung);
+                }
+                if liquidity <= 0.0 {
                     break;
                 }
-            },
+                // Whatever is left trades at constant L - but only as far as
+                // that is actually known to hold.
+                if let Beyond::HoldsUntil(bound) = beyond {
+                    let room = if up {
+                        liquidity * (bound - sqrt_cur)
+                    } else {
+                        liquidity * (1.0 / bound - 1.0 / sqrt_cur)
+                    };
+                    // Past the edge of what was read, so where this ends is not
+                    // known. Refusing is the whole point of carrying the bound.
+                    // Written so a NaN `room` refuses too, which a negated
+                    // comparison would have let through.
+                    let reaches = room > 0.0 && remaining <= room;
+                    if !reaches {
+                        return Ok(Walk::NeedsRung);
+                    }
+                }
+                let sqrt_new = if up {
+                    sqrt_cur + remaining / liquidity
+                } else {
+                    1.0 / (1.0 / sqrt_cur + remaining / liquidity)
+                };
+                out += if up {
+                    liquidity * (1.0 / sqrt_cur - 1.0 / sqrt_new)
+                } else {
+                    liquidity * (sqrt_cur - sqrt_new)
+                };
+                sqrt_cur = sqrt_new;
+                remaining = 0.0;
+                break;
+            }
         };
         let sqrt_edge = next.sqrt;
         let net = next.net as f64;
@@ -1357,6 +1422,91 @@ mod tests {
         }
     }
 
+    /// A pool provided across its whole range has NO initialized ticks near
+    /// its price. That is the easiest pool there is to price - liquidity is
+    /// constant, so the arithmetic is exact at any size - and it was the one
+    /// the model refused every trade through, because an empty ladder read as
+    /// "I know nothing" instead of "there is nothing here".
+    ///
+    /// Two of the three pools this runs against are shaped exactly like that.
+    #[test]
+    fn a_full_range_pool_is_priced_not_refused() {
+        let state = PoolState {
+            sqrt_p: 2.0,
+            liquidity: 1_000_000_000,
+            lp_fee: 0,
+            protocol_fee_0for1: 0,
+            protocol_fee_1for0: 0,
+        };
+        // No rungs, and the scan looked a long way in both directions.
+        let far = 2.0 * 1.5;
+        match swap_exact_in_along(state, false, 1_000.0, &[], Beyond::HoldsUntil(far)).unwrap() {
+            Walk::Done(r) => {
+                assert!(r.amount_out > 0.0, "a constant-liquidity pool has a price");
+                assert_eq!(r.ticks_crossed, 0);
+                assert!(r.sqrt_p_after > state.sqrt_p && r.sqrt_p_after < far);
+            }
+            Walk::NeedsRung => panic!("refused a pool whose liquidity is known to be constant"),
+        }
+
+        // ...but only as far as the scan actually looked. A size that would
+        // push the price past the edge is not known, and must not be guessed.
+        // At this liquidity the edge is 100 units of input away.
+        let near = 2.000_000_1;
+        assert_eq!(
+            swap_exact_in_along(state, false, 1_000.0, &[], Beyond::HoldsUntil(near)).unwrap(),
+            Walk::NeedsRung,
+            "past the edge of what was read is not an answer"
+        );
+        // Stopping short of the edge is still an answer: the walk ends without
+        // ever needing to know what is on the other side.
+        match swap_exact_in_along(state, false, 99.0, &[], Beyond::HoldsUntil(near)).unwrap() {
+            Walk::Done(r) => assert!(r.sqrt_p_after <= near),
+            Walk::NeedsRung => panic!("a swap that stops at the edge never crosses it"),
+        }
+    }
+
+    /// `HoldsUntil` and `ConstantLiquidity` have to agree wherever the swap
+    /// stays inside the bound - the bound limits how far the walk may go, it
+    /// does not change the arithmetic along the way.
+    #[test]
+    fn a_bound_that_is_not_reached_changes_nothing() {
+        let state = PoolState {
+            sqrt_p: 2.0,
+            liquidity: 1_000_000_000,
+            lp_fee: 3000,
+            protocol_fee_0for1: 0,
+            protocol_fee_1for0: 0,
+        };
+        let rungs = [Rung { sqrt: 2.000_1, net: -100_000_000 }];
+        let bounded =
+            swap_exact_in_along(state, false, 50_000.0, &rungs, Beyond::HoldsUntil(4.0)).unwrap();
+        let open =
+            swap_exact_in_along(state, false, 50_000.0, &rungs, Beyond::ConstantLiquidity).unwrap();
+        assert_eq!(bounded, open);
+    }
+
+    /// The ordinary pool has fewer ticks in its window than one batch carries,
+    /// and then the ladder reaches exactly as far as the bitmap does - so no
+    /// price move that stays inside the window can put a swap beyond what can
+    /// be walked. That equality is the whole reason the cap is a batch size
+    /// rather than a tick count.
+    #[test]
+    fn an_ordinary_pool_can_be_walked_wherever_the_bitmap_reaches() {
+        // What the scan builds when every tick in the window was read: the
+        // ladder is bounded by the window, not by a count.
+        let w = laddered(&[(-600, 5), (0, 7), (600, -3)], -6000, 6000);
+        let (lo, hi) = w.span();
+        let (llo, lhi) = w.ladder_span();
+        assert_eq!((lo, hi), (llo, lhi), "the ladder must reach the window's own edges");
+
+        // And a walk anywhere inside it has rungs.
+        for tick in [-5000, -600, 0, 600, 5000] {
+            assert!(w.ladder_from(sqrt_at_tick(tick), true).is_some(), "at tick {tick}");
+            assert!(w.ladder_from(sqrt_at_tick(tick), false).is_some(), "at tick {tick}");
+        }
+    }
+
     /// The distinction the whole design rests on: a stretch the scan covered
     /// and found empty is a FACT, one it never read is not. An empty ladder
     /// means "nothing to cross round here" and is walkable; `None` means
@@ -1366,18 +1516,22 @@ mod tests {
     fn unread_is_not_the_same_answer_as_empty() {
         let at = sqrt_at_tick;
 
-        // Read, and genuinely empty around the price.
+        // Read, and genuinely empty around the price - a pool provided across
+        // its whole range looks exactly like this, and it is the easiest pool
+        // there is to price, not the hardest.
         let empty = laddered(&[], -6000, 6000);
-        assert_eq!(empty.ladder_from(at(0), true), Some(vec![]));
-        assert_eq!(empty.ladder_from(at(0), false), Some(vec![]));
+        let up = empty.ladder_from(at(0), true).expect("read and empty is an answer");
+        assert!(up.rungs.is_empty());
+        assert_eq!(up.bound, at(6000), "empty still knows how far it looked");
+        assert!(empty.ladder_from(at(0), false).is_some());
 
         // Positions known, effects not - an unbatched pool.
         let bare = window(&[-600, 600], -6000, 6000);
-        assert_eq!(bare.ladder_from(at(0), true), None, "positions alone cannot be walked");
+        assert!(bare.ladder_from(at(0), true).is_none(), "positions alone cannot be walked");
 
         // Laddered, but asked about a price outside what was read.
         let near = laddered(&[(0, 7)], -600, 600);
-        assert_eq!(near.ladder_from(at(6000), true), None);
+        assert!(near.ladder_from(at(6000), true).is_none());
         assert!(near.ladder_from(at(100), true).is_some());
     }
 

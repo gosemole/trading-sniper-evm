@@ -378,8 +378,19 @@ async fn depth_report_cmd(
             pct(lo),
             pct(hi)
         );
-        if window.ladder() == 0 {
+        // An empty ladder is only "nothing" when nothing was read. A pool
+        // provided across its whole range has no initialized ticks near its
+        // price at all, and the scan reading none of them is the answer, not
+        // the absence of one - that pool can be priced anywhere.
+        if llo > lhi {
             println!("  walkable   nothing - no quote can be modelled from this pool");
+        } else if window.edges() == 0 {
+            println!(
+                "  walkable   {:+.1}% .. {:+.1}%   (no ticks at all: liquidity is constant \
+                 across the whole scan)",
+                pct(llo),
+                pct(lhi)
+            );
         } else {
             println!(
                 "  walkable   {:+.1}% .. {:+.1}%   (how far a swap may be PRICED from memory)",
@@ -510,9 +521,14 @@ async fn depth_check_cmd(
         let zero_for_one = pool.base_token != 0;
         let window = depth::tick_window(&reader, state.sqrt_p).await?;
         match window.ladder_from(state.sqrt_p, !zero_for_one) {
-            Some(rungs) => {
-                let cached =
-                    depth::swap_exact_in_along(state, zero_for_one, amount, &rungs, depth::Beyond::Unknown)?;
+            Some(ladder) => {
+                let cached = depth::swap_exact_in_along(
+                    state,
+                    zero_for_one,
+                    amount,
+                    &ladder.rungs,
+                    depth::Beyond::HoldsUntil(ladder.bound),
+                )?;
                 let chain = depth::swap_exact_in(&reader, state, zero_for_one, amount).await?;
                 walk_checked += 1;
                 match cached {
@@ -533,7 +549,7 @@ async fn depth_check_cmd(
                     // this size walked past it. The model refuses exactly here.
                     depth::Walk::NeedsRung => println!(
                         "{:24} n/a    this size walks past the cached ladder ({} rung(s))",
-                        "", rungs.len()
+                        "", ladder.rungs.len()
                     ),
                 }
             }
