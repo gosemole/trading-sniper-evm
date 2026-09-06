@@ -598,12 +598,19 @@ impl TickWindow {
         if !sqrt_p.is_finite() || sqrt_p < self.ladder_lo || sqrt_p > self.ladder_hi {
             return None;
         }
+        // Bounded by the ladder, not by the window. The bitmap reaches further
+        // than the liquidity reads do, so an unbounded selection would pick up
+        // ticks whose effect was never looked up - and then refuse the whole
+        // ladder over them, on exactly the densely provided pools where the cap
+        // bites. What lies past the bound is carried as `bound` instead, where
+        // the walk can stop at it rather than choke on it.
         let selected = self.edges.iter().filter(|e| match up {
-            true => e.sqrt > sqrt_p,
-            false => e.sqrt <= sqrt_p,
+            true => e.sqrt > sqrt_p && e.sqrt <= self.ladder_hi,
+            false => e.sqrt <= sqrt_p && e.sqrt >= self.ladder_lo,
         });
-        // Collected through `Option` so a hole in the ladder comes back as "ask
-        // the chain" rather than as a walk with a tick silently missing.
+        // Still collected through `Option`: within the bound every net was
+        // read, so a hole means something is wrong and the answer is "ask the
+        // chain" rather than a walk with a tick silently missing.
         let rungs: Vec<Rung> = match up {
             true => selected.map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect::<Option<_>>()?,
             false => selected.rev().map(|e| e.net.map(|net| Rung { sqrt: e.sqrt, net })).collect::<Option<_>>()?,
@@ -1459,6 +1466,37 @@ mod tests {
         assert_eq!(words(60), MAX_BITMAP_WORDS);
         // And a scan is never zero words wide.
         assert_eq!(words(1_000_000), 1);
+    }
+
+    /// The bitmap reaches further than the liquidity reads do, so a densely
+    /// provided pool has ticks whose effect was never looked up. Selecting them
+    /// anyway made `ladder_from` refuse over them - silently disabling the
+    /// model on exactly the pools where the cap on reads bites.
+    #[test]
+    fn ticks_past_the_ladder_do_not_poison_the_ones_inside_it() {
+        let at = sqrt_at_tick;
+        // Read out to +/-600, known to be there out to +/-6000.
+        let w = TickWindow {
+            edges: vec![
+                Edge { sqrt: at(-6000), net: None },
+                Edge { sqrt: at(-600), net: Some(5) },
+                Edge { sqrt: at(600), net: Some(-3) },
+                Edge { sqrt: at(6000), net: None },
+            ],
+            lo: at(-60000),
+            hi: at(60000),
+            whole: false,
+            ladder_lo: at(-600),
+            ladder_hi: at(600),
+        };
+
+        let up = w.ladder_from(at(0), true).expect("the near ticks were read");
+        assert_eq!(up.rungs, vec![Rung { sqrt: at(600), net: -3 }]);
+        assert_eq!(up.bound, at(600), "and the walk must stop where they end");
+
+        let down = w.ladder_from(at(0), false).expect("the near ticks were read");
+        assert_eq!(down.rungs, vec![Rung { sqrt: at(-600), net: 5 }]);
+        assert_eq!(down.bound, at(-600));
     }
 
     /// A pool provided across its whole range has NO initialized ticks near

@@ -49,15 +49,20 @@ pub struct Tick {
 /// each with its own backoff, all hammering the thing that was already
 /// refusing. Now the connection is retried once for all of them.
 ///
-/// The cost is that they now fall together: a dropped socket stops every pool
-/// at once. That is close to what happened anyway - sockets fail because the
-/// endpoint or the network did, not one pool at a time.
+/// The cost is that they now fall together: whichever pool goes quiet first
+/// takes the connection down and all of them come back together. That is close
+/// to what happened anyway - sockets fail because the endpoint or the network
+/// did, not one pool at a time - and the alternative was worse: letting the
+/// others run on meant a refused subscription had no way back, because a
+/// reconnect needed every pool to stop first.
 pub async fn run_all(pools: Vec<Pool>, ws_url: String, out: mpsc::Sender<Tick>) -> Result<()> {
     let provider = Provider::<Ws>::connect(&ws_url).await.context("connect ws")?;
     info!(pools = pools.len(), "websocket connected");
 
+    let mut names = Vec::with_capacity(pools.len());
     let mut following = Vec::with_capacity(pools.len());
     for pool in pools {
+        names.push(pool.name.clone());
         // A clone shares the socket. Each task owns one so it can hold the
         // borrow its own subscription needs.
         let provider = provider.clone();
@@ -66,20 +71,26 @@ pub async fn run_all(pools: Vec<Pool>, ws_url: String, out: mpsc::Sender<Tick>) 
     }
     anyhow::ensure!(!following.is_empty(), "no pools to follow");
 
-    // Held until they are all done, because the last handle dropped is the
-    // connection closed.
-    let ended = futures_util::future::join_all(following).await;
+    // The FIRST to end, not the last. Waiting for all of them meant a pool
+    // whose subscription was refused sat dead while the others ran happily on
+    // - no reconnect, because a reconnect needed everyone to stop, and nothing
+    // said the pool had gone quiet. One going dark now takes the connection
+    // down and the caller brings all of them back together.
+    let (ended, which, rest) = futures_util::future::select_all(following).await;
+    let name = names.get(which).map(String::as_str).unwrap_or("?");
+    for task in rest {
+        task.abort();
+    }
     drop(provider);
 
-    // A pool whose subscription was refused says so and does not stop the rest:
-    // one bad filter should not take the other pools off the air, and the next
-    // reconnect gives it another try.
-    let failed = ended.iter().filter(|r| !matches!(r, Ok(Ok(())))).count();
-    anyhow::ensure!(
-        failed < ended.len(),
-        "every pool's subscription ended in failure"
-    );
-    Ok(())
+    match ended {
+        Ok(Ok(())) => {
+            warn!(pool = %name, "this pool's stream ended; reconnecting all of them");
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e).with_context(|| format!("following {name}")),
+        Err(e) => Err(anyhow::anyhow!("{e}")).with_context(|| format!("following {name}")),
+    }
 }
 
 /// One pool's subscription, over a connection somebody else owns.
