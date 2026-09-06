@@ -86,7 +86,12 @@ struct Plan {
     sell_yield_ppm: AtomicU64,
     /// Last known price and liquidity of every pool on the route, so a quote
     /// can be worked out without asking anyone.
-    state: Mutex<Option<RouteState>>,
+    ///
+    /// A plain `std` lock, not a `tokio` one, and deliberately: nothing is
+    /// awaited while it is held, and pricing has to be callable from the tick
+    /// loop - which is synchronous, and which now decides the size of a buy
+    /// before committing the money for it.
+    state: std::sync::Mutex<Option<RouteState>>,
     /// The same as `gas_limit`, for the sale back down this route. A separate
     /// figure because the reversed route is a different transaction: it starts
     /// on a different token and can settle a different way. Zero until one sale
@@ -202,7 +207,9 @@ struct Modelled {
 /// fallback for a pool nothing is on file for, which is the only case left.
 #[derive(Default)]
 struct TickBook {
-    inner: Mutex<HashMap<PoolRef, Entry>>,
+    /// `std` rather than `tokio` for the same reason as `Plan::state`: nothing
+    /// awaits while it is held, and the tick loop reads it synchronously.
+    inner: std::sync::Mutex<HashMap<PoolRef, Entry>>,
 }
 
 struct Entry {
@@ -255,8 +262,8 @@ impl TickBook {
     /// The ticks a move through this pool would cross, ready to be walked
     /// without touching the chain - or `None` when nothing on file reaches that
     /// far.
-    async fn rungs(&self, key: PoolRef, from: f64, to: f64) -> Option<Vec<crate::depth::Rung>> {
-        let book = self.inner.lock().await;
+    fn rungs(&self, key: PoolRef, from: f64, to: f64) -> Option<Vec<crate::depth::Rung>> {
+        let book = self.inner.lock().ok()?;
         let entry = book.get(&key)?;
         if entry.at.elapsed() > TICK_WINDOW_STALE_AFTER {
             return None;
@@ -265,8 +272,10 @@ impl TickBook {
     }
 
     /// The ladder a swap through this pool would walk, in its direction.
-    async fn ladder(&self, key: PoolRef, sqrt_p: f64, up: bool) -> Option<crate::depth::Ladder> {
-        let book = self.inner.lock().await;
+    fn ladder(&self, key: PoolRef, sqrt_p: f64, up: bool) -> Option<crate::depth::Ladder> {
+        // A poisoned lock means a panic while holding it. Nothing here can
+        // panic, and losing the ladder only costs a quote.
+        let book = self.inner.lock().ok()?;
         let entry = book.get(&key)?;
         if entry.at.elapsed() > TICK_WINDOW_STALE_AFTER {
             return None;
@@ -283,12 +292,12 @@ impl TickBook {
     /// Without this the only trace was `exact=false` on a buy, which says a
     /// trade was affected but not that anything is wrong.
     /// How long ago this pool's window was last read, if it ever was.
-    async fn age(&self, key: PoolRef) -> Option<Duration> {
-        self.inner.lock().await.get(&key).map(|e| e.at.elapsed())
+    fn age(&self, key: PoolRef) -> Option<Duration> {
+        self.inner.lock().ok()?.get(&key).map(|e| e.at.elapsed())
     }
 
-    async fn put(&self, key: PoolRef, window: Option<crate::depth::TickWindow>) {
-        let mut book = self.inner.lock().await;
+    fn put(&self, key: PoolRef, window: Option<crate::depth::TickWindow>) {
+        let Ok(mut book) = self.inner.lock() else { return };
         let had = book.get(&key).is_some_and(|e| e.window.is_some());
         match (had, window.is_some()) {
             (true, false) => warn!(
@@ -509,7 +518,7 @@ impl Executor {
                     sell_yield_ppm: AtomicU64::new(0),
                     sell_gas_limit: AtomicU64::new(0),
                     sell_approved: AtomicBool::new(sell_approved),
-                    state: Mutex::new(None),
+                    state: std::sync::Mutex::new(None),
                 },
             );
         }
@@ -679,7 +688,7 @@ impl Executor {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(pool = %key, err = %format!("{e:#}"), "no tick reader for this pool");
-                self.ticks.put(key, None).await;
+                self.ticks.put(key, None);
                 return;
             }
         };
@@ -716,7 +725,7 @@ impl Executor {
                     walkable_up = format!("{:.1}%", ((lhi / state.sqrt_p).powi(2) - 1.0) * 100.0),
                     "tick window read"
                 );
-                self.ticks.put(key, Some(w)).await;
+                self.ticks.put(key, Some(w));
             }
             Err(e) => self.keep_window(key, "could not read the tick window", e).await,
         }
@@ -734,7 +743,7 @@ impl Executor {
     /// which is the moment worth a warning rather than every moment on the way
     /// to it.
     async fn keep_window(&self, key: PoolRef, what: &str, e: anyhow::Error) {
-        match self.ticks.age(key).await {
+        match self.ticks.age(key) {
             Some(age) if age <= TICK_WINDOW_STALE_AFTER => tracing::debug!(
                 pool = %key, kept_age_s = age.as_secs(), err = %format!("{e:#}"),
                 "{what}; keeping the last one"
@@ -781,20 +790,24 @@ impl Executor {
         // The same pass records what every pool looked like at that block, so
         // a fast quote has something to price the hops the signal says nothing
         // about. The pool that drops brings its own state with the signal.
-        *plan.state.lock().await = Some(RouteState {
-            at: Instant::now(),
-            hops: local
-                .hops
-                .iter()
-                .map(|h| HopState {
-                    sqrt_p: h.sqrt_p,
-                    liquidity: h.liquidity,
-                    lp_fee: h.lp_fee,
-                    protocol_fee_0for1: h.protocol_fee_0for1,
-                    protocol_fee_1for0: h.protocol_fee_1for0,
-                })
-                .collect(),
-        });
+        // A poisoned lock costs this pass's snapshot and nothing else; the
+        // next one writes over it.
+        if let Ok(mut slot) = plan.state.lock() {
+            *slot = Some(RouteState {
+                at: Instant::now(),
+                hops: local
+                    .hops
+                    .iter()
+                    .map(|h| HopState {
+                        sqrt_p: h.sqrt_p,
+                        liquidity: h.liquidity,
+                        lp_fee: h.lp_fee,
+                        protocol_fee_0for1: h.protocol_fee_0for1,
+                        protocol_fee_1for0: h.protocol_fee_1for0,
+                    })
+                    .collect(),
+            });
+        }
 
         // The same measurement the other way round, while we hold enough of
         // the token to ask. A hook may charge differently by direction, and the
@@ -830,13 +843,13 @@ impl Executor {
     /// `None` means nothing usable is on file and the caller should read for
     /// itself. It never means "nothing to cross": see
     /// `depth::TickWindow::rungs_towards`, where that distinction is kept.
-    pub async fn rungs_towards(
+    pub fn rungs_towards(
         &self,
         key: PoolRef,
         from: f64,
         to: f64,
     ) -> Option<Vec<crate::depth::Rung>> {
-        self.ticks.rungs(key, from, to).await
+        self.ticks.rungs(key, from, to)
     }
 
     /// The address everything is signed and settled from.
@@ -1037,7 +1050,7 @@ impl Executor {
                     m => m,
                 };
                 match self.unstated_fee_acceptable(plan, ppm) {
-                    true => self.model_quote(plan, &sell, fresh, ppm).await,
+                    true => self.model_quote(plan, &sell, fresh, ppm),
                     false => None,
                 }
             }
@@ -1234,7 +1247,7 @@ impl Executor {
             )
         });
         let ppm = plan.yield_ppm.load(Ordering::Relaxed);
-        let modelled = self.model_quote(plan, &plan.route, fresh, ppm).await;
+        let modelled = self.model_quote(plan, &plan.route, fresh, ppm);
         // The model prices every buy or none does: there is no router
         // fallback on this path. Skip the buy instead of guessing; it costs
         // nothing but this one drop, and there will be another.
@@ -1274,9 +1287,8 @@ impl Executor {
         let state_age_s = plan
             .state
             .lock()
-            .await
-            .as_ref()
-            .map(|s| s.at.elapsed().as_secs());
+            .ok()
+            .and_then(|s| s.as_ref().map(|s| s.at.elapsed().as_secs()));
 
         Ok(Quoted {
             amount_out,
@@ -1525,7 +1537,7 @@ impl Executor {
     /// for a hop, or a ladder that does not reach as far as the swap walks. A
     /// buy is then skipped and a sale asks the router. Being slow is
     /// recoverable; signing a wrong minimum is not.
-    async fn model_quote(
+    fn model_quote(
         &self,
         plan: &Plan,
         route: &Route,
@@ -1545,18 +1557,22 @@ impl Executor {
             );
             return None;
         }
-        let guard = plan.state.lock().await;
+        // Copied out and the lock let go immediately. Holding it through the
+        // walk would make this function have to be async, and the tick loop -
+        // which is not - has to be able to size a buy before committing money
+        // for it.
+        let guard = plan.state.lock().ok();
+        let snapshot = guard.as_deref().and_then(|s| s.as_ref());
         // Kept rather than collapsed into the filter below, because every one
         // of the refusals in this function used to arrive as the same sentence
         // listing three possible causes, and a log that makes the reader guess
         // between three is worth about as much as no log.
         let stale_after = state_stale_after(self.calibrate_secs);
-        let age = guard.as_ref().map(|s| s.at.elapsed());
+        let age = snapshot.map(|s| s.at.elapsed());
         // Keyed by pool rather than by position, so the same state serves a
         // route walked in either order. Absent or stale, it simply is not
         // there to fall back on.
-        let known: Option<HashMap<PoolRef, HopState>> = guard
-            .as_ref()
+        let known: Option<HashMap<PoolRef, HopState>> = snapshot
             .filter(|s| s.at.elapsed() <= stale_after && s.hops.len() == plan.route.hops.len())
             .map(|s| {
                 plan.route
@@ -1566,6 +1582,10 @@ impl Executor {
                     .zip(s.hops.iter().copied())
                     .collect()
             });
+        // Everything wanted from it has been copied out, and a `MutexGuard` in
+        // a binding otherwise lives to the end of the function - which here is
+        // a whole route walk, with the calibration pass waiting to write.
+        drop(guard);
 
         let mut amount = crate::route::u256_to_f64(route.amount_in);
         for hop in &route.hops {
@@ -1624,7 +1644,7 @@ impl Executor {
                 protocol_fee_1for0: here.protocol_fee_1for0,
             };
             let up = !hop.zero_for_one();
-            let Some(rungs) = self.ticks.ladder(hop.pool_ref(), here.sqrt_p, up).await else {
+            let Some(rungs) = self.ticks.ladder(hop.pool_ref(), here.sqrt_p, up) else {
                 warn!(
                     route = %route.name,
                     pool = %hop.pool_ref(),

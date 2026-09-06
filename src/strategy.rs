@@ -1026,7 +1026,7 @@ async fn report_depth(
     // was read on a timer. So the ordinary case is arithmetic, not a request.
     if let Some(exec) = &exec {
         let target = crate::depth::move_target(sqrt_p, pool.base_token, max_move_pct);
-        if let Some(rungs) = exec.rungs_towards(pool.pool_ref(), sqrt_p, target).await {
+        if let Some(rungs) = exec.rungs_towards(pool.pool_ref(), sqrt_p, target) {
             match crate::depth::pay_to_move_along(
                 sqrt_p, sig.liquidity, pool.base_token, max_move_pct, fee, &rungs,
             ) {
