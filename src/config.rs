@@ -336,6 +336,66 @@ impl Config {
         validate(&cfg).with_context(|| format!("in config {}", path.display()))?;
         Ok(cfg)
     }
+
+    /// The armed route that buys when this pool drops, if any.
+    ///
+    /// One place, because two of them would drift: startup arms a route
+    /// against a pool here, and a reload has to find the SAME route or it would
+    /// retune a pool against somebody else's numbers.
+    pub fn armed_route(&self, trigger: crate::route::PoolRef) -> Option<&RouteConfig> {
+        self.routes.iter().find(|r| r.auto_buy && r.trigger() == Some(trigger))
+    }
+}
+
+impl RouteConfig {
+    /// The pool whose price this route reacts to: the one named, else the pool
+    /// it ends in. `None` when neither parses as a pool.
+    pub fn trigger(&self) -> Option<crate::route::PoolRef> {
+        let raw = self.trigger_pool.clone().or_else(|| self.pools.last().cloned())?;
+        crate::route::parse_pool_ref(&raw).ok()
+    }
+}
+
+impl PoolConfig {
+    /// How the rest of the process names this pool: a v4 pool by its id, a v3
+    /// pool by its own address. `None` when the file gives neither, which is a
+    /// pool nothing can be matched against.
+    pub fn pool_ref(&self) -> Option<crate::route::PoolRef> {
+        match (&self.pool_id, &self.address) {
+            (Some(id), _) => crate::route::parse_pool_ref(id).ok(),
+            (None, Some(a)) => crate::route::parse_pool_ref(a).ok(),
+            (None, None) => None,
+        }
+    }
+}
+
+/// What changed in the file that only a restart can apply.
+///
+/// Everything here was read once and handed to something that has been running
+/// on it ever since - a websocket, a broadcaster, a wallet, a resolved route.
+/// Naming them is the point: an operator who edits an endpoint and sends SIGHUP
+/// must not be left believing the process took it.
+pub fn restart_only(running: &Config, next: &Config) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut differs = |name: &'static str, same: bool| {
+        if !same {
+            out.push(name);
+        }
+    };
+    differs("ws_url", running.ws_url == next.ws_url);
+    differs("http_url", running.http_url == next.http_url);
+    differs("submit_urls", running.submit_urls == next.submit_urls);
+    differs("private_key", running.private_key.expose() == next.private_key.expose());
+    differs("gas_reserve", running.gas_reserve == next.gas_reserve);
+    differs("calibrate_secs", running.calibrate_secs == next.calibrate_secs);
+    differs("pool_manager", running.pool_manager == next.pool_manager);
+    differs("universal_router", running.universal_router == next.universal_router);
+    differs("permit2", running.permit2 == next.permit2);
+    differs("weth", running.weth == next.weth);
+    differs("tokens", running.tokens == next.tokens);
+    differs("inventory_path", running.inventory_path == next.inventory_path);
+    differs("pool_cache_path", running.pool_cache_path == next.pool_cache_path);
+    out
 }
 
 /// A non-empty environment variable, trimmed.
@@ -594,6 +654,53 @@ mod tests {
         ))
         .expect_err("not an amount");
         assert!(format!("{e:#}").contains("gas_reserve"), "{e:#}");
+    }
+
+    /// A route names the pool it reacts to the same way the pools do, or a
+    /// reload would retune a pool against a route that is not the one arming
+    /// it - and the numbers would come from somebody else's dip.
+    #[test]
+    fn an_armed_route_and_its_trigger_pool_agree_on_the_name() {
+        let id = format!("0x{}", "11".repeat(32));
+        let cfg = with(&format!(
+            "pool_manager = \"{MANAGER}\"\n\
+             [[pools]]\nname = \"A/B (v4)\"\nversion = \"v4\"\npool_id = \"{id}\"\n\
+             [[routes]]\nname = \"buy A\"\ninput = \"WETH\"\nmax_slippage_pct = 3\n\
+             impact_pct = 1\npools = [\"{id}\"]\nauto_buy = true\n"
+        ))
+        .expect("a route over the watched pool");
+        let key = cfg.pools[0].pool_ref().expect("a v4 pool is named by its id");
+        assert_eq!(cfg.routes[0].trigger(), Some(key));
+        assert_eq!(cfg.armed_route(key).map(|r| r.name.as_str()), Some("buy A"));
+
+        // A route that is not armed is not the one to take a take-profit from.
+        let cfg = with(&format!(
+            "pool_manager = \"{MANAGER}\"\n\
+             [[pools]]\nname = \"A/B (v4)\"\nversion = \"v4\"\npool_id = \"{id}\"\n\
+             [[routes]]\nname = \"buy A\"\ninput = \"WETH\"\nmax_slippage_pct = 3\n\
+             impact_pct = 1\npools = [\"{id}\"]\nauto_buy = false\n"
+        ))
+        .expect("an unarmed route");
+        assert!(cfg.armed_route(key).is_none());
+    }
+
+    /// What a reload may not touch has to be NAMED, or an operator edits an
+    /// endpoint, sends SIGHUP and believes the bot took it.
+    #[test]
+    fn a_field_only_a_restart_applies_is_named() {
+        let pool = format!(
+            "[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"{MANAGER}\"\n"
+        );
+        let running = with(&pool).expect("valid");
+        let mut next = running.clone();
+        assert!(restart_only(&running, &next).is_empty(), "nothing changed");
+
+        next.ws_url = "wss://elsewhere".into();
+        next.gas_reserve = "0.5".into();
+        let named = restart_only(&running, &next);
+        assert!(named.contains(&"ws_url"), "{named:?}");
+        assert!(named.contains(&"gas_reserve"), "{named:?}");
+        assert!(!named.contains(&"http_url"), "{named:?}");
     }
 
     /// A misspelled address is caught while someone is reading the message, not

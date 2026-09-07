@@ -68,6 +68,9 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
     let cfg = config::Config::load(&path)?;
+    // Kept whole, because a reload is judged against what this process is
+    // actually running on - not against the file as it was last saved.
+    let running = cfg.clone();
     // Said out loud, and absolute. `config.toml` is resolved against the
     // working directory, so running the binary by its path from somewhere else
     // reads a different file than the one being edited - and every parameter
@@ -174,8 +177,8 @@ async fn main() -> anyhow::Result<()> {
     // there is nothing to open until it is known which pools there are.
     let mut watched: Vec<pool::Pool> = Vec::new();
     let tokens = cfg.tokens.clone();
-    for pool_cfg in cfg.pools {
-        let pool = match pool::Pool::resolve(&http, &pool_cfg, &tokens, Some(manager)).await {
+    for pool_cfg in &cfg.pools {
+        let pool = match pool::Pool::resolve(&http, pool_cfg, &tokens, Some(manager)).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(pool = %pool_cfg.name, err = %e, "failed to resolve pool, skipping");
@@ -184,17 +187,7 @@ async fn main() -> anyhow::Result<()> {
         };
         // A take-profit belongs to the route that bought the position, and the
         // route is armed against this pool, so the two meet here.
-        let armed = cfg
-            .routes
-            .iter()
-            .find(|r| {
-                r.auto_buy
-                    && r.trigger_pool
-                        .clone()
-                        .or_else(|| r.pools.last().cloned())
-                        .and_then(|p| route::parse_pool_ref(&p).ok())
-                        == Some(pool.pool_ref())
-            });
+        let armed = cfg.armed_route(pool.pool_ref());
         strategy.watch(
             pool.clone(),
             pool_cfg.threshold_pct.unwrap_or(cfg.threshold_pct),
@@ -236,11 +229,53 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // A reload is asked for, not watched for: an editor saving a half-written
+    // file must not retune a bot holding positions, and `kill -HUP` is somebody
+    // saying the file is ready to be read.
+    //
+    // Depth one, because a second SIGHUP arriving before the first was applied
+    // is the same request twice: the loader reads the file at the moment it
+    // sends, so what is queued is never staler than the signal behind it.
+    let (reloads_tx, reloads_rx) = tokio::sync::mpsc::channel::<config::Config>(1);
+    #[cfg(unix)]
+    {
+        let path = path.clone();
+        tokio::spawn(async move {
+            let mut hup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(err = %e, "cannot listen for SIGHUP; no config reload");
+                        return;
+                    }
+                };
+            while hup.recv().await.is_some() {
+                // A file that will not parse changes nothing. This process is
+                // holding positions; the one thing a typo must not do is take
+                // the bot down or leave it running on half a config.
+                let next = match config::Config::load(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(err = %format!("{e:#}"),
+                            "config reload REFUSED; the running config stands");
+                        continue;
+                    }
+                };
+                for field in config::restart_only(&running, &next) {
+                    tracing::warn!(field, "changed in the file, but only a restart applies it");
+                }
+                if reloads_tx.send(next).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
     // Everything that had to be looked up has been; keep it for next time.
     cache::flush();
     strategy.resolve_pending().await;
     strategy.seed_inventory().await;
-    let decisions = tokio::spawn(strategy.run(rx, reports_rx));
+    let decisions = tokio::spawn(strategy.run(rx, reports_rx, reloads_rx));
 
     tokio::select! {
         _ = feeds => {}

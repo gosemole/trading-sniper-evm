@@ -71,6 +71,21 @@ impl BigSellMeter {
         }
     }
 
+    /// Change what counts as a big sell, keeping everything the meter knows
+    /// about the price.
+    ///
+    /// The reference is the previous block's close and has nothing to do with
+    /// how big a drop has to be, so rebuilding the meter to retune it would
+    /// throw away the reference and blind the pool until its next block.
+    pub fn set_threshold(&mut self, pct: f64) {
+        self.threshold_pct = pct;
+    }
+
+    /// What a drop is currently measured against, in percent.
+    pub fn threshold(&self) -> f64 {
+        self.threshold_pct
+    }
+
     /// The most recent price this pool reported, which is the running close of
     /// the block being observed. The best available guess at what a sale
     /// started right now would get.
@@ -524,8 +539,98 @@ impl Strategy {
         self.watches.len()
     }
 
+    /// Apply a re-read config to what is already running.
+    ///
+    /// The numbers that decide when to act, and nothing that decides WHAT is
+    /// acted on: which pools are watched and which routes are armed were
+    /// settled at startup by resolving them against the chain, subscribing one
+    /// websocket and approving one wallet. Changing that set means re-resolving
+    /// and rebuilding with positions open and a nonce in flight, which is a
+    /// restart's job.
+    ///
+    /// So everything it will not apply, it says out loud. A number silently
+    /// ignored is worse than one that was never editable: the operator walks
+    /// away believing the bot is trading on what the file says.
+    pub fn retune(&mut self, cfg: &crate::config::Config) {
+        let mut applied = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        for pc in &cfg.pools {
+            let Some(key) = pc.pool_ref() else { continue };
+            seen.insert(key);
+            let Some(w) = self.watches.get_mut(&key) else {
+                warn!(pool = %pc.name, "not watched: adding a pool needs a restart");
+                continue;
+            };
+            let armed = cfg.armed_route(key);
+            let threshold = pc.threshold_pct.unwrap_or(cfg.threshold_pct);
+            let max_move = pc.max_move_pct.unwrap_or(cfg.max_move_pct);
+            let take_profit = armed.and_then(|r| r.take_profit_pct);
+            let exit_after = armed.and_then(|r| r.exit_after_secs).map(Duration::from_secs);
+            // Compared field by field so the log says what actually moved. A
+            // reload that printed every pool it looked at would bury the one
+            // line somebody edited the file for.
+            if w.meter.threshold() != threshold {
+                info!(pool = %w.pool.name, from = w.meter.threshold(), to = threshold,
+                      "threshold_pct");
+                w.meter.set_threshold(threshold);
+                applied += 1;
+            }
+            if w.max_move_pct != max_move {
+                info!(pool = %w.pool.name, from = w.max_move_pct, to = max_move, "max_move_pct");
+                w.max_move_pct = max_move;
+                applied += 1;
+            }
+            if w.take_profit_pct != take_profit {
+                info!(pool = %w.pool.name, from = ?w.take_profit_pct, to = ?take_profit,
+                      "take_profit_pct");
+                w.take_profit_pct = take_profit;
+                applied += 1;
+            }
+            if w.exit_after != exit_after {
+                info!(pool = %w.pool.name, from = ?w.exit_after, to = ?exit_after,
+                      "exit_after_secs");
+                w.exit_after = exit_after;
+                applied += 1;
+            }
+        }
+        // A pool dropped from the file keeps being watched, and says so. Left
+        // silently, it would be a position nothing is watching for a
+        // take-profit or a hold timer - which is how a bag gets forgotten.
+        for w in self.watches.values().filter(|w| !seen.contains(&w.pool.pool_ref())) {
+            warn!(pool = %w.pool.name, "no longer in the config, still watched: removing a pool \
+                  needs a restart");
+        }
+        if let Some(exec) = &self.exec {
+            for r in &cfg.routes {
+                let Some(trigger) = r.trigger() else { continue };
+                match exec.set_armed(trigger, r.auto_buy) {
+                    Some(was) if was == r.auto_buy => {}
+                    Some(_) => {
+                        match r.auto_buy {
+                            true => info!(route = %r.name, "ARMED: this route buys again"),
+                            false => warn!(route = %r.name, "DISARMED: this route stops buying; \
+                                           what it holds is still sold"),
+                        }
+                        applied += 1;
+                    }
+                    // Only routes that were armed at startup have a plan, so
+                    // this is a route that has none to flip.
+                    None if r.auto_buy => warn!(route = %r.name,
+                        "cannot be armed while running: arming a route needs a restart"),
+                    None => {}
+                }
+            }
+        }
+        info!(applied, "config reloaded");
+    }
+
     /// Read the feed until it ends, and act on what comes back from the chain.
-    pub async fn run(mut self, mut ticks: mpsc::Receiver<Tick>, mut reports: mpsc::Receiver<Report>) {
+    pub async fn run(
+        mut self,
+        mut ticks: mpsc::Receiver<Tick>,
+        mut reports: mpsc::Receiver<Report>,
+        mut reloads: mpsc::Receiver<crate::config::Config>,
+    ) {
         // Time passes whether or not anyone trades, so the clock gets a branch
         // of its own rather than riding on price updates.
         let mut clock = tokio::time::interval(Duration::from_secs(5));
@@ -534,6 +639,10 @@ impl Strategy {
             tokio::select! {
                 Some(tick) = ticks.recv() => self.on_tick(tick),
                 Some(r) = reports.recv() => self.on_report(r).await,
+                // Applied here rather than from the signal handler's own task:
+                // the watches are `&mut self` and belong to this loop, so a
+                // reload lands between two ticks instead of racing one.
+                Some(cfg) = reloads.recv() => self.retune(&cfg),
                 _ = clock.tick() => self.check_hold_times(),
                 else => break,
             }

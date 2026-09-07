@@ -69,6 +69,13 @@ use tracing::{info, warn};
 struct Plan {
     route: Route,
     cooldown: Duration,
+    /// Whether this route may still BUY. Set from `auto_buy` when the route is
+    /// armed and flipped by a config reload, so a route can be stopped without
+    /// stopping the process that holds its position.
+    ///
+    /// Buying only. A disarmed route still sells what it bought - see
+    /// `set_armed`.
+    armed: AtomicBool,
     /// Gas limit to sign with, measured once when the route is armed and
     /// refreshed after each send. Keeping it here is what takes `estimate_gas`
     /// out of the path between a drop and a broadcast.
@@ -663,16 +670,7 @@ impl Executor {
             // A trigger nobody subscribes to is a route that can never fire.
             // Not fatal - the pool may be about to be added - but silent
             // failure is exactly what this is otherwise.
-            let watched = cfg.pools.iter().any(|p| {
-                let named = match (&p.pool_id, &p.address) {
-                    // A v4 pool is named by its id; a v3 pool by its own
-                    // address, which it always has.
-                    (Some(id), _) => parse_pool_ref(id).ok(),
-                    (None, Some(a)) => parse_pool_ref(a).ok(),
-                    (None, None) => None,
-                };
-                named == Some(trigger)
-            });
+            let watched = cfg.pools.iter().any(|p| p.pool_ref() == Some(trigger));
             if !watched {
                 warn!(
                     route = %rc.name, trigger = ?trigger,
@@ -722,6 +720,7 @@ impl Executor {
                 Plan {
                     route,
                     cooldown: Duration::from_secs(rc.cooldown_secs),
+                    armed: AtomicBool::new(true),
                     gas_limit: AtomicU64::new(gas_limit),
                     yield_ppm: AtomicU64::new(0),
                     sell_yield_ppm: AtomicU64::new(0),
@@ -1107,6 +1106,10 @@ impl Executor {
     /// that rounds to nothing.
     pub fn size_for(&self, key: PoolRef, sig: &Signal, cap: U256) -> Option<(U256, Prepared)> {
         let plan = self.plans.get(&key)?;
+        if !plan.armed.load(Ordering::Relaxed) {
+            info!(route = %plan.route.name, "route is disarmed; not sizing this signal");
+            return None;
+        }
         let route = &plan.route;
         let ppm = plan.yield_ppm.load(Ordering::Relaxed);
         if !self.unstated_fee_acceptable(plan, ppm) {
@@ -1237,6 +1240,22 @@ impl Executor {
     /// The address everything is signed and settled from.
     pub fn owner(&self) -> Address {
         self.owner
+    }
+
+    /// Arm or disarm the route that buys through `trigger`, while it runs.
+    ///
+    /// Returns what it was, or `None` when no route is armed against that pool:
+    /// a route that was not armed at startup has no resolved plan, no
+    /// approvals and no measured gas, and none of that can be worked out from
+    /// here without the network.
+    ///
+    /// Buying only, deliberately. A disarmed route still sells what it already
+    /// bought - take-profit and the hold timer go through `route_for` - because
+    /// a position nobody can put down is worse than one nobody should have
+    /// bought.
+    pub fn set_armed(&self, trigger: PoolRef, on: bool) -> Option<bool> {
+        let plan = self.plans.get(&trigger)?;
+        Some(plan.armed.swap(on, Ordering::Relaxed))
     }
 
     /// The route armed against this pool, for a caller that needs to trade it
@@ -1547,6 +1566,10 @@ impl Executor {
             );
             return None;
         };
+        if !plan.armed.load(Ordering::Relaxed) {
+            info!(pool = %pool.name, route = %plan.route.name, "route is disarmed; not buying");
+            return None;
+        }
         // The route has to buy what actually fell. A route armed against a pool
         // whose base side is the other token would buy on someone else's dip.
         if let Some(base) = pool.base_currency() {
