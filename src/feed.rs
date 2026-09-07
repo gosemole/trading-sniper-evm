@@ -12,6 +12,7 @@
 //! falls could serve one and not the other.
 
 use crate::pool::{v3_swap_topic, v4_swap_topic, Pool};
+use std::collections::{HashMap, HashSet};
 use crate::price;
 use crate::route::PoolRef;
 use anyhow::{Context, Result};
@@ -55,42 +56,104 @@ pub struct Tick {
 /// did, not one pool at a time - and the alternative was worse: letting the
 /// others run on meant a refused subscription had no way back, because a
 /// reconnect needed every pool to stop first.
-pub async fn run_all(pools: Vec<Pool>, ws_url: String, out: mpsc::Sender<Tick>) -> Result<()> {
+pub async fn run_all(
+    mut pools: tokio::sync::watch::Receiver<Vec<Pool>>,
+    ws_url: String,
+    out: mpsc::Sender<Tick>,
+) -> Result<()> {
     let provider = Provider::<Ws>::connect(&ws_url).await.context("connect ws")?;
-    info!(pools = pools.len(), "websocket connected");
+    // Marked seen here, so a set published while this was connecting is picked
+    // up by the diff below rather than waited for.
+    let wanted = pools.borrow_and_update().clone();
+    info!(pools = wanted.len(), "websocket connected");
 
-    let mut names = Vec::with_capacity(pools.len());
-    let mut following = Vec::with_capacity(pools.len());
-    for pool in pools {
-        names.push(pool.name.clone());
-        // A clone shares the socket. Each task owns one so it can hold the
-        // borrow its own subscription needs.
-        let provider = provider.clone();
-        let out = out.clone();
-        following.push(tokio::spawn(async move { follow(&provider, pool, out).await }));
+    // Each task reports its own ending instead of being awaited from here.
+    // The set changes while they run, and a `select_all` over their handles
+    // would have to be dropped every time it did - which DETACHES the tasks
+    // rather than stopping them, leaving a subscription nobody can end.
+    let (ended_tx, mut ended) = mpsc::channel::<(String, Result<()>)>(8);
+    let mut following: HashMap<crate::route::PoolRef, tokio::task::JoinHandle<()>> =
+        HashMap::new();
+    for pool in wanted {
+        following.insert(pool.pool_ref(), spawn_follow(&provider, pool, &out, &ended_tx));
     }
     anyhow::ensure!(!following.is_empty(), "no pools to follow");
+
+    // Whether the set can still change. When the sender is gone nothing will
+    // ever publish again, and an errored `changed()` is ready forever - which
+    // would spin this loop instead of waiting on the pools.
+    let mut retunable = true;
+    let (name, ended) = loop {
+        tokio::select! {
+            Some((name, how)) = ended.recv() => break (name, how),
+            // A pool added or dropped while the socket is up: only that pool's
+            // subscription changes. The others are not touched, because a
+            // reconnect to add one pool is a gap in every other pool's feed -
+            // and a dip that falls in the gap is a trade that never happened.
+            r = pools.changed(), if retunable => {
+                if r.is_err() {
+                    retunable = false;
+                    continue;
+                }
+                let wanted = pools.borrow_and_update().clone();
+                let keep: HashSet<crate::route::PoolRef> =
+                    wanted.iter().map(|p| p.pool_ref()).collect();
+                let going: Vec<_> =
+                    following.keys().filter(|k| !keep.contains(k)).copied().collect();
+                for key in going {
+                    if let Some(task) = following.remove(&key) {
+                        task.abort();
+                        info!(pool = %key, "unsubscribed");
+                    }
+                }
+                for pool in wanted {
+                    if following.contains_key(&pool.pool_ref()) {
+                        continue;
+                    }
+                    following
+                        .insert(pool.pool_ref(), spawn_follow(&provider, pool, &out, &ended_tx));
+                }
+            }
+        }
+    };
 
     // The FIRST to end, not the last. Waiting for all of them meant a pool
     // whose subscription was refused sat dead while the others ran happily on
     // - no reconnect, because a reconnect needed everyone to stop, and nothing
     // said the pool had gone quiet. One going dark now takes the connection
     // down and the caller brings all of them back together.
-    let (ended, which, rest) = futures_util::future::select_all(following).await;
-    let name = names.get(which).map(String::as_str).unwrap_or("?");
-    for task in rest {
+    for (_, task) in following {
         task.abort();
     }
     drop(provider);
 
     match ended {
-        Ok(Ok(())) => {
+        Ok(()) => {
             warn!(pool = %name, "this pool's stream ended; reconnecting all of them");
             Ok(())
         }
-        Ok(Err(e)) => Err(e).with_context(|| format!("following {name}")),
-        Err(e) => Err(anyhow::anyhow!("{e}")).with_context(|| format!("following {name}")),
+        Err(e) => Err(e).with_context(|| format!("following {name}")),
     }
+}
+
+/// One pool's subscription, on the connection this run already holds, reporting
+/// how it ended down `ended` rather than through a handle somebody has to keep.
+fn spawn_follow(
+    provider: &Provider<Ws>,
+    pool: Pool,
+    out: &mpsc::Sender<Tick>,
+    ended: &mpsc::Sender<(String, Result<()>)>,
+) -> tokio::task::JoinHandle<()> {
+    // A clone shares the socket. Each task owns one so it can hold the borrow
+    // its own subscription needs.
+    let provider = provider.clone();
+    let out = out.clone();
+    let ended = ended.clone();
+    let name = pool.name.clone();
+    tokio::spawn(async move {
+        let how = follow(&provider, pool, out).await;
+        let _ = ended.send((name, how)).await;
+    })
 }
 
 /// One pool's subscription, over a connection somebody else owns.

@@ -256,12 +256,27 @@ struct Settled {
 /// fails three times in a row is not failing because of timing.
 const SELL_ATTEMPTS: u32 = 3;
 
+/// A re-read config, with its pools already resolved.
+///
+/// Resolving asks the chain for decimals, symbols and PoolKeys, so it happens
+/// in the task that read the file - never in the loop that decides trades. A
+/// pool that could not be resolved is simply absent, and the pools that could
+/// be are applied without it.
+pub struct Reload {
+    pub cfg: crate::config::Config,
+    pub pools: Vec<Pool>,
+}
+
 pub struct Strategy {
     http: Provider<Http>,
     watches: HashMap<PoolRef, Watch>,
     exec: Option<Arc<Executor>>,
     inventory: Inventory,
     reports: mpsc::Sender<Report>,
+    /// The pools the feed should be subscribed to. Published only after a
+    /// reload has decided what is actually watched, so a pool kept because it
+    /// holds a position keeps its subscription too.
+    feed: Option<tokio::sync::watch::Sender<Vec<Pool>>>,
 }
 
 impl Strategy {
@@ -277,7 +292,14 @@ impl Strategy {
             exec,
             inventory,
             reports,
+            feed: None,
         }
+    }
+
+    /// Where to publish the watched set, so the feed can follow a pool that
+    /// was added and drop one that was removed.
+    pub fn publishes_pools_to(&mut self, feed: tokio::sync::watch::Sender<Vec<Pool>>) {
+        self.feed = Some(feed);
     }
 
     /// Find out how trades that were in flight when we last stopped ended.
@@ -541,24 +563,56 @@ impl Strategy {
 
     /// Apply a re-read config to what is already running.
     ///
-    /// The numbers that decide when to act, and nothing that decides WHAT is
-    /// acted on: which pools are watched and which routes are armed were
-    /// settled at startup by resolving them against the chain, subscribing one
-    /// websocket and approving one wallet. Changing that set means re-resolving
-    /// and rebuilding with positions open and a nonce in flight, which is a
-    /// restart's job.
+    /// Pool by pool and route by route, and never all or nothing: a pool that
+    /// cannot be resolved, a route with no plan to flip, a pool held back
+    /// because it holds a position - each is reported and skipped on its own.
+    /// One edited entry must not stop the entries beside it from being applied,
+    /// and must not touch what they are already doing: the pools already
+    /// subscribed keep their subscriptions, the routes already armed keep
+    /// buying, and a trade in flight is not looked at.
     ///
-    /// So everything it will not apply, it says out loud. A number silently
-    /// ignored is worse than one that was never editable: the operator walks
-    /// away believing the bot is trading on what the file says.
-    pub fn retune(&mut self, cfg: &crate::config::Config) {
+    /// What it will not apply, it says out loud. A number silently ignored is
+    /// worse than one that was never editable: the operator walks away
+    /// believing the bot is trading on what the file says.
+    pub fn retune(&mut self, r: &Reload) {
+        let cfg = &r.cfg;
+        let resolved: HashMap<PoolRef, &Pool> =
+            r.pools.iter().map(|p| (p.pool_ref(), p)).collect();
         let mut applied = 0usize;
-        let mut seen = std::collections::HashSet::new();
+        let mut set_changed = false;
+        let mut seen = HashSet::new();
         for pc in &cfg.pools {
             let Some(key) = pc.pool_ref() else { continue };
             seen.insert(key);
+            if !self.watches.contains_key(&key) {
+                // New in the file. Watched from here on, but not armed: a route
+                // is armed by resolving it, approving what it spends and
+                // measuring its gas, none of which can be done from inside this
+                // loop - so a new pool reports its drops and buys nothing until
+                // a restart.
+                let Some(pool) = resolved.get(&key) else {
+                    warn!(pool = %pc.name,
+                        "new in the config but could not be resolved; not watching it - the \
+                         pools already watched are unaffected");
+                    continue;
+                };
+                self.watch(
+                    (*pool).clone(),
+                    pc.threshold_pct.unwrap_or(cfg.threshold_pct),
+                    pc.max_move_pct.unwrap_or(cfg.max_move_pct),
+                    cfg.armed_route(key).and_then(|r| r.take_profit_pct),
+                    cfg.armed_route(key).and_then(|r| r.exit_after_secs),
+                );
+                if cfg.armed_route(key).is_some() {
+                    warn!(pool = %pc.name,
+                        "watched, but its route cannot be armed while running: no auto-buy from \
+                         this pool until a restart");
+                }
+                applied += 1;
+                set_changed = true;
+                continue;
+            }
             let Some(w) = self.watches.get_mut(&key) else {
-                warn!(pool = %pc.name, "not watched: adding a pool needs a restart");
                 continue;
             };
             let armed = cfg.armed_route(key);
@@ -593,12 +647,32 @@ impl Strategy {
                 applied += 1;
             }
         }
-        // A pool dropped from the file keeps being watched, and says so. Left
-        // silently, it would be a position nothing is watching for a
-        // take-profit or a hold timer - which is how a bag gets forgotten.
-        for w in self.watches.values().filter(|w| !seen.contains(&w.pool.pool_ref())) {
-            warn!(pool = %w.pool.name, "no longer in the config, still watched: removing a pool \
-                  needs a restart");
+        // Dropped from the file - but not from a position. A pool holding one
+        // keeps its watch and its subscription whatever the file says: the
+        // take-profit and the hold timer are the only things that will ever
+        // sell it, and both live here. A bag nobody is watching is how a bag
+        // gets forgotten.
+        let leaving: Vec<PoolRef> =
+            self.watches.keys().filter(|k| !seen.contains(k)).copied().collect();
+        for key in leaving {
+            let Some(w) = self.watches.get(&key) else { continue };
+            let held = w.pool.base_currency().and_then(|t| self.inventory.get(t)).is_some();
+            if held || w.selling {
+                warn!(pool = %w.pool.name, held, selling = w.selling,
+                    "no longer in the config, but it holds a position - still watched and still \
+                     sold; remove it after the position is closed");
+                continue;
+            }
+            info!(pool = %w.pool.name, "no longer in the config; unwatched");
+            self.watches.remove(&key);
+            // Nothing feeds this pool any more, so nothing can trigger its
+            // route. Said in the executor as well, so a plan cannot fire on a
+            // stray tick that was already in the channel.
+            if let Some(exec) = &self.exec {
+                exec.set_armed(key, false);
+            }
+            applied += 1;
+            set_changed = true;
         }
         if let Some(exec) = &self.exec {
             for r in &cfg.routes {
@@ -621,7 +695,18 @@ impl Strategy {
                 }
             }
         }
-        info!(applied, "config reloaded");
+        // Only after the set is settled, and only when it moved: this is what
+        // the feed subscribes to, and republishing an unchanged set would make
+        // it diff for nothing.
+        if set_changed {
+            if let Some(feed) = &self.feed {
+                let pools: Vec<Pool> = self.watches.values().map(|w| w.pool.clone()).collect();
+                if feed.send(pools).is_err() {
+                    warn!("the feed is not listening; the watched set was not published");
+                }
+            }
+        }
+        info!(applied, watching = self.watches.len(), "config reloaded");
     }
 
     /// Read the feed until it ends, and act on what comes back from the chain.
@@ -629,7 +714,7 @@ impl Strategy {
         mut self,
         mut ticks: mpsc::Receiver<Tick>,
         mut reports: mpsc::Receiver<Report>,
-        mut reloads: mpsc::Receiver<crate::config::Config>,
+        mut reloads: mpsc::Receiver<Reload>,
     ) {
         // Time passes whether or not anyone trades, so the clock gets a branch
         // of its own rather than riding on price updates.
@@ -642,7 +727,7 @@ impl Strategy {
                 // Applied here rather than from the signal handler's own task:
                 // the watches are `&mut self` and belong to this loop, so a
                 // reload lands between two ticks instead of racing one.
-                Some(cfg) = reloads.recv() => self.retune(&cfg),
+                Some(r) = reloads.recv() => self.retune(&r),
                 _ = clock.tick() => self.check_hold_times(),
                 else => break,
             }
@@ -1249,6 +1334,122 @@ async fn report_depth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A v3 pool named by its own address, with both currencies known - enough
+    /// for a watch, a position and a pool_ref.
+    fn v3_pool(name: &str, byte: u8) -> Pool {
+        let addr = ethers::types::Address::from([byte; 20]);
+        let base = ethers::types::Address::from([byte.wrapping_add(100); 20]);
+        Pool {
+            name: name.to_string(),
+            version: "v3".to_string(),
+            decimals0: 18,
+            decimals1: 18,
+            decimals_known: true,
+            base_token: 0,
+            quote_symbol: Some("WETH".to_string()),
+            base_symbol: Some(name.to_string()),
+            currencies: Some((base, ethers::types::Address::from([1u8; 20]))),
+            address: addr,
+            pool_id: None,
+            tick_spacing: None,
+            lp_fee: Some(3000),
+        }
+    }
+
+    fn watching(pools: &[Pool], threshold: f64) -> Strategy {
+        let http = Provider::<Http>::try_from("http://127.0.0.1:1").expect("a url, not a dial");
+        let (reports, _rx) = mpsc::channel(8);
+        let mut s = Strategy::new(http, None, Inventory::default(), reports);
+        for p in pools {
+            s.watch(p.clone(), threshold, 1.0, None, None);
+        }
+        s
+    }
+
+    fn pool_toml(p: &Pool, threshold: Option<f64>) -> String {
+        let extra = threshold.map(|t| format!("threshold_pct = {t}\n")).unwrap_or_default();
+        format!(
+            "[[pools]]\nname = \"{}\"\nversion = \"v3\"\naddress = \"{:?}\"\n{extra}",
+            p.name, p.address
+        )
+    }
+
+    fn cfg_of(body: &str) -> crate::config::Config {
+        toml::from_str(&format!("threshold_pct = 3\nmax_move_pct = 1\n{body}"))
+            .expect("a config")
+    }
+
+    /// One pool's edit must not decide anything about the pool beside it.
+    ///
+    /// The case this is about: a config where one entry cannot be applied - it
+    /// would not resolve - while another was retuned. The retuned one has to
+    /// land, and the untouched one has to stay exactly as it was rather than
+    /// falling back to a global or being dropped.
+    #[test]
+    fn one_pool_that_cannot_be_applied_does_not_hold_up_the_others() {
+        let (a, b, c) = (v3_pool("A", 0xa), v3_pool("B", 0xb), v3_pool("C", 0xc));
+        let mut s = watching(&[a.clone(), b.clone()], 3.0);
+
+        // C is in the file but could not be resolved, so it is absent from the
+        // pools the reload carries.
+        let cfg = cfg_of(&format!(
+            "{}{}{}",
+            pool_toml(&a, Some(8.0)),
+            pool_toml(&b, None),
+            pool_toml(&c, Some(2.0))
+        ));
+        s.retune(&Reload { cfg, pools: vec![a.clone(), b.clone()] });
+
+        assert_eq!(s.watches[&a.pool_ref()].meter.threshold(), 8.0, "A was retuned");
+        assert_eq!(s.watches[&b.pool_ref()].meter.threshold(), 3.0, "B was left alone");
+        assert!(!s.watches.contains_key(&c.pool_ref()), "C could not be resolved");
+        assert_eq!(s.watching(), 2);
+    }
+
+    /// A pool added to the file is watched from the next reload, on the
+    /// connection the others are already using.
+    #[test]
+    fn a_pool_added_to_the_file_is_watched() {
+        let (a, b) = (v3_pool("A", 0xa), v3_pool("B", 0xb));
+        let mut s = watching(&[a.clone()], 3.0);
+        let cfg = cfg_of(&format!("{}{}", pool_toml(&a, None), pool_toml(&b, Some(5.0))));
+        s.retune(&Reload { cfg, pools: vec![a.clone(), b.clone()] });
+        assert_eq!(s.watching(), 2);
+        assert_eq!(s.watches[&b.pool_ref()].meter.threshold(), 5.0);
+    }
+
+    /// Dropping a pool from the file must not drop a position with it: the
+    /// take-profit and the hold timer are the only things that ever sell it.
+    #[test]
+    fn a_pool_holding_a_position_is_kept_however_the_file_changed() {
+        let (a, b) = (v3_pool("A", 0xa), v3_pool("B", 0xb));
+        let http = Provider::<Http>::try_from("http://127.0.0.1:1").expect("a url");
+        let (reports, _rx) = mpsc::channel(8);
+        let mut inventory = Inventory::default();
+        assert!(inventory.seed(
+            b.base_currency().expect("currencies"),
+            "B",
+            18,
+            ethers::types::U256::from(1_000u64),
+            1.0,
+        ));
+        let mut s = Strategy::new(http, None, inventory, reports);
+        s.watch(a.clone(), 3.0, 1.0, None, None);
+        s.watch(b.clone(), 3.0, 1.0, None, None);
+
+        // B is gone from the file, and A alone is left in it.
+        let cfg = cfg_of(&pool_toml(&a, None));
+        s.retune(&Reload { cfg, pools: vec![a.clone()] });
+        assert!(s.watches.contains_key(&b.pool_ref()), "B holds a position and stays watched");
+
+        // Once it holds nothing, the same reload drops it.
+        let (a2, b2) = (a.clone(), b.clone());
+        let mut s = watching(&[a2.clone(), b2.clone()], 3.0);
+        s.retune(&Reload { cfg: cfg_of(&pool_toml(&a2, None)), pools: vec![a2.clone()] });
+        assert!(!s.watches.contains_key(&b2.pool_ref()), "nothing held, so it is unwatched");
+        assert_eq!(s.watching(), 1);
+    }
 
     fn tick(block: u64, p: f64) -> Tick {
         Tick {

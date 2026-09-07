@@ -205,6 +205,13 @@ async fn main() -> anyhow::Result<()> {
     );
     tracing::info!(pools = strategy.watching(), "watching");
 
+    // What the feed follows. The strategy publishes it after every reload, so
+    // a pool added or dropped changes ONE subscription on the live socket
+    // instead of reconnecting all of them - a reconnect to add one pool is a
+    // gap in every other pool's feed.
+    let (pool_set, pool_set_rx) = tokio::sync::watch::channel(watched.clone());
+    strategy.publishes_pools_to(pool_set);
+
     // One task for all of them, and one backoff. Per pool it was a reconnect
     // storm multiplied by their number against an endpoint already refusing.
     let feeds = tokio::spawn({
@@ -215,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
             let mut backoff = std::time::Duration::from_secs(3);
             loop {
                 let started = std::time::Instant::now();
-                match feed::run_all(watched.clone(), ws.clone(), ticks.clone()).await {
+                match feed::run_all(pool_set_rx.clone(), ws.clone(), ticks.clone()).await {
                     Ok(()) => tracing::warn!("feed closed, reconnecting"),
                     Err(e) => tracing::error!(err = %format!("{e:#}"), "feed error, reconnecting"),
                 }
@@ -236,10 +243,11 @@ async fn main() -> anyhow::Result<()> {
     // Depth one, because a second SIGHUP arriving before the first was applied
     // is the same request twice: the loader reads the file at the moment it
     // sends, so what is queued is never staler than the signal behind it.
-    let (reloads_tx, reloads_rx) = tokio::sync::mpsc::channel::<config::Config>(1);
+    let (reloads_tx, reloads_rx) = tokio::sync::mpsc::channel::<strategy::Reload>(1);
     #[cfg(unix)]
     {
         let path = path.clone();
+        let http = http.clone();
         tokio::spawn(async move {
             let mut hup =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -264,7 +272,23 @@ async fn main() -> anyhow::Result<()> {
                 for field in config::restart_only(&running, &next) {
                     tracing::warn!(field, "changed in the file, but only a restart applies it");
                 }
-                if reloads_tx.send(next).await.is_err() {
+                // Resolved here, off the loop that decides trades: this asks
+                // the chain for decimals, symbols and PoolKeys, and a tick
+                // arriving meanwhile must not wait behind it. One pool that
+                // will not resolve is left out and the rest are still applied.
+                let mut pools = Vec::with_capacity(next.pools.len());
+                for pc in &next.pools {
+                    match pool::Pool::resolve(&http, pc, &next.tokens, Some(manager)).await {
+                        Ok(p) => pools.push(p),
+                        Err(e) => tracing::error!(
+                            pool = %pc.name, err = %format!("{e:#}"),
+                            "could not resolve on reload; leaving it out"
+                        ),
+                    }
+                }
+                // Whatever the chain had to be asked for is worth keeping.
+                cache::flush();
+                if reloads_tx.send(strategy::Reload { cfg: next, pools }).await.is_err() {
                     return;
                 }
             }

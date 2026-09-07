@@ -392,7 +392,13 @@ pub fn restart_only(running: &Config, next: &Config) -> Vec<&'static str> {
     differs("universal_router", running.universal_router == next.universal_router);
     differs("permit2", running.permit2 == next.permit2);
     differs("weth", running.weth == next.weth);
-    differs("tokens", running.tokens == next.tokens);
+    // Additions are fine - a pool added by a reload is resolved against the
+    // new map. What a running process cannot follow is a ticker that MOVED:
+    // every pool and route already resolved is holding the old address.
+    differs(
+        "tokens",
+        running.tokens.iter().all(|(k, v)| next.tokens.get(k) == Some(v)),
+    );
     differs("inventory_path", running.inventory_path == next.inventory_path);
     differs("pool_cache_path", running.pool_cache_path == next.pool_cache_path);
     out
