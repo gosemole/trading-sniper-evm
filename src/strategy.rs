@@ -603,11 +603,6 @@ impl Strategy {
                     cfg.armed_route(key).and_then(|r| r.take_profit_pct),
                     cfg.armed_route(key).and_then(|r| r.exit_after_secs),
                 );
-                if cfg.armed_route(key).is_some() {
-                    warn!(pool = %pc.name,
-                        "watched, but its route cannot be armed while running: no auto-buy from \
-                         this pool until a restart");
-                }
                 applied += 1;
                 set_changed = true;
                 continue;
@@ -673,27 +668,6 @@ impl Strategy {
             }
             applied += 1;
             set_changed = true;
-        }
-        if let Some(exec) = &self.exec {
-            for r in &cfg.routes {
-                let Some(trigger) = r.trigger() else { continue };
-                match exec.set_armed(trigger, r.auto_buy) {
-                    Some(was) if was == r.auto_buy => {}
-                    Some(_) => {
-                        match r.auto_buy {
-                            true => info!(route = %r.name, "ARMED: this route buys again"),
-                            false => warn!(route = %r.name, "DISARMED: this route stops buying; \
-                                           what it holds is still sold"),
-                        }
-                        applied += 1;
-                    }
-                    // Only routes that were armed at startup have a plan, so
-                    // this is a route that has none to flip.
-                    None if r.auto_buy => warn!(route = %r.name,
-                        "cannot be armed while running: arming a route needs a restart"),
-                    None => {}
-                }
-            }
         }
         // Only after the set is settled, and only when it moved: this is what
         // the feed subscribes to, and republishing an unchanged set would make
@@ -1158,7 +1132,7 @@ impl Strategy {
         let Some(exec) = self.exec.clone() else {
             return;
         };
-        let Some(route) = exec.route_for(pool).cloned() else {
+        let Some(route) = exec.route_for(pool) else {
             return;
         };
         let Some(w) = self.watches.get_mut(&pool) else {

@@ -172,6 +172,11 @@ async fn main() -> anyhow::Result<()> {
     if !inv.is_empty() {
         tracing::info!("inventory restored from {}", cfg.inventory_path);
     }
+    // The reload task arms and retunes routes on this same executor - never a
+    // rebuilt one. The nonce, the broadcaster and the fee stream belong to the
+    // process, and handing a buy in flight a second nonce counter is how one
+    // buy is lost.
+    let arming = auto.clone();
     let mut strategy = strategy::Strategy::new(http.clone(), auto, inv, reports_tx);
     // Resolved first, subscribed after: every pool shares one websocket, so
     // there is nothing to open until it is known which pools there are.
@@ -248,6 +253,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let path = path.clone();
         let http = http.clone();
+        let arming = arming.clone();
         tokio::spawn(async move {
             let mut hup =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -285,6 +291,20 @@ async fn main() -> anyhow::Result<()> {
                             "could not resolve on reload; leaving it out"
                         ),
                     }
+                }
+                // Routes first, and on the executor that is already
+                // running: a pool the strategy is about to watch then finds its
+                // route already armed, and one it is about to drop cannot fire
+                // in between. Each route is applied on its own, so one that
+                // will not resolve leaves the others trading.
+                if let Some(exec) = &arming {
+                    let applied = exec.apply_routes(&next).await;
+                    tracing::info!(applied, "routes reloaded");
+                } else if next.routes.iter().any(|r| r.auto_buy) {
+                    tracing::warn!(
+                        "no route was armed at startup, so there is no wallet or broadcaster to \
+                         arm one with; arming needs a restart"
+                    );
                 }
                 // Whatever the chain had to be asked for is worth keeping.
                 cache::flush();

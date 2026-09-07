@@ -53,22 +53,26 @@ use crate::config::Config;
 use crate::execute;
 use crate::strategy::Signal;
 use crate::pool::Pool;
-use crate::route::{format_units, parse_pool_ref, Hop, PoolRef, Route, Token};
+use crate::route::{format_units, Hop, PoolRef, Route, Token};
 use crate::swap;
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, U256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 struct Plan {
     route: Route,
     cooldown: Duration,
+    /// The config entry this was built from. A reload compares against it to
+    /// tell a number that can be changed in place from a PATH that has to be
+    /// resolved and approved again.
+    source: crate::config::RouteConfig,
     /// Whether this route may still BUY. Set from `auto_buy` when the route is
     /// armed and flipped by a config reload, so a route can be stopped without
     /// stopping the process that holds its position.
@@ -126,6 +130,7 @@ fn effectively_unlimited() -> U256 {
 }
 
 /// Everything the model needs to price the route, and when it was true.
+#[derive(Clone)]
 struct RouteState {
     at: Instant,
     hops: Vec<HopState>,
@@ -594,7 +599,14 @@ pub struct Executor {
     /// Sign and send, rather than only reporting what would have been sent.
     execute: bool,
     /// Trigger pool -> what to buy when it drops.
-    plans: HashMap<PoolRef, Plan>,
+    ///
+    /// Behind a lock and handed out as `Arc<Plan>` because a reload edits it
+    /// while trades run: a route added, dropped or retuned replaces its own
+    /// entry and nothing else. A buy that is already pricing holds its plan by
+    /// `Arc` and finishes on the numbers it started with, which is the only
+    /// honest answer - the size was worked out and the money set aside under
+    /// those.
+    plans: std::sync::RwLock<HashMap<PoolRef, Arc<Plan>>>,
     /// Where each pool's liquidity changes, kept current in the background so
     /// a quote can be exact instead of merely cautious. See `TickBook`.
     ticks: TickBook,
@@ -648,87 +660,15 @@ impl Executor {
             done: HashMap::new(),
         };
 
-        let mut plans = HashMap::new();
+        let mut plans: HashMap<PoolRef, Arc<Plan>> = HashMap::new();
         for rc in armed {
-            let weth = cfg.weth.as_deref().map(str::parse).transpose().context("weth")?;
-            let route = Route::resolve(http, manager, rc, &cfg.tokens, weth)
-                .await
-                .with_context(|| format!("auto_buy route '{}'", rc.name))?;
-            // Default to the pool the route ends in: that is the one whose
-            // price the buy is reacting to.
-            let raw = rc
-                .trigger_pool
-                .clone()
-                .unwrap_or_else(|| rc.pools[rc.pools.len() - 1].clone());
-            let trigger = parse_pool_ref(&raw)
-                .with_context(|| format!("route '{}': trigger pool", rc.name))?;
+            let (trigger, plan) =
+                build_plan(http, cfg, rc, manager, router, owner, execute, &mut approve).await?;
             anyhow::ensure!(
                 !plans.contains_key(&trigger),
                 "two auto_buy routes are armed against pool {trigger}; only one can fire"
             );
-
-            // A trigger nobody subscribes to is a route that can never fire.
-            // Not fatal - the pool may be about to be added - but silent
-            // failure is exactly what this is otherwise.
-            let watched = cfg.pools.iter().any(|p| p.pool_ref() == Some(trigger));
-            if !watched {
-                warn!(
-                    route = %rc.name, trigger = ?trigger,
-                    "trigger pool is not in [[pools]], so nothing watches it - this route \
-                     will never fire"
-                );
-            }
-
-            // Also the answer to the question the first sale would otherwise
-            // have to stop and ask - see `Plan::sell_approved`.
-            let sell_approved = preflight(&mut approve, &route).await?;
-            if rc.cooldown_secs == 0 {
-                warn!(
-                    route = %rc.name,
-                    "cooldown_secs = 0: every signal buys, and a dip lasting ten blocks buys \
-                     ten times"
-                );
-            }
-            info!(
-                route = %rc.name,
-                trigger = %trigger,
-                spend = %route.input.symbol,
-                impact_pct = route.impact_pct,
-                buy = %route.output.symbol,
-                slippage_pct = route.max_slippage_pct,
-                cooldown_s = rc.cooldown_secs,
-                mode = if execute { "LIVE" } else { "dry run" },
-                "auto-buy armed"
-            );
-            // Measured now, while nobody is waiting, so the hot path never has
-            // to ask. A route that cannot be estimated yet still gets armed:
-            // the fallback is generous and the next send re-measures.
-            let probe =
-                execute::pending_swap(router, &route, U256::one(), U256::one(), execute::deadline_in(600))?;
-            let gas_limit = match swap::measure_gas(http, owner, &probe).await {
-                Ok(g) => g.min(U256::from(u64::MAX)).as_u64(),
-                Err(e) => {
-                    warn!(route = %rc.name, err = %format!("{e:#}"), gas = GAS_FALLBACK,
-                          "could not measure gas yet; using the fallback");
-                    GAS_FALLBACK
-                }
-            };
-            info!(route = %rc.name, gas_limit, "gas measured");
-
-            plans.insert(
-                trigger,
-                Plan {
-                    route,
-                    cooldown: Duration::from_secs(rc.cooldown_secs),
-                    armed: AtomicBool::new(true),
-                    gas_limit: AtomicU64::new(gas_limit),
-                    yield_ppm: AtomicU64::new(0),
-                    sell_yield_ppm: AtomicU64::new(0),
-                    sell_gas_limit: AtomicU64::new(0),
-                    sell_approved: AtomicBool::new(sell_approved),
-                    state: std::sync::Mutex::new(None),
-                },
-            );
+            plans.insert(trigger, Arc::new(plan));
         }
 
         // Started before the first signal, so the first buy already prices off a
@@ -795,7 +735,7 @@ impl Executor {
             wallet,
             owner,
             execute,
-            plans,
+            plans: std::sync::RwLock::new(plans),
             ticks: TickBook::default(),
             fees,
             submit,
@@ -834,8 +774,8 @@ impl Executor {
                 .await;
                 match head {
                     Ok(at) => {
-                        for plan in me.plans.values() {
-                            if let Err(e) = me.measure_yield(plan, at.as_u64()).await {
+                        for plan in me.plans_now() {
+                            if let Err(e) = me.measure_yield(&plan, at.as_u64()).await {
                                 warn!(route = %plan.route.name, err = %format!("{e:#}"),
                                       "could not measure route yield");
                             }
@@ -885,7 +825,7 @@ impl Executor {
                     }
                 }
                 let mut done = std::collections::HashSet::new();
-                for plan in me.plans.values() {
+                for plan in me.plans_now() {
                     for hop in &plan.route.hops {
                         if !done.insert(hop.pool_ref()) {
                             continue;
@@ -1105,7 +1045,8 @@ impl Executor {
     /// `None` means "do not buy": no measurement, no usable state, or a size
     /// that rounds to nothing.
     pub fn size_for(&self, key: PoolRef, sig: &Signal, cap: U256) -> Option<(U256, Prepared)> {
-        let plan = self.plans.get(&key)?;
+        let plan = self.plan(key)?;
+        let plan = &*plan;
         if !plan.armed.load(Ordering::Relaxed) {
             info!(route = %plan.route.name, "route is disarmed; not sizing this signal");
             return None;
@@ -1242,6 +1183,193 @@ impl Executor {
         self.owner
     }
 
+    /// The plan armed against this pool, held by `Arc` so a reload may replace
+    /// the entry while the caller is still using what it took.
+    ///
+    /// A poisoned lock is treated as "no plan": a panic while the map was being
+    /// edited leaves a bot that must not buy on half a change, and it still
+    /// sells - `route_for` is the same, and a sale reads no more than this.
+    fn plan(&self, key: PoolRef) -> Option<Arc<Plan>> {
+        self.plans.read().ok()?.get(&key).cloned()
+    }
+
+    /// Every plan there is right now, for a background pass that walks all of
+    /// them. Taken as a snapshot so the lock is not held across a network call.
+    fn plans_now(&self) -> Vec<Arc<Plan>> {
+        match self.plans.read() {
+            Ok(plans) => plans.values().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Apply a re-read config's routes to an executor that is already running.
+    ///
+    /// Route by route, and never all or nothing. A route whose path cannot be
+    /// resolved, or whose approval fails, is reported and left as it was; the
+    /// routes beside it are applied and the ones already armed keep buying on
+    /// what they were armed with. Nothing here touches the wallet's nonce, the
+    /// broadcaster or the fee stream - they belong to the process, not to a
+    /// route, and rebuilding them to change one route is how a buy in flight
+    /// gets a nonce handed to it twice.
+    ///
+    /// Three kinds of change, in the order they cost:
+    ///
+    /// * a NUMBER (impact, slippage, cooldown) is swapped in with everything
+    ///   the route has learned carried over - no network, and the route can
+    ///   fire on the very next block;
+    /// * `auto_buy` is a flag, so a route stops or resumes buying at once and
+    ///   keeps its approvals for when it resumes;
+    /// * a PATH is a different trade, so it is resolved, approved and measured
+    ///   from scratch exactly as at startup - and what the old path had
+    ///   measured is deliberately not carried over.
+    ///
+    /// A route deleted from the file is disarmed, never dropped: it may be
+    /// holding a position, and the plan is what prices the sale. Dropping it
+    /// needs a restart, and the log says so.
+    pub async fn apply_routes(&self, cfg: &Config) -> usize {
+        let mut approve = Approver {
+            http: &self.http,
+            wallet: &self.wallet,
+            owner: self.owner,
+            permit2: self.permit2,
+            router: self.router,
+            execute: self.execute,
+            done: HashMap::new(),
+        };
+        let mut applied = 0usize;
+        let mut named: HashSet<PoolRef> = HashSet::new();
+        for rc in &cfg.routes {
+            let Some(trigger) = rc.trigger() else {
+                warn!(route = %rc.name, "no trigger pool that parses; left as it was");
+                continue;
+            };
+            if !named.insert(trigger) {
+                warn!(route = %rc.name, trigger = %trigger,
+                    "a second route against the same pool; only one can fire, so this one is \
+                     left out");
+                continue;
+            }
+            let old = self.plan(trigger);
+            let rebuild = match &old {
+                // Never armed, and now asked for.
+                None => rc.auto_buy,
+                // The path itself changed: what was measured describes pools
+                // this route no longer swaps through.
+                Some(p) => !same_path(&p.source, rc),
+            };
+            if rebuild {
+                // A path is also what prices the SALE of whatever that path
+                // bought: the reversed route, its approvals and its measured
+                // yield all describe those pools. Repointing it under a
+                // position that is still held would sell it through pools it
+                // was never bought through, so the old path stands until the
+                // position is closed. Unreadable balance counts as held - the
+                // conservative half of the guess leaves a working route working.
+                if let Some(old) = &old {
+                    let token = old.route.output.address;
+                    match swap::balance_of(&self.http, token, self.owner).await {
+                        Ok(held) if held.is_zero() => {}
+                        Ok(_) => {
+                            warn!(
+                                route = %rc.name, token = %old.route.output.symbol,
+                                "its path changed, but what the old path bought is still held - \
+                                 that path is what sells it. Left as it was; close the position, \
+                                 or restart"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(
+                                route = %rc.name, err = %format!("{e:#}"),
+                                "its path changed, but the balance it holds could not be read; \
+                                 left as it was"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                match build_plan(
+                    &self.http, cfg, rc, self.manager, self.router, self.owner, self.execute,
+                    &mut approve,
+                )
+                .await
+                {
+                    Ok((key, mut plan)) => {
+                        *plan.armed.get_mut() = rc.auto_buy;
+                        if self.install(key, plan) {
+                            applied += 1;
+                            info!(route = %rc.name, armed = rc.auto_buy, "route (re)armed");
+                        }
+                    }
+                    // The old plan stands. A route that cannot be resolved must
+                    // not leave a half-armed one behind, and the other routes
+                    // have already been applied or are about to be.
+                    Err(e) => error!(
+                        route = %rc.name, err = %format!("{e:#}"),
+                        "could not be armed; it stays exactly as it was and the other routes \
+                         are unaffected"
+                    ),
+                }
+                continue;
+            }
+            let Some(old) = old else { continue };
+            if changed_numbers(&old.source, rc) {
+                info!(
+                    route = %rc.name,
+                    impact_pct = rc.impact_pct,
+                    slippage_pct = rc.max_slippage_pct,
+                    cooldown_s = rc.cooldown_secs,
+                    "retuned in place; what it has measured is kept"
+                );
+                if self.install(trigger, retuned(&old, rc)) {
+                    applied += 1;
+                }
+            }
+            if let Some(was) = self.set_armed(trigger, rc.auto_buy) {
+                if was != rc.auto_buy {
+                    match rc.auto_buy {
+                        true => info!(route = %rc.name, "ARMED: this route buys again"),
+                        false => warn!(route = %rc.name,
+                            "DISARMED: this route stops buying; what it holds is still sold"),
+                    }
+                    applied += 1;
+                }
+            }
+        }
+        // Gone from the file. Disarmed rather than dropped: the plan is what
+        // prices a sale, and a route that bought a position is the only thing
+        // that knows how to sell it back.
+        for plan in self.plans_now() {
+            let Some(trigger) = plan.source.trigger() else { continue };
+            if named.contains(&trigger) {
+                continue;
+            }
+            if plan.armed.swap(false, Ordering::Relaxed) {
+                applied += 1;
+                warn!(route = %plan.route.name,
+                    "no longer in the config: disarmed, and still able to sell what it holds; a \
+                     restart is what drops it");
+            }
+        }
+        applied
+    }
+
+    /// Put a plan in the map, replacing whatever was armed against that pool.
+    fn install(&self, trigger: PoolRef, plan: Plan) -> bool {
+        match self.plans.write() {
+            Ok(mut plans) => {
+                plans.insert(trigger, Arc::new(plan));
+                true
+            }
+            // A panic while the map was being edited. Refusing to write is the
+            // conservative half: the route keeps trading on what it had.
+            Err(_) => {
+                error!(trigger = %trigger, "the plans are locked out; route not changed");
+                false
+            }
+        }
+    }
+
     /// Arm or disarm the route that buys through `trigger`, while it runs.
     ///
     /// Returns what it was, or `None` when no route is armed against that pool:
@@ -1254,14 +1382,13 @@ impl Executor {
     /// a position nobody can put down is worse than one nobody should have
     /// bought.
     pub fn set_armed(&self, trigger: PoolRef, on: bool) -> Option<bool> {
-        let plan = self.plans.get(&trigger)?;
-        Some(plan.armed.swap(on, Ordering::Relaxed))
+        Some(self.plan(trigger)?.armed.swap(on, Ordering::Relaxed))
     }
 
     /// The route armed against this pool, for a caller that needs to trade it
     /// in the other direction.
-    pub fn route_for(&self, key: PoolRef) -> Option<&Route> {
-        self.plans.get(&key).map(|p| &p.route)
+    pub fn route_for(&self, key: PoolRef) -> Option<Route> {
+        self.plan(key).map(|p| p.route.clone())
     }
 
     /// React to one big-sell signal: decide, price, sign, send.
@@ -1280,6 +1407,7 @@ impl Executor {
         let Some((key, plan)) = self.armed_for(pool) else {
             return Ok(None);
         };
+        let plan = &*plan;
         if !self.claim_turn(key, plan, pool).await {
             return Ok(None);
         }
@@ -1391,14 +1519,14 @@ impl Executor {
             }
         };
         let sell = route.reversed();
-        let plan = self.plans.get(&key);
+        let plan = self.plan(key);
         // Two `eth_call`s that answer the same way every time once `--approve`
         // has been run, and answering them here cost a sale two round trips of
         // a moving market. Asked once, cached when the answer is "unlimited",
         // and refreshed in the background after every sale - so a revoked
         // approval is noticed by the pass after the one that used it, and a
         // partial one is never cached at all.
-        let cached = plan.is_some_and(|p| p.sell_approved.load(Ordering::Relaxed));
+        let cached = plan.as_ref().is_some_and(|p| p.sell_approved.load(Ordering::Relaxed));
         if sell.input.address != Address::zero() && !cached {
             let (erc20, p2) =
                 swap::check_approvals(&self.http, sell.input.address, self.owner, self.permit2, self.router)
@@ -1410,7 +1538,7 @@ impl Executor {
                 sell.input.symbol,
                 sell.input.symbol
             );
-            if let Some(p) = plan {
+            if let Some(p) = &plan {
                 let unlimited = erc20 >= effectively_unlimited() && p2 >= effectively_unlimited();
                 p.sell_approved.store(unlimited, Ordering::Relaxed);
             }
@@ -1459,12 +1587,14 @@ impl Executor {
         // needs somewhere to start and starting from nothing costs it fifty
         // requests.
         let ppm = plan
+            .as_ref()
             .map(|p| match p.sell_yield_ppm.load(Ordering::Relaxed) {
                 0 => p.yield_ppm.load(Ordering::Relaxed),
                 m => m,
             })
             .unwrap_or(0);
         let prepared = plan
+            .as_ref()
             .filter(|p| self.unstated_fee_acceptable(p, ppm))
             .and_then(|p| self.prepare(p, &sell, fresh, ppm));
         let hint = prepared
@@ -1556,10 +1686,10 @@ impl Executor {
 
     /// The route armed against this pool, if it is one this signal should act
     /// on at all. Everything it turns down, it says why.
-    fn armed_for(&self, pool: &Pool) -> Option<(PoolRef, &Plan)> {
+    fn armed_for(&self, pool: &Pool) -> Option<(PoolRef, Arc<Plan>)> {
         let fell = pool.base_symbol.as_deref().unwrap_or("?");
         let key = pool.pool_ref();
-        let Some(plan) = self.plans.get(&key) else {
+        let Some(plan) = self.plan(key) else {
             warn!(
                 pool = %pool.name, token = %fell, id = %key,
                 "big sell, but no auto_buy route buys through this pool - not buying"
@@ -1758,7 +1888,7 @@ impl Executor {
     fn refresh_sell(self: &Arc<Self>, key: PoolRef, size: U256) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            let Some(plan) = me.plans.get(&key) else { return };
+            let Some(plan) = me.plan(key) else { return };
             let sell = plan.route.reversed();
             if sell.input.address != Address::zero() {
                 match swap::check_approvals(
@@ -1813,7 +1943,7 @@ impl Executor {
     fn remeasure_gas(self: &Arc<Self>, key: PoolRef, size: U256) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            let Some(plan) = me.plans.get(&key) else { return };
+            let Some(plan) = me.plan(key) else { return };
             // At the size that was just sent. A one-wei probe reverts - the
             // swap returns nothing - so it measured nothing and the limit was
             // always the fallback.
@@ -2153,6 +2283,143 @@ impl Executor {
 /// Returns whether the token this route SELLS is now approved without limit, so
 /// the first sale can skip the two `eth_call`s that ask - see `Plan`'s
 /// `sell_approved`, which is what the answer is kept in.
+/// Whether two config entries describe the same TRADE - the same token in,
+/// through the same pools, triggered by the same one.
+///
+/// Everything else about a route is a number, and a number can be swapped in
+/// without asking the chain anything. This cannot: a different path has
+/// different pools, different approvals and a different gas cost, and carrying
+/// a measurement across it would price the new trade with the old one's fee.
+fn same_path(a: &crate::config::RouteConfig, b: &crate::config::RouteConfig) -> bool {
+    a.input == b.input && a.pools == b.pools && a.trigger_pool == b.trigger_pool
+}
+
+/// Whether anything a running route reads on every buy has been edited.
+fn changed_numbers(a: &crate::config::RouteConfig, b: &crate::config::RouteConfig) -> bool {
+    a.impact_pct != b.impact_pct
+        || a.max_slippage_pct != b.max_slippage_pct
+        || a.cooldown_secs != b.cooldown_secs
+        || a.name != b.name
+}
+
+/// The same route with new numbers, and everything it has learned carried over.
+///
+/// The carrying is the whole point. A plan built fresh reads zero for the
+/// measured yield, and zero means "never measured", which refuses every buy
+/// until the next calibration pass - so retuning one number would silently stop
+/// the route for up to `calibrate_secs`. Gas, approvals and the last pool state
+/// go across for the same reason: they describe the path, and the path has not
+/// changed.
+fn retuned(old: &Plan, rc: &crate::config::RouteConfig) -> Plan {
+    let mut route = old.route.clone();
+    route.name = rc.name.clone();
+    route.impact_pct = rc.impact_pct;
+    route.max_slippage_pct = rc.max_slippage_pct;
+    Plan {
+        route,
+        cooldown: Duration::from_secs(rc.cooldown_secs),
+        source: rc.clone(),
+        armed: AtomicBool::new(old.armed.load(Ordering::Relaxed)),
+        gas_limit: AtomicU64::new(old.gas_limit.load(Ordering::Relaxed)),
+        yield_ppm: AtomicU64::new(old.yield_ppm.load(Ordering::Relaxed)),
+        sell_yield_ppm: AtomicU64::new(old.sell_yield_ppm.load(Ordering::Relaxed)),
+        sell_gas_limit: AtomicU64::new(old.sell_gas_limit.load(Ordering::Relaxed)),
+        sell_approved: AtomicBool::new(old.sell_approved.load(Ordering::Relaxed)),
+        state: std::sync::Mutex::new(old.state.lock().ok().and_then(|s| s.clone())),
+    }
+}
+
+/// Resolve one route into a plan: its path, its approvals, its gas.
+///
+/// Startup and a reload both come through here, so a route armed while the bot
+/// runs is armed exactly as one armed at startup - same approvals, same
+/// measured gas, same warnings. Two of these would drift, and the one that
+/// drifted would be the one nobody was watching.
+///
+/// Every step is a network call or an approval transaction, which is why this
+/// is never called from the loop that decides trades.
+#[allow(clippy::too_many_arguments)]
+async fn build_plan(
+    http: &Provider<Http>,
+    cfg: &Config,
+    rc: &crate::config::RouteConfig,
+    manager: Address,
+    router: Address,
+    owner: Address,
+    execute: bool,
+    approve: &mut Approver<'_>,
+) -> Result<(PoolRef, Plan)> {
+    let weth = cfg.weth.as_deref().map(str::parse).transpose().context("weth")?;
+    let route = Route::resolve(http, manager, rc, &cfg.tokens, weth)
+        .await
+        .with_context(|| format!("auto_buy route '{}'", rc.name))?;
+    // Default to the pool the route ends in: that is the one whose price the
+    // buy is reacting to.
+    let trigger = rc.trigger().with_context(|| format!("route '{}': trigger pool", rc.name))?;
+
+    // A trigger nobody subscribes to is a route that can never fire. Not fatal
+    // - the pool may be about to be added - but silent failure is exactly what
+    // this is otherwise.
+    let watched = cfg.pools.iter().any(|p| p.pool_ref() == Some(trigger));
+    if !watched {
+        warn!(
+            route = %rc.name, trigger = ?trigger,
+            "trigger pool is not in [[pools]], so nothing watches it - this route will never fire"
+        );
+    }
+
+    // Also the answer to the question the first sale would otherwise have to
+    // stop and ask - see `Plan::sell_approved`.
+    let sell_approved = preflight(approve, &route).await?;
+    if rc.cooldown_secs == 0 {
+        warn!(
+            route = %rc.name,
+            "cooldown_secs = 0: every signal buys, and a dip lasting ten blocks buys ten times"
+        );
+    }
+    info!(
+        route = %rc.name,
+        trigger = %trigger,
+        spend = %route.input.symbol,
+        impact_pct = route.impact_pct,
+        buy = %route.output.symbol,
+        slippage_pct = route.max_slippage_pct,
+        cooldown_s = rc.cooldown_secs,
+        mode = if execute { "LIVE" } else { "dry run" },
+        "auto-buy armed"
+    );
+    // Measured now, while nobody is waiting, so the hot path never has to ask.
+    // A route that cannot be estimated yet still gets armed: the fallback is
+    // generous and the next send re-measures.
+    let probe =
+        execute::pending_swap(router, &route, U256::one(), U256::one(), execute::deadline_in(600))?;
+    let gas_limit = match swap::measure_gas(http, owner, &probe).await {
+        Ok(g) => g.min(U256::from(u64::MAX)).as_u64(),
+        Err(e) => {
+            warn!(route = %rc.name, err = %format!("{e:#}"), gas = GAS_FALLBACK,
+                  "could not measure gas yet; using the fallback");
+            GAS_FALLBACK
+        }
+    };
+    info!(route = %rc.name, gas_limit, "gas measured");
+
+    Ok((
+        trigger,
+        Plan {
+            route,
+            cooldown: Duration::from_secs(rc.cooldown_secs),
+            source: rc.clone(),
+            armed: AtomicBool::new(true),
+            gas_limit: AtomicU64::new(gas_limit),
+            yield_ppm: AtomicU64::new(0),
+            sell_yield_ppm: AtomicU64::new(0),
+            sell_gas_limit: AtomicU64::new(0),
+            sell_approved: AtomicBool::new(sell_approved),
+            state: std::sync::Mutex::new(None),
+        },
+    ))
+}
+
 async fn preflight(approve: &mut Approver<'_>, route: &Route) -> Result<bool> {
     // No fixed size to compare against any more: what a buy costs is worked out
     // per signal and bounded by whatever is here. An empty wallet is still worth
@@ -2301,6 +2568,102 @@ impl Approver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn route_cfg(pools: &[&str]) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            name: "buy A".into(),
+            input: "WETH".into(),
+            max_slippage_pct: 4.0,
+            impact_pct: 2.0,
+            pools: pools.iter().map(|p| p.to_string()).collect(),
+            auto_buy: true,
+            trigger_pool: None,
+            take_profit_pct: Some(6.0),
+            exit_after_secs: Some(30),
+            cooldown_secs: 5,
+        }
+    }
+
+    fn token(sym: &str) -> Token {
+        Token { address: Address::from([7u8; 20]), decimals: 18, symbol: sym.into() }
+    }
+
+    fn plan_of(rc: &crate::config::RouteConfig) -> Plan {
+        Plan {
+            route: Route {
+                name: rc.name.clone(),
+                input: token("WETH"),
+                output: token("A"),
+                impact_pct: rc.impact_pct,
+                wrap: None,
+                max_slippage_pct: rc.max_slippage_pct,
+                hops: Vec::new(),
+            },
+            cooldown: Duration::from_secs(rc.cooldown_secs),
+            source: rc.clone(),
+            armed: AtomicBool::new(true),
+            gas_limit: AtomicU64::new(1_234_567),
+            yield_ppm: AtomicU64::new(990_000),
+            sell_yield_ppm: AtomicU64::new(980_000),
+            sell_gas_limit: AtomicU64::new(7_654_321),
+            sell_approved: AtomicBool::new(true),
+            state: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// A number is a number; a PATH is a different trade. Told apart wrongly
+    /// in one direction, a reload re-approves and re-measures a route that did
+    /// not change; in the other, it prices a new path with the old one's
+    /// measured fee - and that one buys.
+    #[test]
+    fn a_new_number_is_not_a_new_path() {
+        let a = route_cfg(&["0xpool1"]);
+
+        let mut numbers = a.clone();
+        numbers.impact_pct = 3.0;
+        numbers.max_slippage_pct = 5.0;
+        numbers.cooldown_secs = 9;
+        assert!(same_path(&a, &numbers), "the same pools, spending the same token");
+        assert!(changed_numbers(&a, &numbers));
+
+        let mut path = a.clone();
+        path.pools = vec!["0xpool2".into()];
+        assert!(!same_path(&a, &path));
+
+        let mut spend = a.clone();
+        spend.input = "USDC".into();
+        assert!(!same_path(&a, &spend), "a different token in is a different trade");
+
+        let mut trigger = a.clone();
+        trigger.trigger_pool = Some("0xpool9".into());
+        assert!(!same_path(&a, &trigger));
+
+        assert!(!changed_numbers(&a, &a.clone()), "an untouched route is not retuned");
+    }
+
+    /// Retuning one number must not stop the route: a plan built fresh reads
+    /// zero for the measured yield, and zero refuses every buy until the next
+    /// calibration pass.
+    #[test]
+    fn retuning_a_number_keeps_what_the_route_has_measured() {
+        let before = route_cfg(&["0xpool1"]);
+        let old = plan_of(&before);
+        old.armed.store(false, Ordering::Relaxed);
+
+        let mut after = before.clone();
+        after.impact_pct = 3.5;
+        after.cooldown_secs = 11;
+        let new = retuned(&old, &after);
+
+        assert_eq!(new.route.impact_pct, 3.5, "the new number is in the route that gets priced");
+        assert_eq!(new.cooldown, Duration::from_secs(11));
+        assert_eq!(new.yield_ppm.load(Ordering::Relaxed), 990_000, "measured yield carried");
+        assert_eq!(new.sell_yield_ppm.load(Ordering::Relaxed), 980_000);
+        assert_eq!(new.gas_limit.load(Ordering::Relaxed), 1_234_567, "measured gas carried");
+        assert_eq!(new.sell_gas_limit.load(Ordering::Relaxed), 7_654_321);
+        assert!(new.sell_approved.load(Ordering::Relaxed), "the approval still stands");
+        assert!(!new.armed.load(Ordering::Relaxed), "a disarmed route is not armed by a retune");
+    }
 
     /// Sizing decides how much money leaves the wallet, so what it must never
     /// do is return a size bigger than asked for. Impact rises with size, and
