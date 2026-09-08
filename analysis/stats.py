@@ -227,10 +227,18 @@ def main():
         # columns above say which field separates; this says whether the
         # combination pays for the launches it throws away, which is the only
         # question a config answers.
-        ("filtered.toml",
+        # Exactly what filtered.toml refuses down to, pair included: on this
+        # data ETH carried +43.0 stakes over 266 launches and every other
+        # token together carried +0.8 over 30.
+        ("filtered.toml (без пары)",
          lambda r: r["exempt"] >= 6
          and r["creator_tax_bps"] == 0
-         and 2 <= r["dev_pct"] <= 15)], rule)
+         and 2 <= r["dev_pct"] <= 15),
+        ("filtered.toml + pairs=[ETH]",
+         lambda r: r["exempt"] >= 6
+         and r["creator_tax_bps"] == 0
+         and 2 <= r["dev_pct"] <= 15
+         and r["pair"] == "ETH")], rule)
 
     a, b = halves(ROWS)
     print(f"\n  выборка пополам по деплойеру: {len(a)} / {len(b)} запусков")
