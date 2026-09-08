@@ -907,6 +907,78 @@ pub async fn watch_curves(
 }
 
 
+/// The chain's clock, from its own block headers.
+///
+/// The sequencer feed carries this too and carries it earlier, which is why it
+/// used to be the only source. But it was the ONLY source, and the tick that
+/// decides things gives up on the first line without it - so every run where
+/// the feed faltered decided nothing at all, silently, while the launches went
+/// past. One overnight run made not one decision for that reason.
+///
+/// Headers arrive after their block is built rather than before, so this is a
+/// later reading of the same boundary than the feed's. That was worth caring
+/// about when the aim was to land inside a particular second of the snipe tax
+/// window and pay 19 basis points instead of 618. It is not worth caring about
+/// now: the entry is the free step, where the tax is zero and stays zero, and
+/// there is no boundary left to hit - only a moment to be after.
+///
+/// So it defers to the feed when the feed is alive, and takes over when it is
+/// not.
+pub async fn watch_heads(
+    ws_url: &str,
+    anchor: std::sync::Arc<std::sync::RwLock<Option<(u64, std::time::Instant)>>>,
+    seconds: std::sync::Arc<std::sync::RwLock<std::collections::BTreeMap<u64, u64>>>,
+) -> Result<()> {
+    use ethers::providers::{Middleware, Provider, Ws};
+    use futures_util::StreamExt;
+
+    let provider = Provider::<Ws>::connect(ws_url)
+        .await
+        .context("connecting for block headers")?;
+    let mut stream = provider
+        .subscribe_blocks()
+        .await
+        .context("subscribing to block headers")?;
+    info!("watching block headers for the chain\'s clock");
+
+    // Blocks land every ~100ms here, so this much silence is a dead socket.
+    const SILENCE: std::time::Duration = std::time::Duration::from_secs(20);
+    // How stale the anchor has to be before this replaces it. The feed sets it
+    // on every turnover, so anything older than a couple of seconds means the
+    // feed is not doing so any more.
+    const DEFER_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let mut heads: u64 = 0;
+    loop {
+        let Ok(next) = tokio::time::timeout(SILENCE, stream.next()).await else {
+            anyhow::bail!("no block header for {}s", SILENCE.as_secs());
+        };
+        let Some(head) = next else { break };
+        heads += 1;
+        let (Some(number), stamped) = (head.number, head.timestamp.as_u64()) else {
+            continue;
+        };
+        let number = number.as_u64();
+        if let Ok(mut s) = seconds.write() {
+            s.insert(number, stamped);
+            while s.len() > 4096 {
+                let Some(&oldest) = s.keys().next() else { break };
+                s.remove(&oldest);
+            }
+        }
+        if let Ok(mut a) = anchor.write() {
+            let stale = a.is_none_or(|(second, at)| {
+                stamped > second && at.elapsed() > DEFER_FOR
+            });
+            if stale {
+                *a = Some((stamped, std::time::Instant::now()));
+            }
+        }
+    }
+    warn!(heads, "the block header stream ended");
+    Ok(())
+}
+
 /// The trades a curve made before anything was listening to it.
 ///
 /// A curve's address does not exist until its launch, so it cannot be in a log

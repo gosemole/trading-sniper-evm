@@ -756,6 +756,39 @@ async fn watch_launches_cmd(
         }
     });
 
+    // The chain's clock, from its own headers. Not an optimisation: without an
+    // anchor the tick that decides things gives up on its first line, and
+    // until now the only thing that set one was the sequencer feed - so a run
+    // where the feed faltered decided nothing at all and said nothing about
+    // it.
+    let heading = tokio::spawn({
+        let ws = cfg.ws_url.clone();
+        let anchor = second_anchor.clone();
+        let seconds = block_seconds.clone();
+        async move {
+            let mut backoff = std::time::Duration::from_secs(3);
+            loop {
+                let started = std::time::Instant::now();
+                match launch::watch_heads(&ws, anchor.clone(), seconds.clone()).await {
+                    Ok(()) => tracing::warn!(
+                        lived_s = started.elapsed().as_secs(),
+                        "block headers ended, reconnecting"
+                    ),
+                    Err(e) => tracing::error!(
+                        lived_s = started.elapsed().as_secs(),
+                        err = %format!("{e:#}"),
+                        "block headers failed, reconnecting"
+                    ),
+                }
+                if started.elapsed() >= std::time::Duration::from_secs(60) {
+                    backoff = std::time::Duration::from_secs(3);
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+            }
+        }
+    });
+
     // The sequencer's own feed, when there is one. A second source for the same
     // launches, heard earlier: it carries signed transactions rather than logs,
     // so it says a launch is coming before the block that carries it exists.
@@ -1929,6 +1962,7 @@ async fn watch_launches_cmd(
         tracing::info!(operators = ops.len(), wallets = ops.wallets(), "operator history saved");
     }
     resolving.abort();
+    heading.abort();
     watching.abort();
     if let Some(f) = feeding {
         f.abort();
