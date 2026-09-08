@@ -129,6 +129,11 @@ impl Policy {
     }
 }
 
+/// TODO(money): this is only ever asked when a trade arrives on the curve.
+/// `hold_blocks` is written for a position nobody is trading and therefore
+/// never fires - the very case it exists for is the one that cannot reach it.
+/// The caller has a tick; the question belongs there too.
+///
 /// Hold it, or let it go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {

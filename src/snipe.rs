@@ -199,13 +199,23 @@ fn price_x1e18(c: &crate::curve::Curve) -> U256 {
     c.quote_reserve * U256::exp10(18) / c.token_reserve
 }
 
-/// Why this launch is not worth following at all, if it is not.
+/// Why this launch is not worth putting money into, if it is not.
 ///
-/// The terms a launch is refused on are known before it has traded: what the
-/// creator takes off both legs, and how many wallets were let in free. Neither
-/// changes, so a launch failing here is not watched, not journalled and not
-/// asked about again - and the same function decides that and the `Skip` in
-/// `decide`, so the two cannot drift apart.
+/// The terms are known before it has traded - what the creator takes off both
+/// legs, how many wallets were let in free, what the maker put in - and none
+/// of them changes. A launch refused here is still followed, journalled and
+/// shadowed; only the buy is withheld. That split is deliberate: the only way
+/// to see the flow these filters look for come back is to have kept the flow
+/// that is not it.
+///
+/// TODO(evidence): every threshold below was measured on one night of 3473
+/// launches, and the composition of the flow changed under them within a day -
+/// creator fees above 300 bps went from 8% of launches to 62%, dev buys under
+/// 2% from 19% to 88%, and the group the whole result rests on from 18% to
+/// 1.3%. The filters are not wrong for that; they refuse the spam correctly.
+/// But the numbers beside each field come from a market that may not be this
+/// one, and they should be re-measured on a fresh week before the size is
+/// raised past the tenth it starts at.
 pub fn refuse_outright(facts: &Facts, p: &Policy) -> Option<String> {
     if facts.creator_tax_bps > p.max_creator_tax_bps {
         return Some(format!(

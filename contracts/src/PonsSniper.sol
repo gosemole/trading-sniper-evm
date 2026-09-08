@@ -58,6 +58,13 @@ pragma solidity ^0.8.26;
  * because it happens within a block of the price that triggered it. Held here,
  * approved here, it is one call.
  *
+ * TODO(untested against reality): every test for this contract runs against a
+ * mock curve written alongside it, so what they prove is that this agrees with
+ * our own model of PonsV2 - which is the same model the bot prices with, and
+ * therefore not independent evidence. The first trade against a real curve is
+ * the first real test. Until one has landed, treat `snipe` and `unwind` as
+ * unverified on chain and keep the size at the tenth `live.toml` starts with.
+ *
  * The cost is that this is no longer empty between trades. Quote assets are
  * still pulled from the owner per buy and every refund goes straight back, so
  * nothing idle accumulates - but an open position sits here until it is sold,

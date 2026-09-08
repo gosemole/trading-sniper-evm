@@ -1,4 +1,4 @@
-# Trading. Everything here is filtered.toml plus the parts that spend money.
+# Trading. The filters, the exit, and the parts that spend money.
 #
 # The filters below gate the BUY, not the watching. Every launch the launchpad
 # emits is still followed and journalled, because the only way to know when the
@@ -12,7 +12,9 @@
 #   WS_URL=... HTTP_URL=... PRIVATE_KEY=... \
 #     ./target/release/trading-mm-fall --watch-launches --config live.toml --execute
 #
-# Without --execute nothing is sent and this behaves exactly like filtered.toml.
+# Without --execute nothing is sent: the same watching, the same journals, the
+# same shadow, and no wallet is even loaded. That is the dry run - there is no
+# separate config for one.
 # With it, three things must all be true or the run refuses to start: the flag,
 # a contract below, and that contract answering that this wallet owns it.
 threshold_pct = 3
@@ -37,7 +39,8 @@ contract = "0x75C1243Da9AF8Bd6b01193de40A8dc4Af75C6cb2"
 # fills have said the same thing the journals do.
 size_x100 = 10
 
-# Every filter, and why, is in filtered.toml - these are the same values.
+# The filters. Each was measured on the journals; the reasoning for each is in
+# the commit that added it and in src/snipe.rs beside the field it sets.
 pairs               = ["ETH"]
 min_exempt          = 6
 max_creator_tax_bps = 0

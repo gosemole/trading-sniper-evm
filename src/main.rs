@@ -489,6 +489,13 @@ struct Trader {
     /// Ours, not the node's. A buy is sent from a task, so the loop cannot ask
     /// what the next one is without waiting - and two buys in the same second
     /// asking the same node get the same answer and collide.
+    ///
+    /// TODO(safety): this assumes nothing else spends from this key. Anything
+    /// that does - a second copy of this bot, a manual `cast send`, the fall
+    /// bot in this same repo - takes a nonce this counter still believes is
+    /// free, and every transaction after it is replaced or rejected. Either
+    /// refuse to start when the pending count has moved under us, or take the
+    /// key exclusively.
     nonce: u64,
     fees: std::sync::Arc<std::sync::RwLock<(ethers::types::U256, ethers::types::U256)>>,
     gas: ethers::types::U256,
@@ -497,6 +504,12 @@ struct Trader {
     open: usize,
     max_open: usize,
     spent: ethers::types::U256,
+    /// TODO(money): counts what is sent to the curve and not what the run
+    /// costs. Gas is not in it, and neither is a reverted buy, which spends
+    /// gas and buys nothing. On a chain this cheap the difference is small,
+    /// but the cap is there for the case where something is wrong - and the
+    /// case where something is wrong is exactly the one where every buy
+    /// reverts and this counter does not move at all.
     max_spend: Option<ethers::types::U256>,
 }
 
@@ -1288,6 +1301,13 @@ async fn watch_launches_cmd(
         );
         tracing::info!(?wrapper, ?owner, "wrapper checked");
 
+        // TODO(money): nothing is recovered at startup. A bot killed holding a
+        // position comes back knowing nothing about it: the wrapper still
+        // holds the tokens, no `Followed` refers to them, and the curve they
+        // came from is not being watched. They sit until somebody notices and
+        // calls `rescue`. The wrapper knows - its balance of each launched
+        // token is the position - so a sweep at startup over the curves in
+        // recent journals would find them and either sell or report them.
         if sending {
             let chain = http.get_chainid().await.context("chain id")?.as_u64();
             let wallet = swap::load_wallet(cfg, chain)?;
@@ -1468,6 +1488,21 @@ async fn watch_launches_cmd(
                 followed.retain(|curve, f| {
                     let keep = f.until > now;
                     if !keep {
+                        // TODO(money): a position still open here is abandoned.
+                        // The exit is only ever asked on a trade, so a curve
+                        // that goes quiet is never sold out of - and a minute
+                        // later this drops the position with the launch. On
+                        // paper that is a shadow that expires unsold; with
+                        // `--execute` it is tokens left in the wrapper that
+                        // only `rescue` can reach, by hand.
+                        //
+                        // Two halves to it: ask `exit::decide` from this tick
+                        // as well as from a trade (the `hold_blocks` rule is
+                        // written for exactly this and never fires), and
+                        // refuse to drop a `Followed` whose position is not
+                        // closed - keep it, keep selling, and let it go when
+                        // it is empty. Must be done before `--execute` runs
+                        // unattended.
                         finish(f);
                         if f.exempt_known && f.outsiders.is_empty() {
                             ops.note_dead(f.operator);

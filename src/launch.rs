@@ -654,6 +654,16 @@ fn launch_in_tx(
     })
 }
 
+/// TODO(dead weight): on this chain the feed buys nothing. Measured over an
+/// hour: it finds the launches - forty a minute, matching the log rate - and
+/// delivers every one of them AFTER the log for the same launch has arrived,
+/// 13 of 14, then 11 of 11, then 22 of 22. It publishes one frame per block,
+/// so there is no pre-block lead to have; `behind_blocks` sits at 1 to 3.
+/// Meanwhile it decodes ~130 transactions a second in the same process that
+/// must decide inside a hundred milliseconds. Either delete it, or keep it
+/// only for a relay that is actually ahead - and measure that before trusting
+/// it. FEED is unset in every config for this reason.
+///
 /// Follow the sequencer's own feed until the connection ends.
 ///
 /// This hears a launch when the sequencer accepts it, which is before the block

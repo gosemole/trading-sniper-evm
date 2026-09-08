@@ -262,18 +262,18 @@ def main():
         ("бандл >= 5", lambda r: r["window_bundled"] >= 5),
         ("creator fee = 0", lambda r: r["creator_tax_bps"] == 0),
         ("dev buy >= 15%", lambda r: r["dev_pct"] >= 15),
-        # What filtered.toml actually refuses down to, in one row. The single
+        # What live.toml actually refuses down to, in one row. The single
         # columns above say which field separates; this says whether the
         # combination pays for the launches it throws away, which is the only
         # question a config answers.
-        # Exactly what filtered.toml refuses down to, pair included: on this
-        # data ETH carried +43.0 stakes over 266 launches and every other
-        # token together carried +0.8 over 30.
-        ("filtered.toml (без пары)",
+        # Pair included, because live.toml names one: on the night's data ETH
+        # carried +43.0 stakes over 266 launches and every other token
+        # together carried +0.8 over 30.
+        ("live.toml (без пары)",
          lambda r: r["exempt"] >= 6
          and r["creator_tax_bps"] == 0
          and 2 <= r["dev_pct"] <= 15),
-        ("filtered.toml + pairs=[ETH]",
+        ("live.toml + pairs=[ETH]",
          lambda r: r["exempt"] >= 6
          and r["creator_tax_bps"] == 0
          and 2 <= r["dev_pct"] <= 15
