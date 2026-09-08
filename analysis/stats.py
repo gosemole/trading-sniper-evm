@@ -202,6 +202,20 @@ def main():
     serial = sorted(((sum(1 for r in ROWS if r['deployer'] == d), d) for d in who),
                     reverse=True)[:3]
     print("  самые частые: " + ", ".join(f"{d[:10]}… x{n}" for n, d in serial))
+    # What a number in this report is. Every column below is one of these two
+    # and nothing else, and reading a stake as ETH or a multiple as a total is
+    # how a result gets quoted at ten times what it was.
+    stake = next((r.get("stake") for r in ROWS if r.get("stake")), None)
+    print("\n  единицы:")
+    print("    СТАВКА  — то, что кладётся в один запуск: доля фантомного резерва")
+    print("              его кривой, заданная size_x100. На ETH-парах при"
+          f" size_x100=100{' это ' + stake + ' ETH' if stake else ''}.")
+    print("    итого   — ставок в плюсе, если положить ПО ОДНОЙ в каждый запуск")
+    print("              группы. +43.8 значит: вложено 296 ставок, вернулось 339.8.")
+    print("    на зап  — то же, делённое на число запусков. +0.148 это +14.8%.")
+    print("    1.07x   — сколько вернулось на единицу вложенного. 1.00x это ноль,")
+    print("              а не прибыль.")
+    print("    win     — доля запусков, закрывшихся выше вложенного.")
     peak = by_deployer(ROWS, lambda r: max(v for _, v in r["path"]))
     # Two numbers about the same paths, and NOT a comparison. The floor is
     # what the best moment of a shuffled path is worth - it applies to "how
