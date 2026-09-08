@@ -138,7 +138,9 @@ def totals(title, groups, rule):
         top10 = sum(win[:10]) / sum(win) * 100 if win else 0.0
         print(f"    {name:<24}{len(g):>5}{net:>+9.1f}{sum(win):>+10.1f}{loss:>+9.1f}"
               f"{max(out, default=0):>+8.1f}{pk:>+9.1f}"
-              f"{(100*net/pk if pk else 0):>7.0f}%{top10:>6.0f}%")
+              # Meaningless unless there was a peak to capture: a share of a
+              # negative number reads as a percentage and is not one.
+              f"{(100*net/pk if pk > 0 else 0):>7.0f}%{top10:>6.0f}%")
 
 
 def halves(rows, seed=7):

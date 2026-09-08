@@ -138,13 +138,18 @@ def replay(path, size_x100, enter_block):
     last_elapsed = None
     for row in lines[1:]:
         kind = row.get("kind")
-        if kind in ("window", "decision", "quote"):
-            continue
+        # Only the records that say what the CHAIN did are read here.
+        # Everything else in a journal is about us - a decision, a quote, a
+        # position closing, a transaction sent - and a new one of those must
+        # never break the analysis. Whitelisting the trades and ignoring the
+        # rest is what makes that true; whitelisting the rest instead is how
+        # adding `done`, `exit` and `sent` threw out 739 journals of 1079 and
+        # left a biased tail that reported a mean peak below one.
         if kind == "graduated":
             graduated = True
             continue
         if kind not in ("buy", "sell", "buyback"):
-            raise Bad(f"unknown record {kind!r}")
+            continue
         if graduated:
             raise Bad("a trade after the curve graduated")
         block = row.get("block", 0)
@@ -172,9 +177,15 @@ def replay(path, size_x100, enter_block):
             want = tr * net // (qr + net)
             if want > spare:
                 want = spare
-            if want != out:
+            # Off by enough to matter. Exact was how the missing bundle buys
+            # were found, and those were out by 8% to 200%; a few wei at a
+            # clamp boundary is arithmetic, and throwing a journal away over
+            # it loses a launch that was priced correctly all along. The bot's
+            # own live check uses the same threshold.
+            off = abs(want - out)
+            if off * 1_000_000 > out:
                 raise Bad(
-                    f"model off by {abs(want - out)} on a buy at +{e}s "
+                    f"model off by {off} on a buy at +{e}s "
                     f"(said {want}, chain paid {out})"
                 )
             qr, tr = qr + net, tr - out
