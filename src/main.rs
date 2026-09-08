@@ -65,6 +65,11 @@ async fn main() -> anyhow::Result<()> {
     let depth_check = args.iter().any(|a| a == "--depth-check");
     let depth_report = args.iter().any(|a| a == "--depth");
     let watch_launches = args.iter().any(|a| a == "--watch-launches");
+    // Every entry the console used to print is a record in the journal - the
+    // entry is `launch`, a step is `decision`, a close is `exit` - so by
+    // default the console says what no record can: how the whole run is
+    // doing. This puts the entries back for a person watching one launch.
+    let verbose = args.iter().any(|a| a == "--verbose");
     // Which launchpads to hear from: comma-separated addresses, or "any" to
     // watch the signature wherever it is emitted.
     let launchpads = flag_value("--launchpad");
@@ -154,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
             snipe_size.as_deref(),
             slippage_bps.as_deref(),
             lead_ms.as_deref(),
+            verbose,
         )
         .await;
     }
@@ -469,6 +475,15 @@ fn opening_curve(
     .ok()
 }
 
+/// One launch entry, for a person watching. Off unless asked for: it is the
+/// same thing the journal's `launch` line already holds, and forty of them a
+/// minute is how the one line that needed reading got lost.
+fn print_entry(verbose: bool, r: &launch::Report) {
+    if verbose {
+        println!("{}", launch::render(r));
+    }
+}
+
 /// The second a block carries, asked of the endpoint.
 ///
 /// The feed gives this earlier and for free, and while it is up nothing here
@@ -594,6 +609,10 @@ async fn watch_launches_cmd(
     size: Option<&str>,
     slippage_bps: Option<&str>,
     lead_ms: Option<&str>,
+    // Print every launch entry, every decision and every close. Off by
+    // default: all three are already records in the journal, and forty of them
+    // a minute is how the one line that needed reading got lost.
+    verbose: bool,
 ) -> anyhow::Result<()> {
     // How long before a step opens a decision is wanted.
     //
@@ -951,39 +970,36 @@ async fn watch_launches_cmd(
         shadow: Option<exit::Held>,
     }
 
-    /// One followed launch, once its minute is up.
-    ///
-    /// The trades are in the file. What is worth a line here is where the
-    /// curve ended up and how far it got on the way, because that is the
-    /// question an entry made at +1s is answered by.
-    fn done_line(curve: ethers::types::Address, f: &Followed) -> String {
+    /// One followed launch, once its minute is up: into the file, not onto
+    /// the console. Everything else the console used to say about a launch is
+    /// already a record - the entry is `launch`, a step is `decision`, a close
+    /// is `exit` - and this was the one line that was not.
+    fn finish(f: &Followed) {
         let opened = f.opening.map(|o| o.quote_reserve).unwrap_or_default();
-        let run = |v: ethers::types::U256| match route::u256_to_f64(opened) {
-            o if o > 0.0 => format!("x{:.2}", route::u256_to_f64(v) / o),
-            _ => "x?".to_string(),
+        let position = match &f.position {
+            snipe::Position::Watching => "never bought".to_string(),
+            snipe::Position::Skipped { why } => format!("skipped: {why}"),
+            snipe::Position::InFlight { step } => format!("in flight from +{step}s"),
+            snipe::Position::Failed { step, why } => format!("failed at +{step}s: {why}"),
+            snipe::Position::Bought { step, .. } => format!("bought at +{step}s"),
         };
-        format!(
-            "    done   {}  {} buys {} sells  peak {}  last {}  {}",
-            launch::short_addr(&curve),
-            f.buys,
-            f.sells,
-            run(f.peak_quote),
-            run(f.curve.quote_reserve),
-            // In words. The derived form prints a spend in raw wei and a
-            // token count in eighteen digits, on a line whose whole job is to
-            // be read at a glance.
-            match &f.position {
-                snipe::Position::Watching => "never bought".to_string(),
-                snipe::Position::Skipped { why } => format!("skipped: {why}"),
-                snipe::Position::InFlight { step } => format!("in flight from +{step}s"),
-                snipe::Position::Failed { step, why } => format!("failed at +{step}s: {why}"),
-                snipe::Position::Bought { step, spend, .. } => format!(
-                    "bought at +{step}s for {}",
-                    launch::amount_of(*spend, f.quote_decimals)
-                ),
-            },
-        )
+        if let Err(e) = journal::append(
+            &f.journal,
+            &journal::done_line(
+                f.buys,
+                f.sells,
+                f.outsiders.len(),
+                f.peak_quote,
+                f.curve.quote_reserve,
+                opened,
+                f.quote_decimals,
+                &position,
+            ),
+        ) {
+            tracing::warn!(err = %format!("{e:#}"), "cannot write the closing line");
+        }
     }
+
     let mut followed: std::collections::HashMap<ethers::types::Address, Followed> =
         std::collections::HashMap::new();
     // Trades that arrived before their curve was being followed. The dev buy
@@ -1115,6 +1131,15 @@ async fn watch_launches_cmd(
     const REMEMBER_BLOCKS: u64 = 5_927_040;
     let mut newest_block = 0u64;
     // How the feed is actually doing, against the logs it is supposed to beat.
+    // What is happening, in numbers, because the entries themselves are all in
+    // the journals and reading them go past says nothing about the whole. Set
+    // `--verbose` to get the entries back on the console.
+    let mut seen_launches: u64 = 0;
+    let mut refused_launches: u64 = 0;
+    let mut shadow_open: u64 = 0;
+    let mut shadow_closed: u64 = 0;
+    let mut shadow_x100: u64 = 0;
+    let mut shadow_wins: u64 = 0;
     let mut heard_from_feed: u64 = 0;
     let mut feed_was_late: u64 = 0;
     let mut feed_told = std::time::Instant::now();
@@ -1209,11 +1234,7 @@ async fn watch_launches_cmd(
                 followed.retain(|curve, f| {
                     let keep = f.until > now;
                     if !keep {
-                        // A curve nobody traded has nothing to report, and
-                        // half of them are that.
-                        if f.buys + f.sells > 0 {
-                            println!("{}", done_line(*curve, f));
-                        }
+                        finish(f);
                         if f.exempt_known && f.outsiders.is_empty() {
                             ops.note_dead(f.operator);
                             ops_dirty = true;
@@ -1227,15 +1248,36 @@ async fn watch_launches_cmd(
                 // Written on a timer rather than on every change: a busy
                 // minute changes it hundreds of times, and the file is only
                 // ever read at startup.
-                if feed_told.elapsed() >= std::time::Duration::from_secs(60) {
+                if feed_told.elapsed() >= std::time::Duration::from_secs(30) {
                     feed_told = std::time::Instant::now();
-                    if heard_from_feed > 0 {
-                        tracing::info!(
-                            heard = heard_from_feed,
-                            too_late = feed_was_late,
-                            "the feed against the logs"
-                        );
-                    }
+                    tracing::info!(
+                        launches = seen_launches,
+                        refused = refused_launches,
+                        following = followed.len(),
+                        bought = shadow_open,
+                        closed = shadow_closed,
+                        // The shadow so far, as a multiple of what it cost.
+                        // Nothing was sent: this is what the rules would have
+                        // returned, and the only running answer there is.
+                        shadow = %match shadow_closed {
+                            0 => "-".to_string(),
+                            n => format!("{}.{:02}x", shadow_x100 / n / 100, shadow_x100 / n % 100),
+                        },
+                        win_pct = match shadow_closed {
+                            0 => 0,
+                            n => 100 * shadow_wins / n,
+                        },
+                        feed_heard = heard_from_feed,
+                        feed_late = feed_was_late,
+                        operators = ops.len(),
+                        "so far"
+                    );
+                    seen_launches = 0;
+                    refused_launches = 0;
+                    shadow_open = 0;
+                    shadow_closed = 0;
+                    shadow_x100 = 0;
+                    shadow_wins = 0;
                     heard_from_feed = 0;
                     feed_was_late = 0;
                 }
@@ -1305,7 +1347,7 @@ async fn watch_launches_cmd(
                         // every launch and on every step of every launch - two
                         // lines of it per launch buried the ones that decide
                         // something. The journal keeps them all.
-                        if !matches!(decision, snipe::Decision::Wait { .. }) {
+                        if verbose && !matches!(decision, snipe::Decision::Wait { .. }) {
                             println!(
                                 "{}",
                                 snipe::render(&signal, &decision, *curve_addr, now.elapsed())
@@ -1340,6 +1382,7 @@ async fn watch_launches_cmd(
                                         };
                                         h.mark(exit::worth(&f.curve, h.tokens));
                                         f.shadow = Some(h);
+                                        shadow_open += 1;
                                         // The position the decision implies.
                                         // Without this every later step of the
                                         // same window asks again and answers
@@ -1404,7 +1447,7 @@ async fn watch_launches_cmd(
                     // about them was still being decided.
                     if followed.get(&at).is_some_and(|f| f.until <= std::time::Instant::now()) {
                         if let Some(f) = followed.remove(&at) {
-                            println!("{}", done_line(at, &f));
+                            finish(&f);
                         }
                         if let Ok(mut w) = watched_curves.write() {
                             w.remove(&at);
@@ -1476,17 +1519,30 @@ async fn watch_launches_cmd(
                         h.mark(exit::worth(&f.curve, h.tokens));
                         let decision = exit::decide(h, &f.curve, block, &exit_policy);
                         if let exit::Exit::Sell { worth, why, .. } = &decision {
-                            println!(
-                                "{}",
-                                exit::render(h, &decision, f.quote_decimals, &f.facts.quote_symbol)
-                            );
+                            if verbose {
+                                println!(
+                                    "{}",
+                                    exit::render(
+                                        h,
+                                        &decision,
+                                        f.quote_decimals,
+                                        &f.facts.quote_symbol
+                                    )
+                                );
+                            }
                             if let Err(e) = journal::append(
                                 &f.journal,
                                 &journal::exit_line(h, *worth, why, block),
                             ) {
                                 tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
                             }
-                            ops.record(f.operator, h.x100(*worth));
+                            let x100 = h.x100(*worth);
+                            shadow_closed += 1;
+                            shadow_x100 += x100;
+                            if x100 > 100 {
+                                shadow_wins += 1;
+                            }
+                            ops.record(f.operator, x100);
                             ops_dirty = true;
                             f.shadow = None;
                         }
@@ -1552,7 +1608,7 @@ async fn watch_launches_cmd(
                     // launch whose minute simply ran out.
                     if matches!(trade, curve::Trade::Completed) {
                         if let Some(f) = followed.remove(&at) {
-                            println!("{}  graduated", done_line(at, &f));
+                            finish(&f);
                         }
                         if let Ok(mut w) = watched_curves.write() {
                             w.remove(&at);
@@ -1671,7 +1727,7 @@ async fn watch_launches_cmd(
                             pending.take().expect("just checked");
                         let marked = call.is_none().then_some("unknown entry point");
                         let pair = launch::pair_of(&p, call.as_ref());
-                        println!("{}", launch::render(&launch::Report {
+                        print_entry(verbose, &launch::Report {
                             created: Some(&p),
                             dev: Some(&l),
                             via: marked,
@@ -1681,7 +1737,7 @@ async fn watch_launches_cmd(
                             tax,
                             lead,
                             refused: refused.as_deref(),
-                        }));
+                        });
                         continue;
                     }
                     // Anything else means the held launch had no dev buy in it.
@@ -1690,7 +1746,7 @@ async fn watch_launches_cmd(
                     {
                         let marked = call.is_none().then_some("unknown entry point");
                         let pair = launch::pair_of(&p, call.as_ref());
-                        println!("{}", launch::render(&launch::Report {
+                        print_entry(verbose, &launch::Report {
                             created: Some(&p),
                             quote: pair.and_then(|t| quotes.get(&t)),
                             call: call.as_ref(),
@@ -1700,7 +1756,7 @@ async fn watch_launches_cmd(
                             refused: refused.as_deref(),
                             via: marked,
                             ..Default::default()
-                        }));
+                        });
                     }
 
                     match l.what {
@@ -1812,6 +1868,10 @@ async fn watch_launches_cmd(
                                 // else reads as data lost rather than as a
                                 // launch deliberately passed over.
                                 refused = snipe::refuse_outright(&facts, &policy);
+                                seen_launches += 1;
+                                if refused.is_some() {
+                                    refused_launches += 1;
+                                }
                                 if let Some(why) = &refused {
                                     // Loud, and on its own line: the entry
                                     // below says it too, but a refusal is what
@@ -1930,7 +1990,7 @@ async fn watch_launches_cmd(
                             } else {
                                 // Nothing else is coming in that transaction,
                                 // so nothing is waited for.
-                                println!("{}", launch::render(&launch::Report {
+                                print_entry(verbose, &launch::Report {
                                     created: Some(&l),
                                     via: marked,
                                     quote: quotes.get(&pair_token),
@@ -1940,13 +2000,13 @@ async fn watch_launches_cmd(
                                     launched_at,
                                     refused: refused.as_deref(),
                                     ..Default::default()
-                                }));
+                                });
                             }
                         }
                         // A dev buy with no launch in front of it: the launch
                         // happened before this process was listening.
                         launch::What::DevBuy { .. } => {
-                            println!("{}", launch::render(&launch::Report {
+                            print_entry(verbose, &launch::Report {
                                 dev: Some(&l),
                                 via: marked,
                                 quote: launch::pair_of(&l, call.as_ref())
@@ -1956,7 +2016,7 @@ async fn watch_launches_cmd(
                                 lead,
                                 launched_at,
                                 ..Default::default()
-                            }));
+                            });
                         }
                     }
                 }
@@ -1968,7 +2028,7 @@ async fn watch_launches_cmd(
                     pending.take().expect("just checked");
                 let marked = call.is_none().then_some("unknown entry point");
                 let pair = launch::pair_of(&p, call.as_ref());
-                println!("{}", launch::render(&launch::Report {
+                print_entry(verbose, &launch::Report {
                     created: Some(&p),
                     via: marked,
                     quote: pair.and_then(|t| quotes.get(&t)),
@@ -1978,7 +2038,7 @@ async fn watch_launches_cmd(
                     launched_at,
                     refused: refused.as_deref(),
                     ..Default::default()
-                }));
+                });
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("ctrl-c received, shutting down");

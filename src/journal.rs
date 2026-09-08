@@ -287,6 +287,46 @@ pub fn exit_line(
     })
 }
 
+/// How a followed launch ended: what happened on it while we watched.
+///
+/// The only thing the console said that no record kept. The trades are all
+/// here individually, but a minute of them is not a thing anyone reads back -
+/// this is the shape of that minute in one line.
+#[allow(clippy::too_many_arguments)]
+pub fn done_line(
+    buys: u32,
+    sells: u32,
+    outsiders: usize,
+    peak_quote: U256,
+    last_quote: U256,
+    opening_quote: U256,
+    quote_decimals: u8,
+    position: &str,
+) -> Value {
+    let run = |v: U256| {
+        if opening_quote.is_zero() {
+            return String::new();
+        }
+        format!(
+            "{}",
+            crate::route::u256_to_f64(v) / crate::route::u256_to_f64(opening_quote)
+        )
+    };
+    json!({
+        "kind": "done",
+        "buys": buys,
+        "sells": sells,
+        // Distinct wallets that bought and were not exempt. None of them means
+        // nobody outside the bundle ever wanted it, and 15% of launches end
+        // that way.
+        "outsiders": outsiders,
+        "peak_run": run(peak_quote),
+        "last_run": run(last_quote),
+        "quote_reserve": crate::route::format_units(last_quote, quote_decimals),
+        "position": position,
+    })
+}
+
 /// Append one line. Opened and closed per line on purpose: a launch writes a
 /// few dozen lines over a minute, and a handle held open across that is a
 /// handle that loses them if the process ends badly.

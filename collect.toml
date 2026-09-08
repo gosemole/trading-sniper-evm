@@ -8,8 +8,12 @@
 #
 # Nothing is sent either way: there is no wallet behind this yet.
 #
-#   WS_URL=... HTTP_URL=... FEED=... \
+#   WS_URL=... HTTP_URL=... \
 #     cargo run --release -- --watch-launches --config collect.toml
+#
+# The console reports how the whole run is doing, once every thirty seconds.
+# Every launch, every decision and every close is a record in the journal
+# already - add --verbose to print them as they happen as well.
 #
 # The pool below is a placeholder; --watch-launches never resolves one.
 threshold_pct = 3

@@ -1511,12 +1511,6 @@ pub fn amount_of(v: U256, decimals: u8) -> String {
     amount(v, decimals)
 }
 
-/// An address, shortened. Public so the loop that decides things can name a
-/// curve without a formatter of its own.
-pub fn short_addr(a: &Address) -> String {
-    short(a)
-}
-
 /// A supply-sized number, short. Public so the loop that decides things can
 /// print one without a formatter of its own.
 pub fn tokens_of(v: U256) -> String {
