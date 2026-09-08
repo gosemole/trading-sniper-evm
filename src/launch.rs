@@ -1081,7 +1081,7 @@ pub async fn watch_heads(
         .subscribe_blocks()
         .await
         .context("subscribing to block headers")?;
-    info!("watching block headers for the chain\'s clock");
+    info!("watching block headers for the chain's clock");
 
     // Blocks land every ~100ms here, so this much silence is a dead socket.
     const SILENCE: std::time::Duration = std::time::Duration::from_secs(20);
@@ -2219,7 +2219,7 @@ mod tests {
         assert_eq!(out, vec![&[0xaa, 0xbb][..], &[0xcc][..]]);
 
         // A length that runs past the end is a truncated frame, not a reason to
-        // read somebody else\'s memory or to panic.
+        // read somebody else's memory or to panic.
         let mut bad = vec![L2_BATCH];
         bad.extend_from_slice(&u64::MAX.to_be_bytes());
         bad.push(L2_SIGNED_TX);
@@ -2294,7 +2294,7 @@ mod tests {
             &mut Funnel::default()
         )
         .is_none());
-        // And somebody else\'s transaction to the same contract is not a launch.
+        // And somebody else's transaction to the same contract is not a launch.
         let other: TypedTransaction = TransactionRequest::new()
             .to(pad)
             .data(vec![0xde, 0xad, 0xbe, 0xef])
@@ -2309,7 +2309,7 @@ mod tests {
         );
     }
 
-    /// The launchpad\'s own numbers, against the curve\'s own arithmetic.
+    /// The launchpad's own numbers, against the curve's own arithmetic.
     ///
     /// `elapsed` is `block.timestamp - launchedAt` and `block.timestamp` is
     /// whole seconds, so this is a staircase and not a curve. Reading it as a
@@ -2329,7 +2329,7 @@ mod tests {
         assert_eq!(snipe_tax_bps(&tax, 4), 0);
 
         // Each step is one shift, and the shift is integer division: 9900 >> 4
-        // is 618 rather than 618.75, which is the contract\'s answer and so is
+        // is 618 rather than 618.75, which is the contract's answer and so is
         // ours.
         assert_eq!(9900u64 >> 4, 618);
         assert_eq!(9900u64 >> 9, 19);
@@ -2402,7 +2402,7 @@ mod tests {
         assert_eq!(line, "+0s 9900 bps, +1s 618 bps, +2s 19 bps, +3s free");
     }
 
-    /// The tax port reads the curve\'s state, so the curve\'s ABI is where its
+    /// The tax port reads the curve's state, so the curve's ABI is where its
     /// assumptions are checked: that these are the names it keeps them under,
     /// that the tax is asked per recipient, and that a buy reports the tax it
     /// was actually charged - which is the only thing that can ever prove the
@@ -2585,7 +2585,7 @@ mod tests {
         assert!(c.exemptions.is_empty());
     }
 
-    /// Somebody else\'s transaction, and a truncated one. Neither is a launch,
+    /// Somebody else's transaction, and a truncated one. Neither is a launch,
     /// and neither may half-decode into one.
     #[test]
     fn foreign_calldata_is_refused() {
@@ -2815,7 +2815,7 @@ mod tests {
             Token::Uint(U256::from(168u64) * U256::exp10(16)),
             Token::Uint(U256::from(42u64) * U256::exp10(17)),
             Token::Uint(U256::from(10_000u64)),
-            Token::Int(U256::MAX - U256::from(59u64)), // -60 in two\'s complement
+            Token::Int(U256::MAX - U256::from(59u64)), // -60 in two's complement
             Token::Bool(true),
         ])]);
         let tokens = ethers::abi::decode(

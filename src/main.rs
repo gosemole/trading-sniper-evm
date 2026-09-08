@@ -278,7 +278,7 @@ impl Trader {
         if let Some(cap) = self.max_spend {
             if self.spent + spend > cap {
                 return Some(format!(
-                    "would spend past this run\'s cap of {}",
+                    "would spend past this run's cap of {}",
                     units::format_units(cap, 18)
                 ));
             }
@@ -1012,6 +1012,10 @@ async fn watch_launches_cmd(
         model_off: bool,
         /// What was actually sent for this position, when something was.
         sent: ethers::types::U256,
+        /// The reserves stopped being the curve's and nothing may be priced
+        /// from them. Set only for a launch that is still holding: anything
+        /// else is dropped outright, which is what this used to do to both.
+        lost: bool,
         /// What the chain actually filled our buy at, once its log has come
         /// back. `None` until then, and `None` forever without `--execute`.
         ///
@@ -1199,6 +1203,9 @@ async fn watch_launches_cmd(
         ops: &mut operators::Operators,
         ops_dirty: &mut bool,
     ) {
+        if f.lost {
+            return;
+        }
         let Some(h) = f.shadow.as_mut() else { return };
         // The high is marked BEFORE the question is asked, or the stop
         // measures a give-back from a peak it has not seen yet.
@@ -1258,7 +1265,7 @@ async fn watch_launches_cmd(
         /// change, and the tokens need a person: `rescue` on the wrapper.
         const SELL_TRIES: u32 = 12;
 
-        if !f.leaving || f.selling || !f.holding() {
+        if !f.leaving || f.selling || !f.holding() || f.lost {
             return;
         }
         let Some(t) = trader else { return };
@@ -1536,7 +1543,7 @@ async fn watch_launches_cmd(
             &ethers::types::Bytes::from(pool::selector("owner()").to_vec()),
         )
         .await
-        .context("reading the wrapper\'s owner")?;
+        .context("reading the wrapper's owner")?;
         // That it is the wrapper at all. An address that answers `owner()`
         // could be anything we ever deployed; only one pointed at this
         // launchpad will let a buy through its own factory check.
@@ -1546,7 +1553,7 @@ async fn watch_launches_cmd(
             &ethers::types::Bytes::from(pool::selector("factory()").to_vec()),
         )
         .await
-        .context("reading the wrapper\'s factory - is this a PonsSniper?")?;
+        .context("reading the wrapper's factory - is this a PonsSniper?")?;
         let ours: ethers::types::Address = launch::PONS_V2_FACTORY.parse()?;
         anyhow::ensure!(
             its_factory == ours,
@@ -2130,7 +2137,7 @@ async fn watch_launches_cmd(
                     }
                     let Some(f) = followed.get_mut(&at) else {
                         // Not following it yet, but told to watch it: this is
-                        // the launch\'s own dev buy, racing its launch log.
+                        // the launch's own dev buy, racing its launch log.
                         if early.len() >= 256 {
                             early.pop_front();
                         }
@@ -2177,9 +2184,33 @@ async fn watch_launches_cmd(
                         }
                     }
                     if let Err(e) = f.curve.apply(&trade) {
-                        // The reserves being followed are not the curve\'s any
+                        // The reserves being followed are not the curve's any
                         // more. Nothing priced from them is worth anything, so
-                        // the curve is dropped rather than carried on with.
+                        // the curve is dropped rather than carried on with -
+                        // unless money of ours is in it. Then dropping the
+                        // record is the one thing that must not happen: it is
+                        // all that knows the position exists, and the only
+                        // address a receipt still in flight can land on. Kept,
+                        // and marked unpriceable, which stops it being sold at
+                        // a floor computed from reserves that are no longer
+                        // the curve's.
+                        //
+                        // TODO(money): re-reading the curve's reserves from
+                        // the chain would make it priceable again and let the
+                        // exit finish on its own. One call, off this path, and
+                        // the position leaves instead of waiting for a person.
+                        if f.holding() {
+                            if !f.lost {
+                                f.lost = true;
+                                tracing::error!(
+                                    curve = ?at, err = %format!("{e:#}"),
+                                    "lost track of a curve holding a position of ours; it \
+                                     cannot be priced and will not be sold - rescue(token, \
+                                     owner) on the wrapper"
+                                );
+                            }
+                            continue;
+                        }
                         tracing::warn!(
                             curve = ?at, err = %format!("{e:#}"),
                             "lost track of a curve; no longer following it"
@@ -2298,7 +2329,7 @@ async fn watch_launches_cmd(
                     };
                     tracing::warn!(
                         schedule = %launch::snipe_tax_line(&next),
-                        "the factory\'s owner changed the snipe tax"
+                        "the factory's owner changed the snipe tax"
                     );
                     tax = Some(next);
                 }
@@ -2309,7 +2340,7 @@ async fn watch_launches_cmd(
                     };
                     tracing::warn!(
                         schedule = %launch::snipe_tax_line(&next),
-                        "the factory\'s owner changed the snipe tax window"
+                        "the factory's owner changed the snipe tax window"
                     );
                     tax = Some(next);
                 }
@@ -2414,7 +2445,15 @@ async fn watch_launches_cmd(
                                     f.position = snipe::Position::Bought {
                                         step,
                                         spend: f.sent,
-                                        tokens: f.expected_tokens,
+                                        // The real fill when its log has come
+                                        // back, which it usually has: the
+                                        // subscription carries it the moment
+                                        // the block exists, and this receipt
+                                        // waited on a poll to find it. When it
+                                        // has not, the model stands in and
+                                        // `ours` corrects the position the
+                                        // moment the log lands.
+                                        tokens: f.filled.unwrap_or(f.expected_tokens),
                                     };
                                 }
                             }
@@ -2771,6 +2810,7 @@ async fn watch_launches_cmd(
                                         refused: refused.clone(),
                                         selling: false,
                                         leaving: false,
+                                        lost: false,
                                         filled: None,
                                         expected_tokens: Default::default(),
                                         sell_next: std::time::Instant::now(),

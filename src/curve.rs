@@ -591,7 +591,7 @@ mod tests {
         .unwrap()
     }
 
-    /// A buy read back off the curve\'s own log lands the reserves exactly
+    /// A buy read back off the curve's own log lands the reserves exactly
     /// where making that buy locally would have.
     ///
     /// This is the whole reason a curve can be followed without asking it
@@ -634,7 +634,7 @@ mod tests {
 
     /// A sell takes the fees off the same leg it pays out on, so the reserve
     /// loses the gross rather than the net. Reading it as the net would leave
-    /// the tracked quote above the curve\'s, and every quote after it too high.
+    /// the tracked quote above the curve's, and every quote after it too high.
     #[test]
     fn a_sell_takes_the_gross_off_the_quote_side() {
         let mut c = opening();
@@ -683,7 +683,7 @@ mod tests {
     }
 
     /// Reserves that cannot absorb a trade are reserves that are no longer the
-    /// curve\'s, and saying so beats quoting from a number already wrong.
+    /// curve's, and saying so beats quoting from a number already wrong.
     #[test]
     fn a_trade_that_does_not_fit_is_an_error_and_not_a_wrap() {
         let mut c = opening();
@@ -813,7 +813,7 @@ mod tests {
         const FEE_BPS: u64 = 100;
 
         // name, graduation threshold, dev spend, creator tax bps, tokens out.
-        // Thresholds and spends are in the quote token\'s own units.
+        // Thresholds and spends are in the quote token's own units.
         let launches: [(&str, U256, U256, u64, &str); 7] = [
             (
                 "SwipeRWA (ETH)",
@@ -960,7 +960,7 @@ mod tests {
 
         // A clamped fill is judged on price, not quantity: asking for the
         // whole quantity at the whole offer still passes, because the price
-        // paid is the price the caller\'s own arguments implied.
+        // paid is the price the caller's own arguments implied.
         assert!(fill.honours(fill.tokens_out, fill.spent));
         // And a price better than the curve can give is refused.
         assert!(!fill.honours(fill.tokens_out * U256::from(2u64), fill.spent));

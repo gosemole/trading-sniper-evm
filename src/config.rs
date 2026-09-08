@@ -422,7 +422,7 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
     );
     if !cfg.snipe.size.trim().is_empty() {
         // Parsed against eighteen decimals only to prove it is a number; the
-        // real parse happens per pair token, in that token\'s own units.
+        // real parse happens per pair token, in that token's own units.
         crate::units::parse_units(cfg.snipe.size.trim(), 18)
             .with_context(|| format!("[snipe] size \"{}\" is not an amount", cfg.snipe.size))?;
     }
