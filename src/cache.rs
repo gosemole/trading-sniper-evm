@@ -138,7 +138,7 @@ pub fn flush() {
         return;
     };
     match res {
-        Ok(true) => tracing::info!("pool cache written"),
+        Ok(true) => tracing::info!("token cache written"),
         Ok(false) => {}
         Err(e) => tracing::warn!(err = %format!("{e:#}"), "could not write the pool cache"),
     }
