@@ -1,0 +1,47 @@
+# Collecting, not trading. Every filter here is open on purpose.
+#
+# A launch that `refuse_outright` passes over is never followed and no journal
+# is opened for it, so the tuned filters in sniper.toml would collect only the
+# launches we already believe in - and a night of those cannot say whether the
+# belief was right. This config follows everything the launchpad emits and
+# writes a file per launch.
+#
+# Nothing is sent either way: there is no wallet behind this yet.
+#
+#   WS_URL=... HTTP_URL=... FEED=... \
+#     cargo run --release -- --watch-launches --config collect.toml
+#
+# The pool below is a placeholder; --watch-launches never resolves one.
+threshold_pct = 3
+
+[[pools]]
+name = "placeholder"
+version = "v3"
+address = "0x0000000000000000000000000000000000000001"
+
+[snipe]
+# A share of each curve's phantom reserve, in hundredths of a percent. Any
+# value above zero is what turns on the curve subscription, the journals and
+# the shadow positions - it is the switch, not just the size.
+size_x100 = 100
+
+# Wide open. These are the numbers the collecting is meant to inform.
+max_creator_tax_bps = 10000
+max_run_x100        = 1000000
+max_exempt          = 100000
+require_dev_buy     = false
+min_dev_buy_x100    = 0
+
+# Off until there is a history worth trusting. Seed one first with
+#   python3 analysis/seed.py launches/ -o operators.json
+# and then raise this to 5 in the config you actually trade on.
+operator_needs = 0
+
+# What the shadow positions are closed by. Left at the measured defaults so the
+# outcomes recorded now are on the same scale as everything after.
+slippage_bps = 100
+max_tax_bps  = 19
+lead_ms      = 100
+trail_bps    = 500
+take_x100    = 200
+hold_blocks  = 588
