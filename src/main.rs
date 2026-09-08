@@ -1516,12 +1516,28 @@ async fn watch_launches_cmd(
                     if let (Some(p), curve::Trade::Buy { tokens_out, .. }) =
                         (curve::predicted_tokens_out(&f.curve, &trade), &trade)
                     {
-                        if p != *tokens_out && !f.model_off {
+                        // Off by enough to matter. The check used to be exact,
+                        // which is how it found the missing bundle buys - those
+                        // were 8% to 200% out. But a few wei at a clamp
+                        // boundary is arithmetic, not drift, and three false
+                        // alarms an hour reading "everything priced from this
+                        // curve is now a guess" teaches the reader to skip the
+                        // line that means it.
+                        let off = p.abs_diff(*tokens_out);
+                        let matters = off.saturating_mul(ethers::types::U256::from(1_000_000u64))
+                            > *tokens_out;
+                        if matters && !f.model_off {
                             f.model_off = true;
                             tracing::warn!(
                                 curve = ?at,
                                 block,
-                                off_by = %launch::tokens_of(p.abs_diff(*tokens_out)),
+                                off_by = %launch::tokens_of(off),
+                                // In parts per million of the fill, because
+                                // the absolute figure means nothing without
+                                // the size beside it.
+                                off_ppm = %(off.saturating_mul(
+                                    ethers::types::U256::from(1_000_000u64)
+                                ) / (*tokens_out).max(ethers::types::U256::one())),
                                 "the model and the chain disagree on a fill; \
                                  everything priced from this curve is now a guess"
                             );
