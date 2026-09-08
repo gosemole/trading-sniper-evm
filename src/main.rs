@@ -926,6 +926,14 @@ async fn watch_launches_cmd(
         model_off: bool,
         /// What was actually sent for this position, when something was.
         sent: ethers::types::U256,
+        /// What the chain actually filled our buy at, once its log has come
+        /// back. `None` until then, and `None` forever without `--execute`.
+        ///
+        /// Everything that decides money prefers this to the model: the model
+        /// is what a threshold was measured on, and this is what the wallet
+        /// holds. The two are journalled side by side so the difference is a
+        /// running measurement rather than an assumption.
+        filled: Option<ethers::types::U256>,
         /// What the buy we sent was priced to fill at. Kept beside `sent`
         /// rather than read off the shadow when the receipt lands, because the
         /// exit can fire on a trade while that buy is still in the air - and
@@ -975,6 +983,115 @@ async fn watch_launches_cmd(
         /// Whether money of ours is still in this curve. See [`holding`].
         fn holding(&self) -> bool {
             holding(self.sent, &self.position)
+        }
+    }
+
+    /// Our own leg of a curve's trade log, when this one is ours.
+    ///
+    /// The receipt says a transaction landed and nothing about what it did.
+    /// The curve's log says exactly what it did, to the wei, and it is already
+    /// being subscribed to for every launch - so the real fill costs nothing
+    /// but recognising the wrapper in a field that is already decoded.
+    ///
+    /// On a buy this replaces the modelled fill everywhere it matters: the
+    /// position, the shadow the exit rules read, and through them the `min_out`
+    /// the sale is sent with - which until now rested on a number the chain had
+    /// never confirmed. On a sale it is the realised result, the first figure
+    /// in this program that is not a model of anything.
+    fn ours(
+        f: &mut Followed,
+        trade: &curve::Trade,
+        wrapper: ethers::types::Address,
+        block: u64,
+        realized: &mut (ethers::types::U256, ethers::types::U256),
+    ) {
+        match trade {
+            curve::Trade::Buy {
+                recipient,
+                quote_in,
+                tokens_out,
+                fee,
+                creator_tax,
+            } if *recipient == wrapper => {
+                if let Err(e) = journal::append(
+                    &f.journal,
+                    &journal::fill_line(
+                        "buy",
+                        block,
+                        *tokens_out,
+                        *quote_in,
+                        *fee,
+                        *creator_tax,
+                        Some((f.expected_tokens, f.sent)),
+                        f.quote_decimals,
+                    ),
+                ) {
+                    tracing::warn!(err = %format!("{e:#}"), "cannot write the fill");
+                }
+                // What the wallet actually parted with, and not merely what
+                // it sent. A buy past the allocation is clamped: the curve
+                // keeps what it needs, and the rest comes back through the
+                // wrapper to the owner. `quote_in` is the kept half - the
+                // curve reports the refund in a separate event, and
+                // `Curve::apply` adds `quote_in` less fees straight to the
+                // reserve, which reconciles to the wei against every recorded
+                // reserve in the journals. A gross figure there would not.
+                // So `sent` minus this is the refund, and this is the outlay.
+                realized.0 += *quote_in;
+                f.filled = Some(*tokens_out);
+                // The position and the rules that will sell it, corrected to
+                // what is actually held. The high is re-marked rather than
+                // carried: it was measured against a token count that has just
+                // been found wrong, and a trailing stop compared with a peak
+                // computed from the wrong quantity is not a stop.
+                if let snipe::Position::Bought { step, spend, .. } = f.position {
+                    f.position = snipe::Position::Bought {
+                        step,
+                        spend,
+                        tokens: *tokens_out,
+                    };
+                }
+                if let Some(h) = f.shadow.as_mut() {
+                    h.tokens = *tokens_out;
+                    h.cost = *quote_in;
+                    h.high = exit::worth(&f.curve, *tokens_out);
+                }
+            }
+            curve::Trade::Sell {
+                seller,
+                tokens_in,
+                quote_out,
+                fee,
+                creator_tax,
+                ..
+            } if *seller == wrapper => {
+                if let Err(e) = journal::append(
+                    &f.journal,
+                    &journal::fill_line(
+                        "sell",
+                        block,
+                        *tokens_in,
+                        *quote_out,
+                        *fee,
+                        *creator_tax,
+                        // Nothing to compare a sale against: it is sent for
+                        // the whole balance rather than for a priced quantity.
+                        None,
+                        f.quote_decimals,
+                    ),
+                ) {
+                    tracing::warn!(err = %format!("{e:#}"), "cannot write the fill");
+                }
+                realized.1 += *quote_out;
+                tracing::info!(
+                    curve = ?f.facts.curve,
+                    out = %launch::amount_of(*quote_out, f.quote_decimals),
+                    r#in = %launch::amount_of(f.sent, f.quote_decimals),
+                    symbol = %f.facts.quote_symbol,
+                    "position closed on chain"
+                );
+            }
+            _ => {}
         }
     }
 
@@ -1074,14 +1191,24 @@ async fn watch_launches_cmd(
             return;
         }
         f.sell_tries += 1;
-        // TODO(money): `tokens` is what the model said the buy would fill at,
-        // not what the wrapper actually holds - the balance is only knowable
-        // from the chain, and asking costs a round trip on the way out. The
-        // slippage allowance absorbs the usual difference, but a curve where
-        // the model has already been caught disagreeing (`model_off`) can put
-        // `min_out` above what the sale can return, and then every retry
-        // reverts for the same reason until the cap gives up. Reading the
-        // balance once, on the first attempt, would settle it.
+        // The sale goes out for the whole balance, so `tokens` sets only the
+        // price we refuse to go below. Once the buy's own log has come back
+        // that is the real holding; before then it is what the model said the
+        // fill would be, and a `min_out` built on a fill the chain never
+        // confirmed can sit above what the sale can actually return - which
+        // reverts, and reverts again on every retry for the same reason.
+        //
+        // Not worth waiting for: an exit that waits for a log is an exit a
+        // block later, and a block is worth more here than the difference
+        // usually is. Said out loud instead, because a run where this appears
+        // next to a stuck position has its explanation in one line.
+        if f.filled.is_none() {
+            tracing::debug!(
+                curve = ?at,
+                "selling before the buy's own log came back; the floor is the \
+                 model's fill and not the wallet's"
+            );
+        }
         let worth = exit::worth(&f.curve, tokens);
         let min_out = worth * ethers::types::U256::from(10_000 - slippage_bps)
             / ethers::types::U256::from(10_000u64);
@@ -1290,6 +1417,11 @@ async fn watch_launches_cmd(
     let mut newest_block = 0u64;
     // The block the exit was last asked about, so it is asked once per block.
     let mut asked_at = 0u64;
+    // What the wallet actually paid and actually got back, in the pair token,
+    // from the curves' own logs. Everything else this program reports is the
+    // model's opinion; this pair is the chain's. Only ETH pairs are traded, so
+    // the two add up.
+    let mut realized = (ethers::types::U256::zero(), ethers::types::U256::zero());
 
     // The wrapper is checked whenever one is configured, whether or not this
     // run may spend anything. A dry run that does not verify the contract is a
@@ -1603,6 +1735,25 @@ async fn watch_launches_cmd(
                         },
                         "the whole run"
                     );
+                    // What the wallet actually did, from the curves' own logs.
+                    // Printed only once something has been sent, because a
+                    // line of zeros beside the shadow reads as a result and is
+                    // not one - it is the absence of a wallet.
+                    if !realized.0.is_zero() {
+                        let (paid, back) = realized;
+                        tracing::info!(
+                            paid = %launch::amount_of(paid, 18),
+                            back = %launch::amount_of(back, 18),
+                            // Gas is not in here. It is paid in the same token
+                            // and never reaches a curve log, so this is the
+                            // trading result and not the wallet's balance.
+                            net = %match back >= paid {
+                                true => format!("+{}", launch::amount_of(back - paid, 18)),
+                                false => format!("-{}", launch::amount_of(paid - back, 18)),
+                            },
+                            "on chain, before gas"
+                        );
+                    }
                     seen_launches = 0;
                     refused_launches = 0;
                     tally.window();
@@ -1924,6 +2075,15 @@ async fn watch_launches_cmd(
                         }
                         curve::Trade::Sell { .. } => f.sells += 1,
                         _ => {}
+                    }
+                    // Ours, when it is ours. The wrapper buys to itself and
+                    // sells from itself, so our own leg arrives through the
+                    // same subscription as everybody else's and carries the
+                    // exact amounts - no receipt to parse and no extra
+                    // request, on a path that has none to spare. This is the
+                    // only place the real fill is ever learnt.
+                    if let Some(mine) = trader.as_ref().map(|t| t.wrapper) {
+                        ours(f, &trade, mine, block, &mut realized);
                     }
                     f.peak_quote = f.peak_quote.max(f.curve.quote_reserve);
                     f.last_block = block;
@@ -2437,6 +2597,7 @@ async fn watch_launches_cmd(
                                         refused: refused.clone(),
                                         selling: false,
                                         leaving: false,
+                                        filled: None,
                                         expected_tokens: Default::default(),
                                         sell_next: std::time::Instant::now(),
                                         sell_tries: 0,

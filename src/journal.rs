@@ -341,6 +341,63 @@ pub fn done_line(
 /// The only record that a decision turned into money. Everything else in a
 /// journal is what the chain did; this is what we did, and without it a file
 /// says a buy was decided on and never says whether it happened.
+/// What the chain actually gave us, beside what the model said it would.
+///
+/// The `sent` line says a transaction landed; it does not say what it did. The
+/// receipt carries no amounts anybody here reads, but the curve's own trade
+/// log does - our buy comes back through the same subscription as everyone
+/// else's, with the wrapper in the recipient field, and it is exact to the wei.
+///
+/// Both numbers are kept because their difference is the only running check on
+/// the model there is: every threshold in the config was measured on fills the
+/// model computed, and this is the first record that says whether those fills
+/// were real. On a buy the modelled amounts are what the decision was priced
+/// at; on a sale there is nothing to compare against and they are absent.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_line(
+    leg: &str,
+    block: u64,
+    tokens: U256,
+    quote: U256,
+    fee: U256,
+    creator_tax: U256,
+    modelled: Option<(U256, U256)>,
+    quote_decimals: u8,
+) -> Value {
+    let q = |v: U256| crate::units::format_units(v, quote_decimals);
+    let t = |v: U256| crate::units::format_units(v, 18);
+    let mut v = json!({
+        "kind": "fill",
+        "leg": leg,
+        "block": block,
+        "tokens": t(tokens),
+        "quote": q(quote),
+        "fee": q(fee),
+        "creator_tax": q(creator_tax),
+    });
+    if let Some((want_tokens, want_quote)) = modelled {
+        // In parts per million of the fill, because the absolute difference
+        // means nothing without the size beside it. Signed, because which way
+        // the model is wrong decides whether a `min_out` built on it is merely
+        // generous or unfillable.
+        let off_ppm = if want_tokens.is_zero() {
+            None
+        } else {
+            let (diff, sign) = if tokens >= want_tokens {
+                (tokens - want_tokens, 1i64)
+            } else {
+                (want_tokens - tokens, -1i64)
+            };
+            let ppm = diff.saturating_mul(U256::from(1_000_000u64)) / want_tokens;
+            Some(sign * i64::try_from(ppm).unwrap_or(i64::MAX))
+        };
+        v["model_tokens"] = json!(t(want_tokens));
+        v["model_quote"] = json!(q(want_quote));
+        v["off_ppm"] = json!(off_ppm);
+    }
+    v
+}
+
 pub fn sent_line(leg: &str, hash: &str, ok: bool, why: &str, nonce: u64) -> Value {
     json!({
         "kind": "sent",
@@ -370,6 +427,86 @@ pub fn append(path: &Path, line: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sign is the whole point of this field: a fill SMALLER than the
+    /// model predicted is the one that puts `min_out` above what a sale can
+    /// return, and reading it as positive would hide exactly that case.
+    #[test]
+    fn a_short_fill_is_recorded_as_a_negative_difference() {
+        let ten = |n: u64| U256::from(n) * U256::exp10(18);
+        let short = fill_line(
+            "buy",
+            1,
+            ten(99),
+            ten(1),
+            U256::zero(),
+            U256::zero(),
+            Some((ten(100), ten(1))),
+            18,
+        );
+        assert_eq!(short["off_ppm"], json!(-10_000));
+
+        let over = fill_line(
+            "buy",
+            1,
+            ten(101),
+            ten(1),
+            U256::zero(),
+            U256::zero(),
+            Some((ten(100), ten(1))),
+            18,
+        );
+        assert_eq!(over["off_ppm"], json!(10_000));
+    }
+
+    /// A sale has nothing to compare against - it is sent for the whole
+    /// balance rather than for a priced quantity - and must not invent one.
+    #[test]
+    fn a_sale_carries_no_comparison() {
+        let v = fill_line(
+            "sell",
+            7,
+            U256::exp10(18),
+            U256::from(500u64),
+            U256::from(5u64),
+            U256::zero(),
+            None,
+            18,
+        );
+        assert_eq!(v["kind"], "fill");
+        assert_eq!(v["leg"], "sell");
+        assert_eq!(v["block"], 7);
+        assert!(v.get("model_tokens").is_none());
+        assert!(v.get("off_ppm").is_none());
+    }
+
+    /// Every amount is a string, and exact. A token amount runs past what a
+    /// JSON number can hold, and this file exists to record those amounts.
+    #[test]
+    fn a_fill_writes_amounts_as_exact_strings() {
+        let odd = U256::from_dec_str("1234567890123456789").unwrap();
+        let v = fill_line("buy", 1, odd, odd, U256::zero(), U256::zero(), None, 18);
+        assert_eq!(v["tokens"], "1.234567890123456789");
+        assert!(v["tokens"].is_string(), "an amount written as a number");
+        assert!(v["quote"].is_string());
+    }
+
+    /// A model that predicted nothing cannot be divided by, and must not
+    /// panic on the path that records a fill.
+    #[test]
+    fn a_model_that_predicted_nothing_reports_no_difference() {
+        let v = fill_line(
+            "buy",
+            1,
+            U256::exp10(18),
+            U256::from(1u64),
+            U256::zero(),
+            U256::zero(),
+            Some((U256::zero(), U256::zero())),
+            18,
+        );
+        assert_eq!(v["off_ppm"], json!(null));
+    }
 
     fn curve() -> crate::curve::Curve {
         crate::curve::Curve {
