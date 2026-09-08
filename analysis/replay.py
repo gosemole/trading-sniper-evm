@@ -218,6 +218,16 @@ def replay(path, size_x100, enter_block):
     # What the launch itself was, all of it knowable before the buy.
     # The tax window, in blocks: three seconds is 30 blocks, and the last of
     # them is the first offset that is certainly past it.
+    # Who this launch names: the deployer, whoever collects the creator fee,
+    # and every wallet exempted from the snipe tax. This is what an operator
+    # is recognised by - the deployer address alone is a fresh one most times.
+    exempt = [w.lower() for w in head.get("exempt", [])]
+    who = sorted(set(exempt + [head["deployer"].lower()]
+                     + ([head["creator_fee_recipient"].lower()]
+                        if head.get("creator_fee_recipient") else [])))
+    outsiders = sorted({row["who"].lower() for row, _, _ in trades
+                        if row["kind"] == "buy" and row["who"].lower() not in exempt})
+
     window_taxed = window_bundled = 0
     dev = 0
     for row, _, off in trades:
@@ -235,6 +245,8 @@ def replay(path, size_x100, enter_block):
         "block": head.get("block"),
         "launched_at": head.get("launched_at"),
         "enter_block": enter_block,
+        "wallets": who,
+        "outsiders": len(outsiders),
         "via": head.get("via", ""),
         "creator_tax_bps": creator_bps,
         "curve_fee_bps": fee_bps,

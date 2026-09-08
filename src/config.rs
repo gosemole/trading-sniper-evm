@@ -415,6 +415,16 @@ pub struct SnipeConfig {
     /// This chain runs 9.8 blocks to the second.
     #[serde(default = "default_hold_blocks")]
     pub hold_blocks: u64,
+
+    /// How many of an operator's positions must have closed before their
+    /// record may refuse a launch of theirs. Zero never refuses on it, which
+    /// is what a fresh store amounts to anyway.
+    #[serde(default = "default_operator_needs")]
+    pub operator_needs: usize,
+    /// Where the operator history lives. It is the only thing this bot keeps
+    /// between runs that cannot be rebuilt from the journals.
+    #[serde(default = "default_operators_path")]
+    pub operators: String,
 }
 
 fn default_slippage_bps() -> u64 {
@@ -450,6 +460,12 @@ fn default_take_x100() -> u64 {
 fn default_hold_blocks() -> u64 {
     588
 }
+fn default_operator_needs() -> usize {
+    5
+}
+fn default_operators_path() -> String {
+    "operators.json".to_string()
+}
 
 impl Default for SnipeConfig {
     fn default() -> Self {
@@ -468,6 +484,8 @@ impl Default for SnipeConfig {
             trail_bps: default_trail_bps(),
             take_x100: default_take_x100(),
             hold_blocks: default_hold_blocks(),
+            operator_needs: default_operator_needs(),
+            operators: default_operators_path(),
         }
     }
 }

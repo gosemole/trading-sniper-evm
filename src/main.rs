@@ -9,6 +9,7 @@ mod feed;
 mod inventory;
 mod journal;
 mod launch;
+mod operators;
 mod pool;
 mod price;
 mod route;
@@ -875,6 +876,12 @@ async fn watch_launches_cmd(
         /// The last block we saw a trade on this curve in, so a position can
         /// be aged in the chain's time rather than in ours.
         last_block: u64,
+        /// Whoever is behind this launch, for filing its outcome under.
+        operator: operators::OpId,
+        /// Distinct wallets that bought and were NOT exempt. A launch that
+        /// never gets one is a launch nobody outside the bundle wanted, and
+        /// 15% of them end that way.
+        outsiders: std::collections::HashSet<ethers::types::Address>,
         /// What the buy decision would have bought, followed to its exit.
         ///
         /// Nothing was sent, so this is not a position - it is the record of
@@ -1005,7 +1012,37 @@ async fn watch_launches_cmd(
         max_exempt: cfg.snipe.max_exempt,
         require_dev_buy: cfg.snipe.require_dev_buy,
         min_dev_buy_x100: cfg.snipe.min_dev_buy_x100,
+        operator_needs: cfg.snipe.operator_needs,
     };
+
+    // Who has launched before, and how it went. The only state this keeps
+    // between runs: everything else can be rebuilt from the chain, and this
+    // cannot.
+    let ops_path = std::path::PathBuf::from(&cfg.snipe.operators);
+    let mut ops = operators::Operators::load(&ops_path)
+        .with_context(|| format!("reading {}", ops_path.display()))?;
+    if ops.is_empty() {
+        tracing::info!(
+            path = %ops_path.display(),
+            "no operator history yet; every launch is a first sighting until \
+             one is built - seed it from the journals with analysis/seed.py"
+        );
+    } else {
+        tracing::info!(
+            operators = ops.len(),
+            wallets = ops.wallets(),
+            needs = cfg.snipe.operator_needs,
+            path = %ops_path.display(),
+            "operator history"
+        );
+    }
+    let mut ops_dirty = false;
+    let mut ops_saved = std::time::Instant::now();
+    // A week of this chain, at 9.8 blocks to the second. An operator nobody
+    // has heard from in a week is not one we are about to meet again, and the
+    // store is the one thing here that grows without an upper bound.
+    const REMEMBER_BLOCKS: u64 = 5_927_040;
+    let mut newest_block = 0u64;
     if size.is_some() {
         tracing::info!(
             max_tax_bps = policy.max_tax_bps,
@@ -1045,12 +1082,30 @@ async fn watch_launches_cmd(
                     let keep = f.until > now;
                     if !keep {
                         println!("{}", done_line(*curve, f));
+                        if f.exempt_known && f.outsiders.is_empty() {
+                            ops.note_dead(f.operator);
+                            ops_dirty = true;
+                        }
                         if let Ok(mut w) = watched_curves.write() {
                             w.remove(curve);
                         }
                     }
                     keep
                 });
+                // Written on a timer rather than on every change: a busy
+                // minute changes it hundreds of times, and the file is only
+                // ever read at startup.
+                if ops_dirty && ops_saved.elapsed() >= std::time::Duration::from_secs(30) {
+                    let gone = ops.forget_before(newest_block.saturating_sub(REMEMBER_BLOCKS));
+                    if gone > 0 {
+                        tracing::info!(gone, "forgot operators nobody has heard from");
+                    }
+                    if let Err(e) = ops.save(&ops_path) {
+                        tracing::warn!(err = %format!("{e:#}"), "cannot write the operator history");
+                    }
+                    ops_dirty = false;
+                    ops_saved = std::time::Instant::now();
+                }
                 for (curve_addr, f) in followed.iter_mut() {
                     let Some(launched_at) = f.launched_at else { continue };
                     // The launch second is not asked about. Its tax is 99%,
@@ -1235,12 +1290,20 @@ async fn watch_launches_cmd(
                         continue;
                     }
                     match &trade {
-                        curve::Trade::Buy { .. } => f.buys += 1,
+                        curve::Trade::Buy { recipient, .. } => {
+                            f.buys += 1;
+                            // Only when the exemption list is actually known:
+                            // an empty one would make every buyer an outsider.
+                            if f.exempt_known && !f.exempt.contains(recipient) {
+                                f.outsiders.insert(*recipient);
+                            }
+                        }
                         curve::Trade::Sell { .. } => f.sells += 1,
                         _ => {}
                     }
                     f.peak_quote = f.peak_quote.max(f.curve.quote_reserve);
                     f.last_block = block;
+                    newest_block = newest_block.max(block);
                     // The shadow, against the curve this trade just made. The
                     // high is marked BEFORE the question is asked, or the stop
                     // measures a give-back from a peak it has not seen yet.
@@ -1258,6 +1321,8 @@ async fn watch_launches_cmd(
                             ) {
                                 tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
                             }
+                            ops.record(f.operator, h.x100(*worth));
+                            ops_dirty = true;
                             f.shadow = None;
                         }
                     }
@@ -1486,7 +1551,23 @@ async fn watch_launches_cmd(
                                         exempt.insert(deployer);
                                     }
                                 }
+                                // Everything this launch names, which is what
+                                // an operator is recognised by. Asked BEFORE
+                                // the launch is filed, so the history it
+                                // returns is the history and not this.
+                                let mut who: Vec<ethers::types::Address> =
+                                    exempt.iter().copied().collect();
+                                if let launch::What::Created { deployer, .. } = l.what {
+                                    who.push(deployer);
+                                }
+                                if let Some(c) = call.as_ref() {
+                                    who.push(c.creator_fee_recipient);
+                                }
+                                let verdict = ops.verdict(&who);
+                                let operator = ops.join(&who, l.block);
+                                ops_dirty = true;
                                 let facts = snipe::Facts {
+                                    operator: verdict,
                                     curve: l.curve,
                                     name: call.as_ref().map(|c| c.name.clone()).unwrap_or_default(),
                                     symbol: call
@@ -1590,6 +1671,8 @@ async fn watch_launches_cmd(
                                         sells: 0,
                                         last_block: l.block,
                                         shadow: None,
+                                        operator,
+                                        outsiders: Default::default(),
                                         peak_quote: opening.quote_reserve,
                                     };
                                     // Whatever already happened on it, in the
@@ -1671,6 +1754,13 @@ async fn watch_launches_cmd(
                 break;
             }
         }
+    }
+    // Last, and unconditionally: a history lost to a shutdown is a history
+    // that has to be rebuilt from the journals.
+    if let Err(e) = ops.save(&ops_path) {
+        tracing::error!(err = %format!("{e:#}"), "cannot write the operator history");
+    } else {
+        tracing::info!(operators = ops.len(), wallets = ops.wallets(), "operator history saved");
     }
     watching.abort();
     if let Some(f) = feeding {

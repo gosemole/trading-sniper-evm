@@ -9,3 +9,9 @@ contracts/out
 contracts/cache
 contracts/lib
 launches/
+
+# The operator history: rebuildable from the journals with analysis/seed.py,
+# and specific to whichever chain and period this ran over.
+operators.json
+operators.json.tmp
+__pycache__/

@@ -71,6 +71,13 @@ pub struct Facts {
     /// phantom reserve, in hundredths of a percent. Their own money is the
     /// only statement of intent available before anyone else has traded.
     pub dev_buy_x100: u64,
+    /// What is known about whoever is behind this, from their previous
+    /// launches. Absent for a first sighting, which most launches are: on one
+    /// night 2797 of 3473 came from an address that never launched again.
+    /// Present far more often than the deployer address alone would suggest,
+    /// because operators are recognised by the wallets around them rather than
+    /// by the address that signed - see [`crate::operators`].
+    pub operator: Option<crate::operators::Verdict>,
     /// How many wallets the launch declared free of the snipe tax. They buy
     /// before anyone else can and sell into whoever comes next, so this is the
     /// single most predictive field there is.
@@ -96,6 +103,9 @@ pub struct Signal<'a> {
 /// What this is willing to do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
+    /// How many of an operator's positions must have closed before their
+    /// record is allowed to refuse a launch. Zero never refuses on it.
+    pub operator_needs: usize,
     /// What to spend, in the pair token's own units.
     pub spend: U256,
     /// How much of the price to give away, in basis points. Must stay below
@@ -204,6 +214,21 @@ pub fn refuse_outright(facts: &Facts, p: &Policy) -> Option<String> {
             p.min_dev_buy_x100 / 100,
             p.min_dev_buy_x100 % 100
         ));
+    }
+    // Last, because it is the only one of these that is about the people
+    // rather than the terms - and the only one that needs a history to have
+    // been kept. On one night the same operator ran 35 launches without a
+    // single one worth holding, behind 35 different deployer addresses.
+    if p.operator_needs > 0 {
+        if let Some(v) = facts.operator.filter(|v| v.is_poor(p.operator_needs)) {
+            return Some(format!(
+                "this operator's last {} positions came back at {}.{:02}x of cost, over {} launches",
+                v.closed,
+                v.median_x100.unwrap_or(0) / 100,
+                v.median_x100.unwrap_or(0) % 100,
+                v.launches,
+            ));
+        }
     }
     None
 }
@@ -349,6 +374,7 @@ mod tests {
 
     fn facts(exempt: usize, creator_tax_bps: u64) -> Facts {
         Facts {
+            operator: None,
             via: "launchAndBuy",
             dev_buy_x100: 500,
             curve: Address::zero(),
@@ -365,6 +391,7 @@ mod tests {
 
     fn policy() -> Policy {
         Policy {
+            operator_needs: 0,
             spend: U256::exp10(17), // 0.1
             slippage_bps: 100,
             max_tax_bps: 19,
@@ -585,4 +612,39 @@ mod tests {
             "a fill at 618 bps would satisfy this minimum"
         );
     }
+    /// A record is only allowed to refuse once there is enough of it, and only
+    /// when it is actually bad. On one night the same operator ran 35 launches
+    /// with nothing worth holding on any of them, behind 35 different deployer
+    /// addresses - this is the only rule here that could have seen that.
+    #[test]
+    fn an_operator_with_a_bad_record_is_passed_over() {
+        let poor = crate::operators::Verdict {
+            launches: 35,
+            dead: 12,
+            closed: 9,
+            median_x100: Option::Some(84),
+        };
+        let good = crate::operators::Verdict {
+            median_x100: Option::Some(140),
+            ..poor
+        };
+        let thin = crate::operators::Verdict { closed: 2, ..poor };
+
+        let p = Policy { operator_needs: 5, ..policy() };
+        let with = |v| Facts { operator: v, ..facts(1, 0) };
+
+        let why = refuse_outright(&with(Option::Some(poor)), &p).expect("should refuse");
+        assert!(why.contains("0.84x"), "{why}");
+        assert_eq!(refuse_outright(&with(Option::Some(good)), &p), None);
+        assert_eq!(
+            refuse_outright(&with(Option::Some(thin)), &p),
+            None,
+            "two closed positions are not a record"
+        );
+        assert_eq!(refuse_outright(&with(None), &p), None, "a stranger is not refused");
+        // Turned off entirely, the record cannot refuse anything.
+        let off = Policy { operator_needs: 0, ..p };
+        assert_eq!(refuse_outright(&with(Option::Some(poor)), &off), None);
+    }
+
 }
