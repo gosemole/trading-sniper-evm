@@ -5,3 +5,7 @@ config.toml
 .claude/settings.local.json
 inventory.json
 pools.json
+contracts/out
+contracts/cache
+contracts/lib
+launches/

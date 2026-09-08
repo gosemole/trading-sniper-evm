@@ -226,36 +226,34 @@ impl Route {
         // where the two first fail to meet.
         let mut wrap = None;
         for (i, raw) in cfg.pools.iter().enumerate() {
-            let (venue, c0, c1, fee, tick_spacing) =
-                match parse_pool_ref(raw)
-                    .with_context(|| format!("route '{}': hop {i}", cfg.name))?
-                {
-                    PoolRef::V4(pool_id) => {
-                        let (c0, c1, fee, ts, hooks) = v4_pool_key(http, manager, pool_id)
-                            .await
-                            .with_context(|| {
-                                format!("route '{}': hop {i}: could not recover PoolKey", cfg.name)
-                            })?;
-                        // The whole v4 design rests on this check: a matching
-                        // hash proves all five fields, so nothing is a guess.
-                        let rederived = pool_id_from_key(c0, c1, fee, ts, hooks);
-                        anyhow::ensure!(
-                            rederived == pool_id,
-                            "route '{}': hop {i}: recovered PoolKey hashes to {rederived:?}, \
-                             not {pool_id:?}",
-                            cfg.name
-                        );
-                        (Venue::V4 { pool_id, hooks }, c0, c1, fee, ts)
-                    }
-                    // v3 needs no such proof: the pool contract answers for
-                    // itself, and the address in config is what we call.
-                    PoolRef::V3(pool) => {
-                        let (c0, c1, fee, ts) = v3_pool_key(http, pool).await.with_context(|| {
-                            format!("route '{}': hop {i}: {pool:?} is not a v3 pool", cfg.name)
+            let (venue, c0, c1, fee, tick_spacing) = match parse_pool_ref(raw)
+                .with_context(|| format!("route '{}': hop {i}", cfg.name))?
+            {
+                PoolRef::V4(pool_id) => {
+                    let (c0, c1, fee, ts, hooks) =
+                        v4_pool_key(http, manager, pool_id).await.with_context(|| {
+                            format!("route '{}': hop {i}: could not recover PoolKey", cfg.name)
                         })?;
-                        (Venue::V3 { pool }, c0, c1, fee, ts)
-                    }
-                };
+                    // The whole v4 design rests on this check: a matching
+                    // hash proves all five fields, so nothing is a guess.
+                    let rederived = pool_id_from_key(c0, c1, fee, ts, hooks);
+                    anyhow::ensure!(
+                        rederived == pool_id,
+                        "route '{}': hop {i}: recovered PoolKey hashes to {rederived:?}, \
+                             not {pool_id:?}",
+                        cfg.name
+                    );
+                    (Venue::V4 { pool_id, hooks }, c0, c1, fee, ts)
+                }
+                // v3 needs no such proof: the pool contract answers for
+                // itself, and the address in config is what we call.
+                PoolRef::V3(pool) => {
+                    let (c0, c1, fee, ts) = v3_pool_key(http, pool).await.with_context(|| {
+                        format!("route '{}': hop {i}: {pool:?} is not a v3 pool", cfg.name)
+                    })?;
+                    (Venue::V3 { pool }, c0, c1, fee, ts)
+                }
+            };
 
             // Paying in WETH for a pool that holds native ETH: the router
             // unwraps on the way in, so the PATH starts at the zero address
@@ -325,7 +323,6 @@ impl Route {
             hops,
         })
     }
-
 }
 
 impl Route {
@@ -449,9 +446,10 @@ impl Route {
         let mut out_hops = Vec::with_capacity(self.hops.len());
 
         for (i, hop) in self.hops.iter().enumerate() {
-            let reader = crate::depth::TickReader::new(http, hop.tick_source(manager), hop.tick_spacing)
-                .map(|r| r.at_block(at))
-                .with_context(|| format!("hop {i}: bad tick spacing"))?;
+            let reader =
+                crate::depth::TickReader::new(http, hop.tick_source(manager), hop.tick_spacing)
+                    .map(|r| r.at_block(at))
+                    .with_context(|| format!("hop {i}: bad tick spacing"))?;
             let state = crate::depth::read_state(&reader)
                 .await
                 .with_context(|| format!("hop {i}: could not read pool state"))?;
@@ -554,9 +552,16 @@ mod tests {
     }
 
     fn two_hop() -> Route {
-        let tok = |b, d, s: &str| Token { address: addr(b), decimals: d, symbol: s.into() };
+        let tok = |b, d, s: &str| Token {
+            address: addr(b),
+            decimals: d,
+            symbol: s.into(),
+        };
         let hop = |c0: u8, c1: u8, i: u8, o: u8, di, dobs| Hop {
-            venue: Venue::V4 { pool_id: H256::from([c0 + c1; 32]), hooks: addr(0xee) },
+            venue: Venue::V4 {
+                pool_id: H256::from([c0 + c1; 32]),
+                hooks: addr(0xee),
+            },
             currency0: addr(c0),
             currency1: addr(c1),
             fee: 3477,
@@ -604,7 +609,10 @@ mod tests {
             .expect_err("the native currency is for gas");
         let said = format!("{e:#}");
         assert!(said.contains("native currency"), "{said}");
-        assert!(said.contains("weth"), "the refusal has to name the way round it: {said}");
+        assert!(
+            said.contains("weth"),
+            "the refusal has to name the way round it: {said}"
+        );
     }
 
     #[test]
@@ -615,7 +623,6 @@ mod tests {
         assert_eq!(back.input.symbol, "C", "sells what the route bought");
         assert_eq!(back.output.symbol, "A");
 
-
         // Same pools, opposite order, and every hop flipped end to end.
         let ids: Vec<_> = back.hops.iter().map(|h| h.pool_ref()).collect();
         let mut want: Vec<_> = r.hops.iter().map(|h| h.pool_ref()).collect();
@@ -625,12 +632,17 @@ mod tests {
         assert_eq!(back.hops[0].output, r.hops[1].input);
         assert_eq!(back.hops[0].input_decimals, 18);
         assert_eq!(back.hops[0].output_decimals, 8);
-        assert_eq!(back.hops[1].output, r.input.address, "ends where it started");
+        assert_eq!(
+            back.hops[1].output, r.input.address,
+            "ends where it started"
+        );
 
         // The PoolKey itself is untouched, so the ids still describe it.
         for (a, b) in back.hops.iter().zip(r.hops.iter().rev()) {
-            assert_eq!((a.currency0, a.currency1, a.fee, a.tick_spacing, &a.venue),
-                       (b.currency0, b.currency1, b.fee, b.tick_spacing, &b.venue));
+            assert_eq!(
+                (a.currency0, a.currency1, a.fee, a.tick_spacing, &a.venue),
+                (b.currency0, b.currency1, b.fee, b.tick_spacing, &b.venue)
+            );
         }
         // ...and the direction flag follows from input == currency0.
         assert_eq!(back.hops[0].zero_for_one(), !r.hops[1].zero_for_one());
@@ -643,8 +655,15 @@ mod tests {
         assert_eq!(there_and_back.input.address, r.input.address);
         assert_eq!(there_and_back.output.address, r.output.address);
         assert_eq!(
-            there_and_back.hops.iter().map(|h| (h.pool_ref(), h.input, h.output)).collect::<Vec<_>>(),
-            r.hops.iter().map(|h| (h.pool_ref(), h.input, h.output)).collect::<Vec<_>>()
+            there_and_back
+                .hops
+                .iter()
+                .map(|h| (h.pool_ref(), h.input, h.output))
+                .collect::<Vec<_>>(),
+            r.hops
+                .iter()
+                .map(|h| (h.pool_ref(), h.input, h.output))
+                .collect::<Vec<_>>()
         );
     }
 

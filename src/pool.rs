@@ -1,7 +1,7 @@
 use crate::config::PoolConfig;
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
-use ethers::types::{Address, Bytes, Filter, Log, TransactionRequest, H256, U256, ValueOrArray};
+use ethers::types::{Address, Bytes, Filter, Log, TransactionRequest, ValueOrArray, H256, U256};
 use ethers::utils::keccak256;
 use std::collections::HashMap;
 
@@ -12,8 +12,7 @@ const V3_SWAP_SIG: &str = "Swap(address,address,int256,int256,uint160,uint128,in
 const V4_SWAP_SIG: &str = "Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)";
 
 /// Canonical V4 PoolManager `Initialize` signature.
-const V4_INIT_SIG: &str =
-    "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)";
+const V4_INIT_SIG: &str = "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)";
 
 /// topic0 of the given event signature.
 pub fn event_topic(sig: &str) -> H256 {
@@ -59,9 +58,9 @@ pub fn resolve_token(tokens: &HashMap<String, String>, s: &str) -> Result<Addres
         Some(addr) => addr
             .parse()
             .with_context(|| format!("ticker '{s}' maps to invalid address '{addr}'")),
-        None => s.parse().with_context(|| {
-            format!("'{s}' is neither a ticker in [tokens] nor a 0x address")
-        }),
+        None => s
+            .parse()
+            .with_context(|| format!("'{s}' is neither a ticker in [tokens] nor a 0x address")),
     }
 }
 
@@ -75,7 +74,7 @@ fn sorted(a: Address, b: Address) -> (Address, Address) {
     }
 }
 
-fn selector(sig: &str) -> Bytes {
+pub fn selector(sig: &str) -> Bytes {
     let h = keccak256(sig.as_bytes());
     Bytes::from(h[..4].to_vec())
 }
@@ -227,13 +226,9 @@ impl Pool {
             ),
             None => (None, None),
         };
-        let base_token = resolve_base_token(
-            &cfg.name,
-            cfg.base_token,
-            sym0.as_deref(),
-            sym1.as_deref(),
-        )
-        .with_context(|| format!("pool '{}'", cfg.name))?;
+        let base_token =
+            resolve_base_token(&cfg.name, cfg.base_token, sym0.as_deref(), sym1.as_deref())
+                .with_context(|| format!("pool '{}'", cfg.name))?;
         let (base_symbol, quote_symbol) = if base_token == 1 {
             (sym1.clone(), sym0.clone())
         } else {
@@ -256,7 +251,6 @@ impl Pool {
                 "no currencies resolved; raw price only (movement % unaffected)"
             ),
         }
-
 
         Ok(Self {
             name: cfg.name.clone(),
@@ -496,7 +490,9 @@ fn derive_pool_id(cfg: &PoolConfig, tokens: &HashMap<String, String>) -> Result<
 pub fn seed_cache_from_config(pools: &[PoolConfig], tokens: &HashMap<String, String>) -> usize {
     let mut seeded = 0;
     for cfg in pools.iter().filter(|p| p.version == "v4") {
-        let Ok(key) = key_from_config(cfg, tokens) else { continue };
+        let Ok(key) = key_from_config(cfg, tokens) else {
+            continue;
+        };
         let derived = pool_id_from_key(
             key.currency0,
             key.currency1,
@@ -572,8 +568,11 @@ fn classify(msg: &str) -> Option<Refused> {
     {
         return Some(Refused::TooWide);
     }
-    if m.contains("unavailable") || m.contains("not available") || m.contains("pruned")
-        || m.contains("missing trie") || m.contains("too old")
+    if m.contains("unavailable")
+        || m.contains("not available")
+        || m.contains("pruned")
+        || m.contains("missing trie")
+        || m.contains("too old")
     {
         return Some(Refused::TooOld);
     }
@@ -708,7 +707,10 @@ pub async fn v4_pool_key(
     }
     let log = find_init_log(http, manager, pool_id).await?;
     let block = log.block_number.map(|b| b.as_u64()).unwrap_or_default();
-    anyhow::ensure!(log.topics.len() >= 4, "Initialize log missing currency topics");
+    anyhow::ensure!(
+        log.topics.len() >= 4,
+        "Initialize log missing currency topics"
+    );
     let c0 = Address::from_slice(&log.topics[2].as_bytes()[12..]);
     let c1 = Address::from_slice(&log.topics[3].as_bytes()[12..]);
     let d = &log.data.0;
@@ -732,7 +734,12 @@ pub async fn v4_pool_key(
          not to {pool_id:?} - refusing to use it"
     );
     tracing::info!(
-        block, ?c0, ?c1, fee, tick_spacing, ?hooks,
+        block,
+        ?c0,
+        ?c1,
+        fee,
+        tick_spacing,
+        ?hooks,
         "recovered v4 PoolKey from Initialize log"
     );
     crate::cache::put_v4_pool(
@@ -881,7 +888,11 @@ pub async fn symbol_of(http: &Provider<Http>, currency: Address) -> Result<Strin
         .data(selector("symbol()"));
     let res: Bytes = crate::rpc::retrying("eth_call symbol()", || {
         let tx = tx.clone();
-        async move { http.call(&tx.into(), None).await.context("eth_call symbol()") }
+        async move {
+            http.call(&tx.into(), None)
+                .await
+                .context("eth_call symbol()")
+        }
     })
     .await?;
     anyhow::ensure!(res.len() >= 32, "short return for symbol()");
@@ -927,7 +938,12 @@ async fn remember_symbol(http: &Provider<Http>, currency: Address, symbol: &str)
 async fn call_uint(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<u32> {
     let res: Bytes = crate::rpc::retrying("eth_call uint", || {
         let tx = TransactionRequest::new().to(to).data(data.clone());
-        async move { provider.call(&tx.into(), None).await.context("eth_call uint") }
+        async move {
+            provider
+                .call(&tx.into(), None)
+                .await
+                .context("eth_call uint")
+        }
     })
     .await?;
     anyhow::ensure!(res.len() >= 32, "short return for uint call");
@@ -937,7 +953,12 @@ async fn call_uint(provider: &Provider<Http>, to: Address, data: &Bytes) -> Resu
 async fn call_address(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<Address> {
     let res: Bytes = crate::rpc::retrying("eth_call address", || {
         let tx = TransactionRequest::new().to(to).data(data.clone());
-        async move { provider.call(&tx.into(), None).await.context("eth_call address") }
+        async move {
+            provider
+                .call(&tx.into(), None)
+                .await
+                .context("eth_call address")
+        }
     })
     .await?;
     anyhow::ensure!(res.len() >= 32, "short return for address call");
@@ -1020,7 +1041,10 @@ mod tests {
 
     #[test]
     fn a_name_written_as_a_pair_is_read_base_first() {
-        assert_eq!(named_pair("ROBLOXIANS/RBLX (v4)"), Some(("ROBLOXIANS", "RBLX")));
+        assert_eq!(
+            named_pair("ROBLOXIANS/RBLX (v4)"),
+            Some(("ROBLOXIANS", "RBLX"))
+        );
         assert_eq!(named_pair("PONS/WETH (v3)"), Some(("PONS", "WETH")));
         assert_eq!(named_pair("CAMELTOE/LULU"), Some(("CAMELTOE", "LULU")));
         // Not a pair, so not a claim: these must not be checked against.
@@ -1052,8 +1076,14 @@ mod tests {
     fn without_a_pair_name_nothing_is_inferred() {
         // No claim, no symbols, or only one symbol: fall back to what was
         // configured, and to token0 when that is absent too.
-        assert_eq!(resolve_base_token("the deep pool", None, Some("A"), Some("B")).unwrap(), 0);
-        assert_eq!(resolve_base_token("the deep pool", Some(1), Some("A"), Some("B")).unwrap(), 1);
+        assert_eq!(
+            resolve_base_token("the deep pool", None, Some("A"), Some("B")).unwrap(),
+            0
+        );
+        assert_eq!(
+            resolve_base_token("the deep pool", Some(1), Some("A"), Some("B")).unwrap(),
+            1
+        );
         assert_eq!(resolve_base_token("A/B", None, None, Some("B")).unwrap(), 0);
         assert_eq!(resolve_base_token("A/B", Some(1), None, None).unwrap(), 1);
     }
@@ -1087,7 +1117,9 @@ mod tests {
     #[test]
     fn resolves_tickers_and_raw_addresses() {
         let t = registry();
-        let pools: Address = "0x385b36ff682ab4c76e7c37a66b96aabc466471d5".parse().unwrap();
+        let pools: Address = "0x385b36ff682ab4c76e7c37a66b96aabc466471d5"
+            .parse()
+            .unwrap();
         assert_eq!(resolve_token(&t, "POOLS").unwrap(), pools);
         // tickers are matched case-insensitively
         assert_eq!(resolve_token(&t, "pools").unwrap(), pools);
@@ -1097,7 +1129,11 @@ mod tests {
             pools
         );
         assert_eq!(
-            resolve_token(&HashMap::new(), "0x0000000000000000000000000000000000000000").unwrap(),
+            resolve_token(
+                &HashMap::new(),
+                "0x0000000000000000000000000000000000000000"
+            )
+            .unwrap(),
             Address::zero()
         );
         // an unknown ticker is an error, not a silent zero address
@@ -1170,13 +1206,22 @@ mod tests {
             tick_spacing: Some(60),
             hooks: None,
         };
-        assert_eq!(seed_cache_from_config(std::slice::from_ref(&spelled), &t), 1);
+        assert_eq!(
+            seed_cache_from_config(std::slice::from_ref(&spelled), &t),
+            1
+        );
 
         // And it comes back out under its own hash, which is exactly how a
         // route hop asks for it.
         let id = derive_pool_id(&spelled, &t).unwrap();
         let got = crate::cache::v4_pool(id, |k| {
-            pool_id_from_key(k.currency0, k.currency1, k.fee, k.tick_spacing, k.hooks.unwrap_or_default())
+            pool_id_from_key(
+                k.currency0,
+                k.currency1,
+                k.fee,
+                k.tick_spacing,
+                k.hooks.unwrap_or_default(),
+            )
         })
         .expect("filed under its own hash");
         assert_eq!(got.fee, 3000);
@@ -1190,7 +1235,11 @@ mod tests {
         assert_eq!(seed_cache_from_config(std::slice::from_ref(&lying), &t), 0);
 
         // A pool that spells nothing out is simply not a source.
-        let bare = PoolConfig { fee: None, tick_spacing: None, ..spelled };
+        let bare = PoolConfig {
+            fee: None,
+            tick_spacing: None,
+            ..spelled
+        };
         assert_eq!(seed_cache_from_config(std::slice::from_ref(&bare), &t), 0);
 
         std::fs::remove_file(&path).ok();

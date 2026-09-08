@@ -11,9 +11,9 @@
 //! uncertainty from reading state a block late.
 
 use anyhow::{Context, Result};
+use ethers::abi::{decode, encode, ParamType, Token as AbiToken};
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::{Address, Bytes, TransactionRequest, H256, U256};
-use ethers::abi::{decode, encode, ParamType, Token as AbiToken};
 use ethers::utils::keccak256;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -216,7 +216,10 @@ impl<'a> TickReader<'a> {
         let Source::V4 { manager, .. } = self.source else {
             anyhow::bail!("only a v4 pool's bitmap can be read in one batch");
         };
-        let slots: Vec<U256> = positions.iter().filter_map(|w| self.bitmap_slot(*w)).collect();
+        let slots: Vec<U256> = positions
+            .iter()
+            .filter_map(|w| self.bitmap_slot(*w))
+            .collect();
         anyhow::ensure!(slots.len() == positions.len(), "not every word has a slot");
         self.prefetch(&slots).await;
         let mut out = Vec::with_capacity(slots.len());
@@ -266,11 +269,7 @@ impl<'a> TickReader<'a> {
             .http
             .request(
                 "eth_getStorageAt",
-                (
-                    format!("0x{addr:x}"),
-                    format!("0x{slot:064x}"),
-                    self.tag(),
-                ),
+                (format!("0x{addr:x}"), format!("0x{slot:064x}"), self.tag()),
             )
             .await
             .context("eth_getStorageAt")?;
@@ -303,7 +302,9 @@ impl<'a> TickReader<'a> {
     /// falls back to reading one slot at a time, which is what this did before
     /// and is never wrong, only slower.
     async fn prefetch(&self, slots: &[U256]) {
-        let Source::V4 { manager, .. } = self.source else { return };
+        let Source::V4 { manager, .. } = self.source else {
+            return;
+        };
         if !self.batched {
             return;
         }
@@ -352,7 +353,9 @@ impl<'a> TickReader<'a> {
             res.0.len(),
             slots.len()
         );
-        Ok((0..slots.len()).map(|i| H256::from_slice(&body[i * 32..(i + 1) * 32])).collect())
+        Ok((0..slots.len())
+            .map(|i| H256::from_slice(&body[i * 32..(i + 1) * 32]))
+            .collect())
     }
 
     /// Fetch everything one scan could need, in two requests instead of thirty.
@@ -372,7 +375,9 @@ impl<'a> TickReader<'a> {
     /// ticks in one window while a swap crosses two or three; reading them all
     /// would trade round trips for bandwidth without being asked to.
     async fn prefetch_scan(&self, start_word: i32, up: bool, max_words: u32) {
-        let Source::V4 { manager, .. } = self.source else { return };
+        let Source::V4 { manager, .. } = self.source else {
+            return;
+        };
         /// Ticks read ahead per scan. Comfortably past what a swap sized by
         /// this bot crosses, and bounded so an unusual pool cannot blow the
         /// request up.
@@ -389,16 +394,22 @@ impl<'a> TickReader<'a> {
         if !fresh {
             return;
         }
-        let positions: Vec<i32> =
-            (0..max_words as i32).map(|i| start_word + if up { i } else { -i }).collect();
-        let window: Vec<U256> = positions.iter().filter_map(|w| self.bitmap_slot(*w)).collect();
+        let positions: Vec<i32> = (0..max_words as i32)
+            .map(|i| start_word + if up { i } else { -i })
+            .collect();
+        let window: Vec<U256> = positions
+            .iter()
+            .filter_map(|w| self.bitmap_slot(*w))
+            .collect();
         self.prefetch(&window).await;
 
         // Set bits, in the order the scan will meet them, so the cap keeps the
         // ticks that are actually about to be crossed.
         let mut ticks = Vec::new();
         for (pos, slot) in positions.iter().zip(&window) {
-            let Some(w) = self.cached(manager, *slot) else { continue };
+            let Some(w) = self.cached(manager, *slot) else {
+                continue;
+            };
             let word = U256::from_big_endian(w.as_bytes());
             let bits: Box<dyn Iterator<Item = u32>> = match up {
                 true => Box::new(0..256u32),
@@ -424,7 +435,9 @@ impl<'a> TickReader<'a> {
     /// What reading one bitmap word costs on a pool with no batch storage read
     /// of its own - the call itself, so it can be asked for in advance.
     fn bitmap_call(&self, word_pos: i32) -> Option<(Address, Vec<u8>)> {
-        let Source::V3 { pool } = &self.source else { return None };
+        let Source::V3 { pool } = &self.source else {
+            return None;
+        };
         let mut data = selector("tickBitmap(int16)").to_vec();
         data.extend_from_slice(&signed_word(word_pos as i64));
         Some((*pool, data))
@@ -432,7 +445,9 @@ impl<'a> TickReader<'a> {
 
     /// The same for one tick's data.
     fn tick_call(&self, tick: i32) -> Option<(Address, Vec<u8>)> {
-        let Source::V3 { pool } = &self.source else { return None };
+        let Source::V3 { pool } = &self.source else {
+            return None;
+        };
         let mut data = selector("ticks(int24)").to_vec();
         data.extend_from_slice(&signed_word(tick as i64));
         Some((*pool, data))
@@ -468,7 +483,9 @@ impl<'a> TickReader<'a> {
         }
         let at = self.at.map(ethers::types::BlockId::from);
         let out = crate::rpc::retrying("eth_call", || {
-            let tx = TransactionRequest::new().to(to).data(Bytes::from(data.clone()));
+            let tx = TransactionRequest::new()
+                .to(to)
+                .data(Bytes::from(data.clone()));
             async move { self.http.call(&tx.into(), at).await.context("eth_call") }
         })
         .await?;
@@ -552,7 +569,9 @@ impl<'a> TickReader<'a> {
 
         let at = self.at.map(ethers::types::BlockId::from);
         let res = crate::rpc::retrying("multicall3", || {
-            let tx = TransactionRequest::new().to(target).data(Bytes::from(data.clone()));
+            let tx = TransactionRequest::new()
+                .to(target)
+                .data(Bytes::from(data.clone()));
             async move { self.http.call(&tx.into(), at).await.context("multicall3") }
         })
         .await?;
@@ -605,7 +624,9 @@ impl<'a> TickReader<'a> {
             Source::V4 { manager, pool_id } => {
                 let base = Self::v4_base(*pool_id) + U256::from(BITMAP_OFFSET);
                 let slot = mapping_slot(&signed_word(word_pos as i64), base);
-                Ok(U256::from_big_endian(self.storage(*manager, slot).await?.as_bytes()))
+                Ok(U256::from_big_endian(
+                    self.storage(*manager, slot).await?.as_bytes(),
+                ))
             }
         }
     }
@@ -802,7 +823,10 @@ impl TickWindow {
         };
         for edge in ordered {
             match edge.net {
-                Some(net) => rungs.push(Rung { sqrt: edge.sqrt, net }),
+                Some(net) => rungs.push(Rung {
+                    sqrt: edge.sqrt,
+                    net,
+                }),
                 None => {
                     // Liquidity holds right up to here - there is no other tick
                     // between, or it would be in this list - and what happens
@@ -927,7 +951,11 @@ const MAX_UNBATCHED_WORDS: i64 = 16;
 /// and returned a single word for every widely spaced pool - a window
 /// guaranteeing nothing, which `crosses` would then have answered from.
 fn window_words(spacing: i32, batched: bool) -> i32 {
-    let cap = if batched { MAX_WINDOW_WORDS } else { MAX_UNBATCHED_WORDS };
+    let cap = if batched {
+        MAX_WINDOW_WORDS
+    } else {
+        MAX_UNBATCHED_WORDS
+    };
     let per_word = spacing.max(1) as f64 * 256.0;
     let wanted = ((1.0 + WINDOW_SPAN).ln() / 1.0001f64.ln() / per_word).ceil() as i64;
     // Never past the range a tick can be in - beyond it there is nothing to
@@ -983,7 +1011,10 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
             // One request for all of them where the chain has a batching
             // contract; the reads below then find every word in hand. Without
             // one they simply happen individually, as they always did.
-            let calls: Vec<_> = positions.iter().filter_map(|w| reader.bitmap_call(*w)).collect();
+            let calls: Vec<_> = positions
+                .iter()
+                .filter_map(|w| reader.bitmap_call(*w))
+                .collect();
             reader.prefetch_calls(&calls).await;
             let mut out = Vec::with_capacity(positions.len());
             for w in &positions {
@@ -1040,13 +1071,17 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
         }
     };
     if first < last {
-        let slots: Vec<U256> =
-            found[first..last].iter().filter_map(|(t, _)| reader.tick_slot(*t)).collect();
+        let slots: Vec<U256> = found[first..last]
+            .iter()
+            .filter_map(|(t, _)| reader.tick_slot(*t))
+            .collect();
         reader.prefetch(&slots).await;
         // And the same for a pool that has no storage to batch: its ticks are
         // view calls, and a batching contract can carry all of them at once.
-        let calls: Vec<_> =
-            found[first..last].iter().filter_map(|(t, _)| reader.tick_call(*t)).collect();
+        let calls: Vec<_> = found[first..last]
+            .iter()
+            .filter_map(|(t, _)| reader.tick_call(*t))
+            .collect();
         reader.prefetch_calls(&calls).await;
     }
     let mut nets = Vec::with_capacity(last.saturating_sub(first));
@@ -1072,7 +1107,11 @@ pub async fn tick_window(reader: &TickReader<'_>, sqrt_p: f64) -> Result<TickWin
     let (ladder_lo, ladder_hi) = match (first < last, found.is_empty()) {
         (true, _) => (
             if first == 0 { lo } else { found[first].1 },
-            if last == found.len() { hi } else { found[last - 1].1 },
+            if last == found.len() {
+                hi
+            } else {
+                found[last - 1].1
+            },
         ),
         // No ticks anywhere in the window: nothing to cross, so any walk inside
         // it is exact with an empty ladder. True of a pool provided across its
@@ -1129,7 +1168,14 @@ pub async fn pay_to_move(
 
     let target = move_target(sqrt_p_now, base_token, move_pct);
     let rungs = rungs_towards(reader, sqrt_p_now, target).await?;
-    pay_to_move_along(sqrt_p_now, liquidity_now, base_token, move_pct, lp_fee_pips, &rungs)
+    pay_to_move_along(
+        sqrt_p_now,
+        liquidity_now,
+        base_token,
+        move_pct,
+        lp_fee_pips,
+        &rungs,
+    )
 }
 
 /// Where a `move_pct` move of the base token's price ends, as a sqrt price.
@@ -1148,18 +1194,17 @@ pub fn move_target(sqrt_p_now: f64, base_token: u8, move_pct: f64) -> f64 {
 ///
 /// Stops before the target: a tick sitting exactly at it is not crossed, and
 /// the walk clamps there anyway.
-async fn rungs_towards(
-    reader: &TickReader<'_>,
-    sqrt_from: f64,
-    sqrt_to: f64,
-) -> Result<Vec<Rung>> {
+async fn rungs_towards(reader: &TickReader<'_>, sqrt_from: f64, sqrt_to: f64) -> Result<Vec<Rung>> {
     let up = sqrt_to > sqrt_from;
     let mut tick = tick_at_sqrt(sqrt_from);
     let mut out = Vec::new();
     // The bound is generous: a 100% move at spacing 1 is ~6900 ticks, and
     // initialized ticks are far sparser.
     for _ in 0..1_000 {
-        let Some(t) = reader.next_initialized(tick, up, reader.scan_words()).await? else {
+        let Some(t) = reader
+            .next_initialized(tick, up, reader.scan_words())
+            .await?
+        else {
             break;
         };
         let sqrt = sqrt_at_tick(t);
@@ -1167,7 +1212,10 @@ async fn rungs_towards(
         if past {
             break;
         }
-        out.push(Rung { sqrt, net: reader.liquidity_net(t).await? });
+        out.push(Rung {
+            sqrt,
+            net: reader.liquidity_net(t).await?,
+        });
         tick = if up { t } else { t - 1 };
     }
     Ok(out)
@@ -1232,7 +1280,11 @@ pub fn pay_to_move_along(
     // Each iteration covers one tick segment, and every one of them either
     // consumes a rung or reaches the target, so this cannot run away.
     loop {
-        let done = if up { sqrt_cur >= sqrt_target } else { sqrt_cur <= sqrt_target };
+        let done = if up {
+            sqrt_cur >= sqrt_target
+        } else {
+            sqrt_cur <= sqrt_target
+        };
         if done {
             break;
         }
@@ -1240,7 +1292,11 @@ pub fn pay_to_move_along(
         // Price of the next initialized tick, clamped to the target.
         let sqrt_edge = match next {
             Some(r) => {
-                if up { r.sqrt.min(sqrt_target) } else { r.sqrt.max(sqrt_target) }
+                if up {
+                    r.sqrt.min(sqrt_target)
+                } else {
+                    r.sqrt.max(sqrt_target)
+                }
             }
             None => sqrt_target,
         };
@@ -1253,7 +1309,11 @@ pub fn pay_to_move_along(
                 liquidity * (1.0 / sqrt_edge - 1.0 / sqrt_cur)
             };
         }
-        let reached_target = if up { sqrt_edge >= sqrt_target } else { sqrt_edge <= sqrt_target };
+        let reached_target = if up {
+            sqrt_edge >= sqrt_target
+        } else {
+            sqrt_edge <= sqrt_target
+        };
         sqrt_cur = sqrt_edge;
         if reached_target {
             break;
@@ -1613,9 +1673,15 @@ pub async fn swap_exact_in(
     for _ in 0..MAX_WALK_TICKS {
         match swap_exact_in_along(state, zero_for_one, amount_in, &rungs, Beyond::Unknown)? {
             Walk::Done(r) => return Ok(r),
-            Walk::NeedsRung => match reader.next_initialized(tick, up, reader.scan_words()).await? {
+            Walk::NeedsRung => match reader
+                .next_initialized(tick, up, reader.scan_words())
+                .await?
+            {
                 Some(t) => {
-                    rungs.push(Rung { sqrt: sqrt_at_tick(t), net: reader.liquidity_net(t).await? });
+                    rungs.push(Rung {
+                        sqrt: sqrt_at_tick(t),
+                        net: reader.liquidity_net(t).await?,
+                    });
                     tick = if up { t } else { t - 1 };
                 }
                 // The scan found nothing further, so nothing further changes
@@ -1649,7 +1715,13 @@ mod tests {
     /// with.
     fn window(ticks: &[i32], lo: i32, hi: i32) -> TickWindow {
         TickWindow {
-            edges: ticks.iter().map(|t| Edge { sqrt: sqrt_at_tick(*t), net: None }).collect(),
+            edges: ticks
+                .iter()
+                .map(|t| Edge {
+                    sqrt: sqrt_at_tick(*t),
+                    net: None,
+                })
+                .collect(),
             lo: sqrt_at_tick(lo),
             hi: sqrt_at_tick(hi),
             whole: false,
@@ -1664,7 +1736,10 @@ mod tests {
         TickWindow {
             edges: ticks
                 .iter()
-                .map(|(t, n)| Edge { sqrt: sqrt_at_tick(*t), net: Some(*n) })
+                .map(|(t, n)| Edge {
+                    sqrt: sqrt_at_tick(*t),
+                    net: Some(*n),
+                })
                 .collect(),
             lo: sqrt_at_tick(lo),
             hi: sqrt_at_tick(hi),
@@ -1703,10 +1778,22 @@ mod tests {
         // Read out to +/-600, known to be there out to +/-6000.
         let w = TickWindow {
             edges: vec![
-                Edge { sqrt: at(-6000), net: None },
-                Edge { sqrt: at(-600), net: Some(5) },
-                Edge { sqrt: at(600), net: Some(-3) },
-                Edge { sqrt: at(6000), net: None },
+                Edge {
+                    sqrt: at(-6000),
+                    net: None,
+                },
+                Edge {
+                    sqrt: at(-600),
+                    net: Some(5),
+                },
+                Edge {
+                    sqrt: at(600),
+                    net: Some(-3),
+                },
+                Edge {
+                    sqrt: at(6000),
+                    net: None,
+                },
             ],
             lo: at(-60000),
             hi: at(60000),
@@ -1715,12 +1802,32 @@ mod tests {
             ladder_hi: at(600),
         };
 
-        let up = w.ladder_from(at(0), true).expect("the near ticks were read");
-        assert_eq!(up.rungs, vec![Rung { sqrt: at(600), net: -3 }]);
-        assert_eq!(up.bound, at(6000), "bounded by the first tick nobody looked up");
+        let up = w
+            .ladder_from(at(0), true)
+            .expect("the near ticks were read");
+        assert_eq!(
+            up.rungs,
+            vec![Rung {
+                sqrt: at(600),
+                net: -3
+            }]
+        );
+        assert_eq!(
+            up.bound,
+            at(6000),
+            "bounded by the first tick nobody looked up"
+        );
 
-        let down = w.ladder_from(at(0), false).expect("the near ticks were read");
-        assert_eq!(down.rungs, vec![Rung { sqrt: at(-600), net: 5 }]);
+        let down = w
+            .ladder_from(at(0), false)
+            .expect("the near ticks were read");
+        assert_eq!(
+            down.rungs,
+            vec![Rung {
+                sqrt: at(-600),
+                net: 5
+            }]
+        );
         assert_eq!(down.bound, at(-6000));
     }
 
@@ -1734,7 +1841,10 @@ mod tests {
         // real range rather than an empty one.
         let w = laddered(&[(-600, 5), (0, 7), (600, -3)], -6000, 6000);
         let got = w.ladder_from(sqrt_at_tick(0), true).expect("walkable");
-        assert!(!got.rungs.is_empty(), "zero rungs everywhere is what refused every price");
+        assert!(
+            !got.rungs.is_empty(),
+            "zero rungs everywhere is what refused every price"
+        );
     }
 
     /// A pool provided across its whole range has NO initialized ticks near
@@ -1793,7 +1903,10 @@ mod tests {
             protocol_fee_0for1: 0,
             protocol_fee_1for0: 0,
         };
-        let rungs = [Rung { sqrt: 2.000_1, net: -100_000_000 }];
+        let rungs = [Rung {
+            sqrt: 2.000_1,
+            net: -100_000_000,
+        }];
         let bounded =
             swap_exact_in_along(state, false, 50_000.0, &rungs, Beyond::HoldsUntil(4.0)).unwrap();
         let open =
@@ -1813,12 +1926,22 @@ mod tests {
         let w = laddered(&[(-600, 5), (0, 7), (600, -3)], -6000, 6000);
         let (lo, hi) = w.span();
         let (llo, lhi) = w.ladder_span();
-        assert_eq!((lo, hi), (llo, lhi), "the ladder must reach the window's own edges");
+        assert_eq!(
+            (lo, hi),
+            (llo, lhi),
+            "the ladder must reach the window's own edges"
+        );
 
         // And a walk anywhere inside it has rungs.
         for tick in [-5000, -600, 0, 600, 5000] {
-            assert!(w.ladder_from(sqrt_at_tick(tick), true).is_some(), "at tick {tick}");
-            assert!(w.ladder_from(sqrt_at_tick(tick), false).is_some(), "at tick {tick}");
+            assert!(
+                w.ladder_from(sqrt_at_tick(tick), true).is_some(),
+                "at tick {tick}"
+            );
+            assert!(
+                w.ladder_from(sqrt_at_tick(tick), false).is_some(),
+                "at tick {tick}"
+            );
         }
     }
 
@@ -1843,8 +1966,14 @@ mod tests {
             &encoded,
         )
         .unwrap();
-        let AbiToken::Array(got) = &out[0] else { panic!("not an array") };
-        assert_eq!(got.len(), 3, "one answer per call, or the pairing is guesswork");
+        let AbiToken::Array(got) = &out[0] else {
+            panic!("not an array")
+        };
+        assert_eq!(
+            got.len(),
+            3,
+            "one answer per call, or the pairing is guesswork"
+        );
 
         let answers: Vec<Option<Vec<u8>>> = got
             .iter()
@@ -1857,7 +1986,10 @@ mod tests {
             })
             .collect();
         assert_eq!(answers[0], Some(vec![1, 2, 3]));
-        assert_eq!(answers[1], None, "a call that reverted has no answer to cache");
+        assert_eq!(
+            answers[1], None,
+            "a call that reverted has no answer to cache"
+        );
         assert_eq!(answers[2], Some(vec![9]));
     }
 
@@ -1889,16 +2021,28 @@ mod tests {
         // Read, and genuinely nothing around the price: the walk may go as far
         // as the scan looked.
         let empty = laddered(&[], -6000, 6000);
-        let up = empty.ladder_from(at(0), true).expect("read and empty is an answer");
+        let up = empty
+            .ladder_from(at(0), true)
+            .expect("read and empty is an answer");
         assert!(up.rungs.is_empty());
-        assert_eq!(up.bound, at(6000), "nothing to cross, so as far as it looked");
+        assert_eq!(
+            up.bound,
+            at(6000),
+            "nothing to cross, so as far as it looked"
+        );
 
         // Positions known, effects not: the walk may go up to the first of
         // them and no further.
         let bare = window(&[-600, 600], -6000, 6000);
-        let up = bare.ladder_from(at(0), true).expect("what is between here and 600 is known");
+        let up = bare
+            .ladder_from(at(0), true)
+            .expect("what is between here and 600 is known");
         assert!(up.rungs.is_empty(), "nothing crossable was read");
-        assert_eq!(up.bound, at(600), "and it stops at the tick nobody looked up");
+        assert_eq!(
+            up.bound,
+            at(600),
+            "and it stops at the tick nobody looked up"
+        );
         let down = bare.ladder_from(at(0), false).expect("the other way too");
         assert_eq!(down.bound, at(-600));
 
@@ -1918,13 +2062,28 @@ mod tests {
 
         // Up from a tick sitting exactly on an edge: that edge is behind us.
         let up = w.rungs_towards(at(0), at(1200)).unwrap();
-        assert_eq!(up, vec![Rung { sqrt: at(600), net: -3 }]);
+        assert_eq!(
+            up,
+            vec![Rung {
+                sqrt: at(600),
+                net: -3
+            }]
+        );
 
         // Down from the same place: that edge is still to be crossed.
         let down = w.rungs_towards(at(0), at(-1200)).unwrap();
         assert_eq!(
             down,
-            vec![Rung { sqrt: at(0), net: 7 }, Rung { sqrt: at(-600), net: 5 }],
+            vec![
+                Rung {
+                    sqrt: at(0),
+                    net: 7
+                },
+                Rung {
+                    sqrt: at(-600),
+                    net: 5
+                }
+            ],
             "going down includes the tick the price is standing on"
         );
 
@@ -1949,8 +2108,14 @@ mod tests {
             // The same ladder handed over directly is the same walk; what this
             // pins is that the ladder EXTRACTION did not drop or add a tick.
             let by_hand: Vec<Rung> = match base == 0 {
-                true => vec![Rung { sqrt: sqrt_at_tick(600), net: -400_000 }],
-                false => vec![Rung { sqrt: sqrt_at_tick(-600), net: 400_000 }],
+                true => vec![Rung {
+                    sqrt: sqrt_at_tick(600),
+                    net: -400_000,
+                }],
+                false => vec![Rung {
+                    sqrt: sqrt_at_tick(-600),
+                    net: 400_000,
+                }],
             };
             let expect = pay_to_move_along(sqrt_p, liquidity, base, 5.0, 3000, &by_hand).unwrap();
             assert_eq!(local, expect, "base {base}");
@@ -1965,12 +2130,18 @@ mod tests {
         let sqrt_p = sqrt_at_tick(0);
         let l = 1_000_000u128;
         // Liquidity that halves just above the price.
-        let thinner = vec![Rung { sqrt: sqrt_at_tick(200), net: -500_000 }];
+        let thinner = vec![Rung {
+            sqrt: sqrt_at_tick(200),
+            net: -500_000,
+        }];
         let flat: Vec<Rung> = vec![];
 
         let with = pay_to_move_along(sqrt_p, l, 0, 5.0, 3000, &thinner).unwrap();
         let without = pay_to_move_along(sqrt_p, l, 0, 5.0, 3000, &flat).unwrap();
-        assert!(with < without, "thinner beyond the tick must cost less to move: {with} vs {without}");
+        assert!(
+            with < without,
+            "thinner beyond the tick must cost less to move: {with} vs {without}"
+        );
     }
 
     /// A ladder that does not reach must say so rather than come back short:
@@ -2040,13 +2211,12 @@ mod tests {
         // Lowest tick of the lowest word read, highest of the highest, both
         // clamped to the range a tick can actually be in.
         let first = ((((centre - words) as i64) << 8) * spacing as i64).clamp(-MAX_TICK, MAX_TICK);
-        let last = (((((centre + words) as i64) << 8) + 256) * spacing as i64)
-            .clamp(-MAX_TICK, MAX_TICK);
+        let last =
+            (((((centre + words) as i64) << 8) + 256) * spacing as i64).clamp(-MAX_TICK, MAX_TICK);
         assert_eq!(lo, sqrt_at_tick(first as i32));
         assert_eq!(hi, sqrt_at_tick(last as i32));
         assert!(lo < hi);
     }
-
 
     #[test]
     fn compress_floors_towards_negative_infinity() {
@@ -2169,13 +2339,17 @@ mod tests {
             protocol_fee_0for1: protocol,
             protocol_fee_1for0: protocol,
         };
-        let out = |protocol: u32| {
-            match swap_exact_in_along(state(protocol), true, 1_000_000.0, &[], Beyond::ConstantLiquidity)
-                .unwrap()
-            {
-                Walk::Done(r) => r.amount_out,
-                Walk::NeedsRung => unreachable!("constant liquidity always finishes"),
-            }
+        let out = |protocol: u32| match swap_exact_in_along(
+            state(protocol),
+            true,
+            1_000_000.0,
+            &[],
+            Beyond::ConstantLiquidity,
+        )
+        .unwrap()
+        {
+            Walk::Done(r) => r.amount_out,
+            Walk::NeedsRung => unreachable!("constant liquidity always finishes"),
         };
         let with = out(400);
         let without = out(0);
@@ -2196,13 +2370,17 @@ mod tests {
             protocol_fee_0for1: 0,
             protocol_fee_1for0: 0,
         };
-        let out = |lp_fee: u32| {
-            match swap_exact_in_along(state(lp_fee), false, 1_000.0, &[], Beyond::ConstantLiquidity)
-                .unwrap()
-            {
-                Walk::Done(r) => r.amount_out,
-                Walk::NeedsRung => unreachable!(),
-            }
+        let out = |lp_fee: u32| match swap_exact_in_along(
+            state(lp_fee),
+            false,
+            1_000.0,
+            &[],
+            Beyond::ConstantLiquidity,
+        )
+        .unwrap()
+        {
+            Walk::Done(r) => r.amount_out,
+            Walk::NeedsRung => unreachable!(),
         };
         let ratio = out(10_000) / out(0);
         assert!((ratio - 0.99).abs() < 1e-6, "ratio {ratio}");
@@ -2219,7 +2397,8 @@ mod tests {
             protocol_fee_0for1: 0,
             protocol_fee_1for0: 0,
         };
-        let walk = |st, amount| swap_exact_in_along(st, false, amount, &[], Beyond::ConstantLiquidity);
+        let walk =
+            |st, amount| swap_exact_in_along(st, false, amount, &[], Beyond::ConstantLiquidity);
 
         // An empty pool consumes nothing and returns nothing.
         match walk(state(2.0, 0, 3000), 1.0).unwrap() {
@@ -2228,7 +2407,10 @@ mod tests {
         }
         assert!(walk(state(0.0, 1_000, 3000), 1.0).is_err(), "no price");
         assert!(walk(state(2.0, 1_000, 3000), 0.0).is_err(), "no input");
-        assert!(walk(state(2.0, 1_000, 1_000_000), 1.0).is_err(), "a 100% fee");
+        assert!(
+            walk(state(2.0, 1_000, 1_000_000), 1.0).is_err(),
+            "a 100% fee"
+        );
     }
 
     #[test]

@@ -18,6 +18,8 @@ set -a; source ~/.config/mm-fall.env; set +a
 
 ```
 WS_URL       wss:// endpoint, for live swap logs
+FEED         wss:// Nitro sequencer feed. Optional; --watch-launches hears
+             launches from it before the block exists
 HTTP_URL     https:// endpoint, for calls
 SUBMIT_URLS  comma-separated https:// endpoints to broadcast through, all at
              once. Optional; empty means just HTTP_URL
@@ -58,6 +60,160 @@ the pool is provided.
 Read-only, and heavier than anything the bot does by itself - it asks the whole
 question at once because somebody is waiting for the answer and nothing is
 racing.
+
+```bash
+cargo run -- --watch-launches
+```
+
+Watches the PonsV2 launchpad and prints every new launch. It reads no wallet,
+holds nothing and cannot send anything, so it is safe to leave running next to
+the bot.
+
+Two logs, because they answer different questions and only one of them always
+happens:
+
+| | |
+|---|---|
+| `TokenLaunched` | the factory. The token, its curve, who deployed it, the **pair token** the curve is bought with, and what it has to take before it graduates. Every launch has exactly one |
+| `Launched` | the launcher in front of it, whose `launchAndBuy` mints and buys in one transaction: what the dev buy paid and received. A launch made straight through the factory has none |
+
+Both logs of one transaction print as **one** entry - two would read as two
+launches - so a launch is held for 250ms in case its dev buy is still coming.
+
+```
+21:04:56.427 launch   Zcash Mascot (ZEBRIGRADE)  block 57136763  feed +32ms  tax 9900bps/3s
+  token      0x6abee1…956d   curve 0x60ef1c…c4ab
+  pair       ETH   config #0, graduates at 4.2 ETH
+  deployer   0x508211…a031   creator tax 0 bps
+  dev buy    0.086 ETH -> 48.23M -> 0x508211…a031 (min 47.75M)
+  exempt     0x531d1b…57c0, 0xe924fa…2c91
+  tx         0xbee1a66d…2adb37   via launchAndBuy
+```
+
+Every entry is stamped, in UTC to the millisecond, like the log lines around
+it - with two sources the whole question is which arrived first, and without a
+stamp the order in a terminal is a guess. Addresses are shortened to something
+that can be recognised and pasted into a search; the whole of one is in the
+transaction. Amounts are cut to six decimals and supply-sized numbers to
+`48.23M`, because no decision is made on the eighteenth decimal of either.
+
+A line appears only when it says something: `exempt` when somebody was
+exempted, `min` when the launcher set one, `launcher` when whoever paid is not
+the deployer, and the emitting contract only when it is **not** one of the two
+known ones - the ordinary case would be the same two addresses on every entry,
+which is a line nobody reads.
+
+`name`, `creator`, `exempt` and `via` come from the transaction's **calldata**,
+which is the only place they exist - no log carries them. `exempt` is who does
+not pay the snipe tax; a sniper is not on that list. That costs one
+`eth_getTransactionByHash` per launch, and a transaction that cannot be fetched
+or does not decode costs the entry those lines and nothing else.
+
+`snipe tax` is the launchpad's setting, not the launch's: two `eth_call`s at
+startup, and then **zero** requests, because the factory announces every change
+to it (`SnipeTaxStartBpsUpdated`, `SnipeTaxSecondsUpdated`) on the same
+subscription the launches arrive on. Where it says `decay unknown` it means
+just that: the ABI gives the tax at launch and the window it decays over, but
+the shape of the decay lives in the hook, so what a buy at second three would
+actually pay is not computed here rather than guessed.
+
+Amounts in the pair token are printed in **its** decimals, which costs one
+`decimals()` and one `symbol()` the first time a pair token is ever seen and
+nothing after that - they are cached in `pools.json` with everything else. A
+pair token that will not answer prints its amounts raw rather than guessed at:
+USDG has six decimals, and 8090 USDG printed at eighteen reads
+`0.00000000809`. Amounts of the launched token are printed at 18 decimals,
+which is what these mint.
+
+The ABIs of both contracts are checked in under `abi/`, and a test rebuilds the
+event signatures from them - see `abi/README.md`.
+
+### The sequencer feed
+
+With `FEED` set to the Nitro sequencer feed's `wss://` URL, launches are heard
+from a second source: the feed carries **signed transactions**, so it says a
+launch is coming before the block that carries it exists.
+
+```
+21:04:56.395 feed    Zcash Mascot (ZEBRIGRADE)  seq 57136763  pair ETH  dev buy 0.086 ETH  from 0x508211…a031  launchAndBuy  tx 0xbee1a66d…2adb37
+```
+
+`launchedAt` is the second the sequencer stamped the message with, and it is
+the `block.timestamp` the block built from it will carry - so it is the
+`launchedAt` the snipe tax counts from, known **before the block exists** and
+without asking anyone for a block. The entry for the launch then carries the
+whole tax window in absolute seconds:
+
+```
+  window     618 bps at 1788814628, 19 bps at 1788814629, free at 1788814630
+```
+
+Blocks are about 100ms and the timestamp is a whole second, so ten of them
+share each step: what a buy pays is decided by which second it lands in, not by
+which block. The feed also says WHERE in our own second the chain's second
+turns over - it is logged whenever it moves - which is the difference between
+sending now and sending in half a second.
+
+`seq` is the feed's own sequence number, which on this chain is the block the
+transaction is heading for. It is printed because a relay that hands out
+history on connect would otherwise be indistinguishable from one that is
+merely fast: the first sequence number of each connection is logged too.
+
+The entry for the same launch then arrives from the logs as usual, with one
+line more:
+
+```
+  feed       412ms before this log
+```
+
+Two things come of it. The lead time is measured rather than assumed - both
+sources are read in one process against one clock, so it compares endpoints and
+not machines. And the calldata is already in hand when the log arrives, so the
+`eth_getTransactionByHash` above is **not made at all** for a launch the feed
+saw first.
+
+What the feed cannot say is what the launch became: the token and its curve are
+created inside the transaction, so those still come from the factory's log.
+Without `FEED` nothing changes - launches are heard from logs alone.
+
+### The journal
+
+With `--size` set, every launch also gets a file under `launches/`, named
+`<block>-<curve>.jsonl`: one JSON line for the launch and one for each trade on
+its curve for the first minute. Who bought, in which second of the tax window,
+what they were really charged, and the reserves each trade left behind.
+
+It is written for reading afterwards. A launch is decided in three seconds, and
+none of this can be recovered later without asking the chain for every log
+again.
+
+Every amount appears twice: in the token's own units (`quote_in`,
+`tokens_out`, `quote_reserve`) and as the integer the chain moved
+(`quote_in_wei`, `tokens_out_wei`). Both are **strings**, never JSON numbers -
+a token amount runs to twenty-seven digits and a JSON number is a double, which
+would round away the last nine of them in the file that exists to record them.
+The readable form is exact as well: the same integer with a decimal point put
+in, not a rounding of it.
+
+`exempt` says whether the wallet was declared free of the snipe tax at launch -
+the list in the calldata plus the deployer and the creator fee recipient, whom
+the factory exempts whether or not they were named. It is **absent** rather
+than `false` when the launch's calldata was never decoded: not knowing is not
+the same as knowing they were not. `snipe_tax` on the same line says what was
+actually paid, and the two together separate a wallet that was let in free from
+one that merely arrived after the window closed.
+
+```bash
+jq -r 'select(.kind=="buy") | [.elapsed, .snipe_tax_bps, .exempt, .who, .quote_in] | @tsv' launches/*.jsonl
+```
+
+`launches/` is gitignored.
+
+`--launchpad 0x...` watches a different address instead of the two built in
+(comma-separated for several). `--launchpad any` drops the address filter and
+takes the events from whoever emits them - **an event signature belongs to
+nobody**, so anything that comes back that way is a claim about a token, not a
+launch.
 
 ```bash
 cargo run -- --quote "buy CAMELTOE"

@@ -436,12 +436,9 @@ impl Strategy {
 
     /// This pool's price of its base token, read from its own state.
     async fn pool_price(&self, pool: &Pool) -> Option<f64> {
-        let reader = crate::depth::TickReader::new(
-            &self.http,
-            pool.tick_source()?,
-            pool.tick_spacing?,
-        )
-        .ok()?;
+        let reader =
+            crate::depth::TickReader::new(&self.http, pool.tick_source()?, pool.tick_spacing?)
+                .ok()?;
         let state = crate::depth::read_state(&reader).await.ok()?;
         let price = crate::price::from_sqrt(
             state.sqrt_p,
@@ -576,8 +573,7 @@ impl Strategy {
     /// believing the bot is trading on what the file says.
     pub fn retune(&mut self, r: &Reload) {
         let cfg = &r.cfg;
-        let resolved: HashMap<PoolRef, &Pool> =
-            r.pools.iter().map(|p| (p.pool_ref(), p)).collect();
+        let resolved: HashMap<PoolRef, &Pool> = r.pools.iter().map(|p| (p.pool_ref(), p)).collect();
         let mut applied = 0usize;
         let mut set_changed = false;
         let mut seen = HashSet::new();
@@ -614,7 +610,9 @@ impl Strategy {
             let threshold = pc.threshold_pct.unwrap_or(cfg.threshold_pct);
             let max_move = pc.max_move_pct.unwrap_or(cfg.max_move_pct);
             let take_profit = armed.and_then(|r| r.take_profit_pct);
-            let exit_after = armed.and_then(|r| r.exit_after_secs).map(Duration::from_secs);
+            let exit_after = armed
+                .and_then(|r| r.exit_after_secs)
+                .map(Duration::from_secs);
             // Compared field by field so the log says what actually moved. A
             // reload that printed every pool it looked at would bury the one
             // line somebody edited the file for.
@@ -647,11 +645,21 @@ impl Strategy {
         // take-profit and the hold timer are the only things that will ever
         // sell it, and both live here. A bag nobody is watching is how a bag
         // gets forgotten.
-        let leaving: Vec<PoolRef> =
-            self.watches.keys().filter(|k| !seen.contains(k)).copied().collect();
+        let leaving: Vec<PoolRef> = self
+            .watches
+            .keys()
+            .filter(|k| !seen.contains(k))
+            .copied()
+            .collect();
         for key in leaving {
-            let Some(w) = self.watches.get(&key) else { continue };
-            let held = w.pool.base_currency().and_then(|t| self.inventory.get(t)).is_some();
+            let Some(w) = self.watches.get(&key) else {
+                continue;
+            };
+            let held = w
+                .pool
+                .base_currency()
+                .and_then(|t| self.inventory.get(t))
+                .is_some();
             if held || w.selling {
                 warn!(pool = %w.pool.name, held, selling = w.selling,
                     "no longer in the config, but it holds a position - still watched and still \
@@ -871,13 +879,19 @@ impl Strategy {
                             }
                             Ok(None) => {
                                 let _ = back
-                                    .send(Report::BuyAborted { token: spend_token, spend })
+                                    .send(Report::BuyAborted {
+                                        token: spend_token,
+                                        spend,
+                                    })
                                     .await;
                             }
                             Err(e) => {
                                 warn!(pool = %p.name, err = %format!("{e:#}"), "auto-buy failed");
                                 let _ = back
-                                    .send(Report::BuyAborted { token: spend_token, spend })
+                                    .send(Report::BuyAborted {
+                                        token: spend_token,
+                                        spend,
+                                    })
                                     .await;
                             }
                         }
@@ -900,7 +914,16 @@ impl Strategy {
     async fn on_report(&mut self, r: Report) {
         let s = match r {
             Report::Filled {
-                hash, pool, side, token, symbol, decimals, raw, price, spent, credit,
+                hash,
+                pool,
+                side,
+                token,
+                symbol,
+                decimals,
+                raw,
+                price,
+                spent,
+                credit,
                 committed,
             } => {
                 let credit_token = credit.map(|(t, _)| t);
@@ -974,7 +997,8 @@ impl Strategy {
         // nothing at all, so the distribution was only ever half visible.
         let quoted = self.inventory.quoted(s.hash);
         let side = if s.ok {
-            self.inventory.settle(s.hash, s.moved, s.credit_moved, s.entry_price)
+            self.inventory
+                .settle(s.hash, s.moved, s.credit_moved, s.entry_price)
         } else {
             self.inventory.rollback(s.hash)
         };
@@ -1078,7 +1102,6 @@ impl Strategy {
             warn!(err = %format!("{e:#}"), "could not write the inventory");
         }
     }
-
 }
 
 impl Strategy {
@@ -1244,7 +1267,12 @@ async fn report_depth(
         let target = crate::depth::move_target(sqrt_p, pool.base_token, max_move_pct);
         if let Some(rungs) = exec.rungs_towards(pool.pool_ref(), sqrt_p, target) {
             match crate::depth::pay_to_move_along(
-                sqrt_p, sig.liquidity, pool.base_token, max_move_pct, fee, &rungs,
+                sqrt_p,
+                sig.liquidity,
+                pool.base_token,
+                max_move_pct,
+                fee,
+                &rungs,
             ) {
                 Ok(v) => {
                     pay = Some(v);
@@ -1263,7 +1291,12 @@ async fn report_depth(
             match crate::depth::TickReader::new(http, source, spacing) {
                 Ok(reader) => {
                     match crate::depth::pay_to_move(
-                        &reader, sqrt_p, sig.liquidity, pool.base_token, max_move_pct, fee,
+                        &reader,
+                        sqrt_p,
+                        sig.liquidity,
+                        pool.base_token,
+                        max_move_pct,
+                        fee,
                     )
                     .await
                     {
@@ -1342,7 +1375,9 @@ mod tests {
     }
 
     fn pool_toml(p: &Pool, threshold: Option<f64>) -> String {
-        let extra = threshold.map(|t| format!("threshold_pct = {t}\n")).unwrap_or_default();
+        let extra = threshold
+            .map(|t| format!("threshold_pct = {t}\n"))
+            .unwrap_or_default();
         format!(
             "[[pools]]\nname = \"{}\"\nversion = \"v3\"\naddress = \"{:?}\"\n{extra}",
             p.name, p.address
@@ -1350,8 +1385,7 @@ mod tests {
     }
 
     fn cfg_of(body: &str) -> crate::config::Config {
-        toml::from_str(&format!("threshold_pct = 3\nmax_move_pct = 1\n{body}"))
-            .expect("a config")
+        toml::from_str(&format!("threshold_pct = 3\nmax_move_pct = 1\n{body}")).expect("a config")
     }
 
     /// One pool's edit must not decide anything about the pool beside it.
@@ -1373,11 +1407,25 @@ mod tests {
             pool_toml(&b, None),
             pool_toml(&c, Some(2.0))
         ));
-        s.retune(&Reload { cfg, pools: vec![a.clone(), b.clone()] });
+        s.retune(&Reload {
+            cfg,
+            pools: vec![a.clone(), b.clone()],
+        });
 
-        assert_eq!(s.watches[&a.pool_ref()].meter.threshold(), 8.0, "A was retuned");
-        assert_eq!(s.watches[&b.pool_ref()].meter.threshold(), 3.0, "B was left alone");
-        assert!(!s.watches.contains_key(&c.pool_ref()), "C could not be resolved");
+        assert_eq!(
+            s.watches[&a.pool_ref()].meter.threshold(),
+            8.0,
+            "A was retuned"
+        );
+        assert_eq!(
+            s.watches[&b.pool_ref()].meter.threshold(),
+            3.0,
+            "B was left alone"
+        );
+        assert!(
+            !s.watches.contains_key(&c.pool_ref()),
+            "C could not be resolved"
+        );
         assert_eq!(s.watching(), 2);
     }
 
@@ -1387,8 +1435,15 @@ mod tests {
     fn a_pool_added_to_the_file_is_watched() {
         let (a, b) = (v3_pool("A", 0xa), v3_pool("B", 0xb));
         let mut s = watching(&[a.clone()], 3.0);
-        let cfg = cfg_of(&format!("{}{}", pool_toml(&a, None), pool_toml(&b, Some(5.0))));
-        s.retune(&Reload { cfg, pools: vec![a.clone(), b.clone()] });
+        let cfg = cfg_of(&format!(
+            "{}{}",
+            pool_toml(&a, None),
+            pool_toml(&b, Some(5.0))
+        ));
+        s.retune(&Reload {
+            cfg,
+            pools: vec![a.clone(), b.clone()],
+        });
         assert_eq!(s.watching(), 2);
         assert_eq!(s.watches[&b.pool_ref()].meter.threshold(), 5.0);
     }
@@ -1414,14 +1469,26 @@ mod tests {
 
         // B is gone from the file, and A alone is left in it.
         let cfg = cfg_of(&pool_toml(&a, None));
-        s.retune(&Reload { cfg, pools: vec![a.clone()] });
-        assert!(s.watches.contains_key(&b.pool_ref()), "B holds a position and stays watched");
+        s.retune(&Reload {
+            cfg,
+            pools: vec![a.clone()],
+        });
+        assert!(
+            s.watches.contains_key(&b.pool_ref()),
+            "B holds a position and stays watched"
+        );
 
         // Once it holds nothing, the same reload drops it.
         let (a2, b2) = (a.clone(), b.clone());
         let mut s = watching(&[a2.clone(), b2.clone()], 3.0);
-        s.retune(&Reload { cfg: cfg_of(&pool_toml(&a2, None)), pools: vec![a2.clone()] });
-        assert!(!s.watches.contains_key(&b2.pool_ref()), "nothing held, so it is unwatched");
+        s.retune(&Reload {
+            cfg: cfg_of(&pool_toml(&a2, None)),
+            pools: vec![a2.clone()],
+        });
+        assert!(
+            !s.watches.contains_key(&b2.pool_ref()),
+            "nothing held, so it is unwatched"
+        );
         assert_eq!(s.watching(), 1);
     }
 
@@ -1442,8 +1509,14 @@ mod tests {
         let mut m = BigSellMeter::new(0.5);
         assert!(m.observe(&tick(1, 1.0)).is_none());
         assert!(m.observe(&tick(1, 1.0)).is_none());
-        assert!(m.observe(&tick(2, 0.99)).is_some(), "-1% in a new block fires");
-        assert!(m.observe(&tick(2, 0.98)).is_none(), "but only once per block");
+        assert!(
+            m.observe(&tick(2, 0.99)).is_some(),
+            "-1% in a new block fires"
+        );
+        assert!(
+            m.observe(&tick(2, 0.98)).is_none(),
+            "but only once per block"
+        );
         assert!(m.observe(&tick(3, 0.97)).is_some());
     }
 

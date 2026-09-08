@@ -2,6 +2,10 @@
 name = "trading-mm-fall"
 version = "0.1.0"
 edition = "2021"
+# Two binaries in the tree, and every command in the README is the bot. Without
+# this `cargo run` refuses to pick one, which is a stop for a person following
+# the README and no help at all to the person who wanted `probe`.
+default-run = "trading-mm-fall"
 
 [dependencies]
 ethers = { version = "2", features = ["ws", "rustls", "abigen"] }

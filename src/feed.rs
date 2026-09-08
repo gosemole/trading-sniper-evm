@@ -12,13 +12,13 @@
 //! falls could serve one and not the other.
 
 use crate::pool::{v3_swap_topic, v4_swap_topic, Pool};
-use std::collections::{HashMap, HashSet};
 use crate::price;
 use crate::route::PoolRef;
 use anyhow::{Context, Result};
 use ethers::providers::{Middleware, Provider, Ws};
 use ethers::types::{Filter, Log, U256};
 use futures_util::StreamExt;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -61,7 +61,9 @@ pub async fn run_all(
     ws_url: String,
     out: mpsc::Sender<Tick>,
 ) -> Result<()> {
-    let provider = Provider::<Ws>::connect(&ws_url).await.context("connect ws")?;
+    let provider = Provider::<Ws>::connect(&ws_url)
+        .await
+        .context("connect ws")?;
     // Marked seen here, so a set published while this was connecting is picked
     // up by the diff below rather than waited for.
     let wanted = pools.borrow_and_update().clone();
@@ -72,10 +74,12 @@ pub async fn run_all(
     // would have to be dropped every time it did - which DETACHES the tasks
     // rather than stopping them, leaving a subscription nobody can end.
     let (ended_tx, mut ended) = mpsc::channel::<(String, Result<()>)>(8);
-    let mut following: HashMap<crate::route::PoolRef, tokio::task::JoinHandle<()>> =
-        HashMap::new();
+    let mut following: HashMap<crate::route::PoolRef, tokio::task::JoinHandle<()>> = HashMap::new();
     for pool in wanted {
-        following.insert(pool.pool_ref(), spawn_follow(&provider, pool, &out, &ended_tx));
+        following.insert(
+            pool.pool_ref(),
+            spawn_follow(&provider, pool, &out, &ended_tx),
+        );
     }
     anyhow::ensure!(!following.is_empty(), "no pools to follow");
 
@@ -211,22 +215,32 @@ async fn follow(provider: &Provider<Ws>, pool: Pool, out: mpsc::Sender<Tick>) ->
 }
 
 fn decode(pool: &Pool, log: &Log) -> Result<Tick> {
-    let block = log.block_number.context("log missing block number")?.as_u64();
+    let block = log
+        .block_number
+        .context("log missing block number")?
+        .as_u64();
     let data = &log.data.0;
     // Both v3 and v4 Swap lay out the non-indexed args as
     // [amount0][amount1][sqrtPriceX96][liquidity][tick]... so the offsets below
     // hold for either version. v4 adds one more word after the tick, and that
     // last word is the whole reason this log is worth more than a price: it is
     // the fee the swap was charged, hook override and all.
-    anyhow::ensure!(data.len() >= 128, "log data too short: {} bytes", data.len());
+    anyhow::ensure!(
+        data.len() >= 128,
+        "log data too short: {} bytes",
+        data.len()
+    );
     let sqrt = U256::from_big_endian(&data[64..96]);
     // liquidity is uint128: low 16 bytes of its 32-byte word.
     let liquidity = u128::from_be_bytes(data[112..128].try_into().unwrap());
     // fee is uint24: low 3 bytes of the sixth word.
-    let lp_fee = (data.len() >= 192)
-        .then(|| u32::from_be_bytes([0, data[189], data[190], data[191]]));
+    let lp_fee =
+        (data.len() >= 192).then(|| u32::from_be_bytes([0, data[189], data[190], data[191]]));
     let price = price::display_price(sqrt, pool.decimals0, pool.decimals1, pool.base_token);
-    anyhow::ensure!(price.is_finite() && price > 0.0, "non-finite price from sqrt");
+    anyhow::ensure!(
+        price.is_finite() && price > 0.0,
+        "non-finite price from sqrt"
+    );
     Ok(Tick {
         pool: pool.pool_ref(),
         block,

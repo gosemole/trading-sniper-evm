@@ -78,10 +78,10 @@
 
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider, StreamExt, Ws};
-use futures_util::FutureExt;
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Eip1559TransactionRequest, Filter, H256, U256};
+use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,7 +119,10 @@ struct PoolCfg {
 /// A non-empty environment variable, trimmed - `config::env_var`'s rule, so
 /// the probe answers to exactly the names the bot does.
 fn env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::env::var(name)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Every value given for a repeated flag, in the order the flags appear.
@@ -206,7 +209,6 @@ fn block_stats(v: &[i64]) -> String {
     format!("{:>6.1}", v.iter().sum::<i64>() as f64 / v.len() as f64)
 }
 
-
 /// Open the feed at the head rather than wherever its backlog begins.
 ///
 /// A plain connection is handed about four and a half minutes of history and
@@ -221,13 +223,17 @@ fn block_stats(v: &[i64]) -> String {
 /// works. Tested against this chain, both facts.
 async fn connect_feed(
     url: &str,
-) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
-{
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = url.into_client_request().context("bad feed url")?;
     req.headers_mut().insert(
         "Arbitrum-Requested-Sequence-Number",
-        u64::MAX.to_string().parse().expect("a number is a valid header value"),
+        u64::MAX
+            .to_string()
+            .parse()
+            .expect("a number is a valid header value"),
     );
     let (stream, _) = tokio_tungstenite::connect_async(req)
         .await
@@ -307,7 +313,10 @@ fn tx_hashes(l2: &[u8], depth: u8, out: &mut Vec<H256>) {
 /// was asked for and say nothing about it.
 fn sides(args: &[String], cfg: &Cfg) -> Result<(Option<String>, Vec<String>)> {
     let ws_urls = values(args, "--ws");
-    anyhow::ensure!(ws_urls.len() <= 2, "at most two --ws: one per side of the comparison");
+    anyhow::ensure!(
+        ws_urls.len() <= 2,
+        "at most two --ws: one per side of the comparison"
+    );
     if ws_urls.len() == 2 {
         anyhow::ensure!(
             !args.iter().any(|a| a == "--feed"),
@@ -329,7 +338,7 @@ fn sides(args: &[String], cfg: &Cfg) -> Result<(Option<String>, Vec<String>)> {
         .or_else(|| env_var("FEED_URL"))
         .context(
             "nothing to compare against: pass --feed wss://... or set FEED_URL, or give --ws \
-             twice to compare two websockets"
+             twice to compare two websockets",
         )?;
     let ws = ws_urls
         .into_iter()
@@ -403,12 +412,18 @@ fn feed_hashes(
     });
     let decoder = tokio::spawn(async move {
         while let Some((at, text)) = rx.recv().await {
-            let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
+            let Ok(frame) = serde_json::from_str::<Frame>(&text) else {
+                continue;
+            };
             let mut hashes = Vec::new();
             let mut of_message = Vec::new();
             for m in &frame.messages {
-                let Some(b64) = &m.message.message.l2_msg else { continue };
-                let Ok(raw) = base64_decode(b64) else { continue };
+                let Some(b64) = &m.message.message.l2_msg else {
+                    continue;
+                };
+                let Ok(raw) = base64_decode(b64) else {
+                    continue;
+                };
                 of_message.clear();
                 tx_hashes(&raw, 0, &mut of_message);
                 hashes.extend(of_message.iter().map(|h| (*h, m.sequence_number)));
@@ -443,9 +458,14 @@ fn ws_hashes(
     seen: Arc<Mutex<HashMap<H256, (Duration, u64)>>>,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let provider = Provider::<Ws>::connect(&url).await.context("connecting to the rpc")?;
+        let provider = Provider::<Ws>::connect(&url)
+            .await
+            .context("connecting to the rpc")?;
         println!("{} open", label(&url));
-        let mut logs = provider.subscribe_logs(&filter).await.context("eth_subscribe(logs)")?;
+        let mut logs = provider
+            .subscribe_logs(&filter)
+            .await
+            .context("eth_subscribe(logs)")?;
         while let Some(log) = logs.next().await {
             let at = started.elapsed();
             if let Some(h) = log.transaction_hash {
@@ -483,7 +503,10 @@ async fn settle(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> Result<()> {
 /// one rpc against another.
 async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     let value = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
     let seconds: u64 = value("--seconds")
         .map(|v| v.parse())
@@ -523,13 +546,28 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
             let (reader, decode, _) = feed_hashes(url.clone(), started, Arc::clone(&from_a));
             decoder = Some(decode);
             tasks.push(reader);
-            tasks.push(ws_hashes(ws_urls[0].clone(), filter, started, Arc::clone(&from_b)));
+            tasks.push(ws_hashes(
+                ws_urls[0].clone(),
+                filter,
+                started,
+                Arc::clone(&from_b),
+            ));
             ("feed".to_string(), "rpc".to_string())
         }
         None => {
             let f = filter.clone();
-            tasks.push(ws_hashes(ws_urls[0].clone(), f, started, Arc::clone(&from_a)));
-            tasks.push(ws_hashes(ws_urls[1].clone(), filter, started, Arc::clone(&from_b)));
+            tasks.push(ws_hashes(
+                ws_urls[0].clone(),
+                f,
+                started,
+                Arc::clone(&from_a),
+            ));
+            tasks.push(ws_hashes(
+                ws_urls[1].clone(),
+                filter,
+                started,
+                Arc::clone(&from_b),
+            ));
             two_labels(&ws_urls)
         }
     };
@@ -537,7 +575,9 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
     println!(
         "watching for {seconds}s, ignoring the first {warmup}s while both connections settle: \
          {first} against {second}{}",
-        address.map(|a| format!(", logs for {a}")).unwrap_or_default()
+        address
+            .map(|a| format!(", logs for {a}"))
+            .unwrap_or_default()
     );
     tokio::time::sleep(Duration::from_secs(seconds)).await;
     settle(tasks).await?;
@@ -555,7 +595,8 @@ async fn watch(args: &[String], cfg: &Cfg) -> Result<()> {
         .iter()
         .filter(|(_, (t_b, _))| *t_b >= after)
         .filter_map(|(h, (t_b, _))| {
-            a.get(h).map(|(t_a, _)| (*t_b, t_b.as_millis() as i64 - t_a.as_millis() as i64))
+            a.get(h)
+                .map(|(t_a, _)| (*t_b, t_b.as_millis() as i64 - t_a.as_millis() as i64))
         })
         .collect();
     over_time.sort_by_key(|(t, _)| *t);
@@ -628,10 +669,14 @@ fn report_lead(
     if slice == 0 {
         return;
     }
-    let by_fifth: Vec<i64> =
-        (0..5).map(|i| median_of(&over_time[i * slice..(i + 1) * slice])).collect();
+    let by_fifth: Vec<i64> = (0..5)
+        .map(|i| median_of(&over_time[i * slice..(i + 1) * slice]))
+        .collect();
     let as_text: Vec<String> = by_fifth.iter().map(|d| format!("{d}")).collect();
-    println!("median by fifth of the counted window, ms:  {}", as_text.join("  "));
+    println!(
+        "median by fifth of the counted window, ms:  {}",
+        as_text.join("  ")
+    );
     let spread = by_fifth.iter().max().unwrap() - by_fifth.iter().min().unwrap();
     if spread > 200 {
         println!(
@@ -666,7 +711,10 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
 /// about the chain, not about when we happened to read it.
 async fn offset(args: &[String], cfg: &Cfg) -> Result<()> {
     let value = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
     let samples: usize = value("--samples")
         .map(|v| v.parse())
@@ -686,7 +734,10 @@ async fn offset(args: &[String], cfg: &Cfg) -> Result<()> {
     println!("feed open, reads via {}\n", label(&read_url));
     let (_w, mut r) = stream.split();
 
-    println!("{:>14}  {:>14}  {:>10}", "sequenceNumber", "block", "difference");
+    println!(
+        "{:>14}  {:>14}  {:>10}",
+        "sequenceNumber", "block", "difference"
+    );
     let mut offsets: Vec<i128> = Vec::new();
     while let Some(msg) = r.next().await {
         let text = match msg.context("reading the feed")? {
@@ -696,13 +747,19 @@ async fn offset(args: &[String], cfg: &Cfg) -> Result<()> {
             }
             _ => continue,
         };
-        let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
+        let Ok(frame) = serde_json::from_str::<Frame>(&text) else {
+            continue;
+        };
         for m in &frame.messages {
             if offsets.len() >= samples {
                 break;
             }
-            let Some(b64) = &m.message.message.l2_msg else { continue };
-            let Ok(raw) = base64_decode(b64) else { continue };
+            let Some(b64) = &m.message.message.l2_msg else {
+                continue;
+            };
+            let Ok(raw) = base64_decode(b64) else {
+                continue;
+            };
             let mut hashes = Vec::new();
             tx_hashes(&raw, 0, &mut hashes);
             // One transaction is enough, but not any one: a message caught
@@ -712,7 +769,9 @@ async fn offset(args: &[String], cfg: &Cfg) -> Result<()> {
             for h in hashes {
                 match read.get_transaction(h).await {
                     Ok(Some(tx)) => {
-                        let Some(block) = tx.block_number.map(|b| b.as_u64()) else { continue };
+                        let Some(block) = tx.block_number.map(|b| b.as_u64()) else {
+                            continue;
+                        };
                         let d = m.sequence_number as i128 - block as i128;
                         println!("{:>14}  {:>14}  {:>10}", m.sequence_number, block, d);
                         offsets.push(d);
@@ -770,7 +829,9 @@ fn feed_heights(
                 }
                 _ => continue,
             };
-            let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
+            let Ok(frame) = serde_json::from_str::<Frame>(&text) else {
+                continue;
+            };
             let mut seen = seen.lock().await;
             for m in &frame.messages {
                 seen.entry(m.sequence_number).or_insert(at);
@@ -788,9 +849,14 @@ fn ws_heights(
     seen: Arc<Mutex<HashMap<u64, Duration>>>,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        let provider = Provider::<Ws>::connect(&url).await.context("connecting to the rpc")?;
+        let provider = Provider::<Ws>::connect(&url)
+            .await
+            .context("connecting to the rpc")?;
         println!("{} open", label(&url));
-        let mut heads = provider.subscribe_blocks().await.context("eth_subscribe(newHeads)")?;
+        let mut heads = provider
+            .subscribe_blocks()
+            .await
+            .context("eth_subscribe(newHeads)")?;
         while let Some(head) = heads.next().await {
             let at = started.elapsed();
             if let Some(n) = head.number {
@@ -814,7 +880,10 @@ fn ws_heights(
 /// also later.
 async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
     let value = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
     let seconds: u64 = value("--seconds")
         .map(|v| v.parse())
@@ -863,7 +932,8 @@ async fn heads(args: &[String], cfg: &Cfg) -> Result<()> {
         .iter()
         .filter(|(_, t)| **t >= after)
         .filter_map(|(n, t_b)| {
-            a.get(n).map(|t_a| (*t_b, t_b.as_millis() as i64 - t_a.as_millis() as i64))
+            a.get(n)
+                .map(|t_a| (*t_b, t_b.as_millis() as i64 - t_a.as_millis() as i64))
         })
         .collect();
     over_time.sort_by_key(|(t, _)| *t);
@@ -964,13 +1034,19 @@ async fn selftest(t: SelfTest) -> Result<()> {
     // subscription opened only to be ignored would still be one more stream
     // whose failure could end the run.
     let provider = match &t.trigger {
-        Trigger::Heads(url) => {
-            Some(Provider::<Ws>::connect(url).await.context("connecting to the rpc websocket")?)
-        }
+        Trigger::Heads(url) => Some(
+            Provider::<Ws>::connect(url)
+                .await
+                .context("connecting to the rpc websocket")?,
+        ),
         Trigger::Feed => None,
     };
     let mut heads = match &provider {
-        Some(p) => Some(p.subscribe_blocks().await.context("eth_subscribe(newHeads)")?),
+        Some(p) => Some(
+            p.subscribe_blocks()
+                .await
+                .context("eth_subscribe(newHeads)")?,
+        ),
         None => None,
     };
 
@@ -1030,9 +1106,13 @@ async fn selftest(t: SelfTest) -> Result<()> {
                 // transaction that was next in line still looks several blocks
                 // late.
                 let tip = match t.feed_url.is_some() {
-                    true => {
-                        seen.lock().await.values().map(|(_, seq)| *seq).max().unwrap_or_default()
-                    }
+                    true => seen
+                        .lock()
+                        .await
+                        .values()
+                        .map(|(_, seq)| *seq)
+                        .max()
+                        .unwrap_or_default(),
                     false => 0,
                 };
                 (at_head, height, tip)
@@ -1041,7 +1121,9 @@ async fn selftest(t: SelfTest) -> Result<()> {
             // it got round to looking: everything between the two - the queue,
             // the decode - is then inside the measurement, where it belongs.
             None => {
-                let frames = frames.as_mut().expect("--from-feed is refused without a feed");
+                let frames = frames
+                    .as_mut()
+                    .expect("--from-feed is refused without a feed");
                 // Marks the current value seen, which is what makes the wait
                 // below wait for a frame that arrives from now on.
                 frames.borrow_and_update();
@@ -1083,7 +1165,10 @@ async fn selftest(t: SelfTest) -> Result<()> {
             // Signing is local and the nonce is fresh every round, so a refusal
             // is the endpoint's answer and worth stopping on rather than
             // averaging over.
-            println!("round {round} {at_word} {height}  REFUSED by {}: {e}", t.submit_label);
+            println!(
+                "round {round} {at_word} {height}  REFUSED by {}: {e}",
+                t.submit_label
+            );
             break;
         }
         let sent = at_head.elapsed();
@@ -1141,7 +1226,9 @@ async fn selftest(t: SelfTest) -> Result<()> {
              {block} (+{delta} from {counted_from}{})",
             sent.as_millis(),
             back.as_millis(),
-            behind_tip.map(|d| format!(", +{d} from the sequencer at {tip}")).unwrap_or_default()
+            behind_tip
+                .map(|d| format!(", +{d} from the sequencer at {tip}"))
+                .unwrap_or_default()
         );
         nonce += U256::one();
     }
@@ -1201,7 +1288,10 @@ async fn selftest(t: SelfTest) -> Result<()> {
 /// something else would be worse than one that is missing.
 async fn extsload(args: &[String], cfg: &Cfg) -> Result<()> {
     let value = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
     let read_url = value("--read")
         .or_else(|| env_var("HTTP_URL"))
@@ -1224,7 +1314,10 @@ async fn extsload(args: &[String], cfg: &Cfg) -> Result<()> {
         .context("eth_blockNumber")?
         .as_u64()
         .saturating_sub(2);
-    println!("asking {manager:?} via {}, all reads at block {at}\n", label(&read_url));
+    println!(
+        "asking {manager:?} via {}, all reads at block {at}\n",
+        label(&read_url)
+    );
 
     // Slots of a real pool, not of the manager's own header. A pool's `slot0`
     // and `liquidity` are non-zero on a live pool, and that is the point: two
@@ -1254,7 +1347,11 @@ async fn extsload(args: &[String], cfg: &Cfg) -> Result<()> {
         let w: H256 = read
             .request(
                 "eth_getStorageAt",
-                (format!("{manager:?}"), format!("0x{:064x}", slot), format!("0x{at:x}")),
+                (
+                    format!("{manager:?}"),
+                    format!("0x{:064x}", slot),
+                    format!("0x{at:x}"),
+                ),
             )
             .await
             .context("eth_getStorageAt")?;
@@ -1300,7 +1397,10 @@ async fn extsload(args: &[String], cfg: &Cfg) -> Result<()> {
         let tx = ethers::types::TransactionRequest::new()
             .to(manager)
             .data(ethers::types::Bytes::from(data));
-        match read.call(&tx.into(), Some(ethers::types::BlockId::from(at))).await {
+        match read
+            .call(&tx.into(), Some(ethers::types::BlockId::from(at)))
+            .await
+        {
             Ok(out) => {
                 // The dynamic forms return an offset and a length before the
                 // words; the fixed one returns the word alone. Rather than
@@ -1333,7 +1433,10 @@ async fn extsload(args: &[String], cfg: &Cfg) -> Result<()> {
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let value = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
     let send = args.iter().any(|a| a == "--send");
     let rounds: usize = value("--rounds")
@@ -1396,7 +1499,12 @@ async fn main() -> Result<()> {
     let urls = match given.is_empty() {
         false => given,
         true => env_var("SUBMIT_URLS")
-            .map(|v| v.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+            .map(|v| {
+                v.split(',')
+                    .map(|u| u.trim().to_string())
+                    .filter(|u| !u.is_empty())
+                    .collect()
+            })
             .unwrap_or(cfg.submit_urls),
     };
     anyhow::ensure!(
@@ -1432,7 +1540,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    println!("chain {chain_id}, {} endpoint(s), {rounds} round(s)", targets.len());
+    println!(
+        "chain {chain_id}, {} endpoint(s), {rounds} round(s)",
+        targets.len()
+    );
     println!("reads via {}", label(&read_url));
 
     // The height the sequencer has actually reached, if a feed was given.
@@ -1464,7 +1575,9 @@ async fn main() -> Result<()> {
                     }
                     _ => continue,
                 };
-                let Ok(frame) = serde_json::from_str::<Frame>(&text) else { continue };
+                let Ok(frame) = serde_json::from_str::<Frame>(&text) else {
+                    continue;
+                };
                 if let Some(top) = frame.messages.iter().map(|m| m.sequence_number).max() {
                     head.fetch_max(top, Ordering::Relaxed);
                 }
@@ -1544,7 +1657,10 @@ async fn main() -> Result<()> {
         // against a single nonce, and splitting it across endpoints would
         // measure the endpoints in different blocks rather than the loop.
         if targets.len() > 1 {
-            println!("more than one endpoint given; sending through {} only\n", targets[0].label);
+            println!(
+                "more than one endpoint given; sending through {} only\n",
+                targets[0].label
+            );
         }
         let feed_url = value("--feed").or_else(|| env_var("FEED_URL"));
         let trigger = match args.iter().any(|a| a == "--from-feed") {
@@ -1555,7 +1671,7 @@ async fn main() -> Result<()> {
                     .or(cfg.ws_url)
                     .context(
                         "no rpc websocket to take heads from: pass --ws wss://..., set WS_URL, \
-                         or start rounds on the feed instead with --from-feed"
+                         or start rounds on the feed instead with --from-feed",
                     )?,
             ),
         };
@@ -1594,7 +1710,11 @@ async fn main() -> Result<()> {
 
             // Read the head BEFORE the clock starts, so neither this call nor
             // its round trip is charged to the endpoint under test.
-            let head = read.get_block_number().await.context("eth_blockNumber")?.as_u64();
+            let head = read
+                .get_block_number()
+                .await
+                .context("eth_blockNumber")?
+                .as_u64();
             let sequenced = feed_head.load(Ordering::Relaxed);
 
             let started = Instant::now();
@@ -1671,7 +1791,11 @@ async fn main() -> Result<()> {
 fn report(targets: &[Target]) {
     println!(
         "\n{:>44}  {:^17}  {:^17}  {:^17}  {:>6}  {:>6}  refused",
-        "endpoint", "ping min/med/max", "accept min/med/max", "seen min/med/max", "vs rpc",
+        "endpoint",
+        "ping min/med/max",
+        "accept min/med/max",
+        "seen min/med/max",
+        "vs rpc",
         "vs seq"
     );
     for t in targets {
@@ -1751,6 +1875,9 @@ mod tests {
         }
         let mut out = Vec::new();
         tx_hashes(&deep, 0, &mut out);
-        assert!(out.is_empty(), "a batch nested past the limit yields nothing");
+        assert!(
+            out.is_empty(),
+            "a batch nested past the limit yields nothing"
+        );
     }
 }

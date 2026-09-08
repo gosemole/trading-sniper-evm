@@ -83,11 +83,15 @@ impl FeeWatch {
         let provider = Provider::<Ws>::connect(ws_url)
             .await
             .context("connect ws for gas price")?;
-        let mut heads = provider.subscribe_blocks().await.context("subscribe newHeads")?;
+        let mut heads = provider
+            .subscribe_blocks()
+            .await
+            .context("subscribe newHeads")?;
         let mut tip_checked = 0u64;
         while let Some(block) = heads.next().await {
             if let Some(base) = block.base_fee_per_gas {
-                self.base_fee.store(base.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
+                self.base_fee
+                    .store(base.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
                 self.seen_at.store(now_secs(), Ordering::Relaxed);
             }
             // The tip is a separate call, and blocks here are a tenth of a
@@ -98,8 +102,12 @@ impl FeeWatch {
             let now = now_secs();
             if now.saturating_sub(tip_checked) >= 20 {
                 tip_checked = now;
-                if let Ok(tip) = http.request::<_, U256>("eth_maxPriorityFeePerGas", ()).await {
-                    self.tip.store(tip.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
+                if let Ok(tip) = http
+                    .request::<_, U256>("eth_maxPriorityFeePerGas", ())
+                    .await
+                {
+                    self.tip
+                        .store(tip.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
                 }
             }
         }
@@ -154,8 +162,10 @@ impl FeeWatch {
                 if let Ok((max_fee, tip)) = fee_params(&http).await {
                     // Stored as a base, because that is what `params` doubles.
                     let base = max_fee.saturating_sub(tip) / 2;
-                    me.base_fee.store(base.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
-                    me.tip.store(tip.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
+                    me.base_fee
+                        .store(base.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
+                    me.tip
+                        .store(tip.min(U256::from(u64::MAX)).as_u64(), Ordering::Relaxed);
                     me.seen_at.store(now_secs(), Ordering::Relaxed);
                     tracing::debug!("gas price refreshed without the header stream");
                 }
@@ -200,7 +210,11 @@ fn max_uint48() -> U256 {
 pub fn load_wallet(cfg: &Config, chain_id: u64) -> Result<LocalWallet> {
     // `Config::load` already merged PRIVATE_KEY over the file, so there is one
     // place the key can come from by the time we get here.
-    let source = if std::env::var_os("PRIVATE_KEY").is_some() { "PRIVATE_KEY env" } else { "config" };
+    let source = if std::env::var_os("PRIVATE_KEY").is_some() {
+        "PRIVATE_KEY env"
+    } else {
+        "config"
+    };
     let key = cfg.private_key.expose().trim().trim_start_matches("0x");
     anyhow::ensure!(
         !key.is_empty(),
@@ -782,11 +796,7 @@ pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> La
 }
 
 /// Send a prepared batch in order, waiting for each receipt.
-pub async fn send_all(
-    http: &Provider<Http>,
-    wallet: LocalWallet,
-    txs: &[PendingTx],
-) -> Result<()> {
+pub async fn send_all(http: &Provider<Http>, wallet: LocalWallet, txs: &[PendingTx]) -> Result<()> {
     let from = wallet.address();
     let chain_id = wallet.chain_id();
     let client = SignerMiddleware::new(http.clone(), wallet);
@@ -809,7 +819,11 @@ pub async fn send_all(
             .await
             .with_context(|| format!("estimating gas for tx {i} ({})", tx.label))?;
         req = req.gas(gas * 5 / 4);
-        println!("  [{i}] sending {} (gas limit {})...", tx.label, gas * 5 / 4);
+        println!(
+            "  [{i}] sending {} (gas limit {})...",
+            tx.label,
+            gas * 5 / 4
+        );
         let pending = client
             .send_transaction(req, None)
             .await
@@ -843,9 +857,15 @@ pub async fn check_approvals(
     let res = crate::rpc::retrying("erc20 allowance()", || {
         let a = a.clone();
         async move {
-            http.call(&TransactionRequest::new().to(token).data(Bytes::from(a)).into(), None)
-                .await
-                .context("erc20 allowance()")
+            http.call(
+                &TransactionRequest::new()
+                    .to(token)
+                    .data(Bytes::from(a))
+                    .into(),
+                None,
+            )
+            .await
+            .context("erc20 allowance()")
         }
     })
     .await?;
@@ -862,9 +882,15 @@ pub async fn check_approvals(
     let res = crate::rpc::retrying("permit2 allowance()", || {
         let p = p.clone();
         async move {
-            http.call(&TransactionRequest::new().to(permit2).data(Bytes::from(p)).into(), None)
-                .await
-                .context("permit2 allowance()")
+            http.call(
+                &TransactionRequest::new()
+                    .to(permit2)
+                    .data(Bytes::from(p))
+                    .into(),
+                None,
+            )
+            .await
+            .context("permit2 allowance()")
         }
     })
     .await?;
@@ -882,7 +908,9 @@ pub async fn check_approvals(
 pub async fn balance_of(http: &Provider<Http>, token: Address, owner: Address) -> Result<U256> {
     if token == Address::zero() {
         return crate::rpc::retrying("eth_getBalance", || async {
-            http.get_balance(owner, None).await.context("eth_getBalance")
+            http.get_balance(owner, None)
+                .await
+                .context("eth_getBalance")
         })
         .await;
     }
@@ -891,9 +919,15 @@ pub async fn balance_of(http: &Provider<Http>, token: Address, owner: Address) -
     let res = crate::rpc::retrying("erc20 balanceOf()", || {
         let data = data.clone();
         async move {
-            http.call(&TransactionRequest::new().to(token).data(Bytes::from(data)).into(), None)
-                .await
-                .context("erc20 balanceOf()")
+            http.call(
+                &TransactionRequest::new()
+                    .to(token)
+                    .data(Bytes::from(data))
+                    .into(),
+                None,
+            )
+            .await
+            .context("erc20 balanceOf()")
         }
     })
     .await?;
@@ -940,9 +974,9 @@ mod tests {
         let (token, other, me, someone) = (a(1), a(2), a(9), a(8));
         let logs = vec![
             transfer_log(token, me, 100),
-            transfer_log(token, someone, 500),  // not ours
-            transfer_log(other, me, 700),       // not that token
-            transfer_log(token, me, 23),        // routes may pay in parts
+            transfer_log(token, someone, 500), // not ours
+            transfer_log(other, me, 700),      // not that token
+            transfer_log(token, me, 23),       // routes may pay in parts
         ];
         assert_eq!(received(&logs, token, me), Some(U256::from(123u64)));
     }
@@ -954,7 +988,10 @@ mod tests {
         assert_eq!(received(&[transfer_log(token, a(8), 5)], token, me), None);
         // Zero is a real answer and not the same as no answer: a swap that
         // delivered nothing must not be read as "could not tell".
-        assert_eq!(received(&[transfer_log(token, me, 0)], token, me), Some(U256::zero()));
+        assert_eq!(
+            received(&[transfer_log(token, me, 0)], token, me),
+            Some(U256::zero())
+        );
     }
 
     #[test]
@@ -969,9 +1006,13 @@ mod tests {
 
     #[test]
     fn approval_calldata_is_well_formed() {
-        let token: Address = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168".parse().unwrap();
+        let token: Address = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+            .parse()
+            .unwrap();
         let permit2: Address = PERMIT2_DEFAULT.parse().unwrap();
-        let router: Address = "0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99".parse().unwrap();
+        let router: Address = "0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99"
+            .parse()
+            .unwrap();
         let txs = build_unlimited_approval(token, permit2, router).unwrap();
         assert_eq!(txs.len(), 2);
 
@@ -1064,7 +1105,10 @@ mod tests {
 
         let w = build_wrap(weth, amount).unwrap();
         assert_eq!(w.to, weth);
-        assert_eq!(w.value, amount, "the amount is the payment, not an argument");
+        assert_eq!(
+            w.value, amount,
+            "the amount is the payment, not an argument"
+        );
         // keccak("deposit()")[..4]
         assert_eq!(hex::encode(&w.data), "d0e30db0");
 
@@ -1082,8 +1126,10 @@ mod tests {
 
     #[test]
     fn max_constants_are_right() {
-        assert_eq!(max_uint160(), U256::from_dec_str(
-            "1461501637330902918203684832716283019655932542975").unwrap());
+        assert_eq!(
+            max_uint160(),
+            U256::from_dec_str("1461501637330902918203684832716283019655932542975").unwrap()
+        );
         assert_eq!(max_uint48(), U256::from(281_474_976_710_655u64));
     }
 }

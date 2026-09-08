@@ -51,9 +51,9 @@
 
 use crate::config::Config;
 use crate::execute;
-use crate::strategy::Signal;
 use crate::pool::Pool;
 use crate::route::{format_units, Hop, PoolRef, Route, Token};
+use crate::strategy::Signal;
 use crate::swap;
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
@@ -289,7 +289,11 @@ impl Prepared {
             crossed += r.ticks_crossed;
             amount = r.amount_out;
         }
-        Some(Walked { amount_out: amount, impacts, crossed })
+        Some(Walked {
+            amount_out: amount,
+            impacts,
+            crossed,
+        })
     }
 }
 
@@ -431,7 +435,9 @@ impl TickBook {
         window: Option<crate::depth::TickWindow>,
         state: Option<crate::depth::PoolState>,
     ) {
-        let Ok(mut book) = self.inner.lock() else { return };
+        let Ok(mut book) = self.inner.lock() else {
+            return;
+        };
         let had = book.get(&key).is_some_and(|e| e.window.is_some());
         match (had, window.is_some()) {
             (true, false) => warn!(
@@ -442,7 +448,14 @@ impl TickBook {
             (false, true) => info!(pool = %key, "tick window available"),
             _ => {}
         }
-        book.insert(key, Entry { window, state, at: Instant::now() });
+        book.insert(
+            key,
+            Entry {
+                window,
+                state,
+                at: Instant::now(),
+            },
+        );
     }
 }
 
@@ -505,11 +518,7 @@ fn live_hop(key: PoolRef, sig: &Signal, route: &Route) -> Option<(PoolRef, HopSt
 /// the read ticks looks like - which happens exactly when the ceiling is far
 /// larger than the ladder reaches, and where a smaller size is still perfectly
 /// answerable.
-fn size_to_impact(
-    cap: U256,
-    target: f64,
-    impact_at: impl Fn(U256) -> Option<f64>,
-) -> Option<U256> {
+fn size_to_impact(cap: U256, target: f64, impact_at: impl Fn(U256) -> Option<f64>) -> Option<U256> {
     if cap.is_zero() {
         return None;
     }
@@ -725,12 +734,13 @@ impl Executor {
             manager,
             permit2,
             calibrate_secs: cfg.calibrate_secs,
-            gas_reserve: crate::route::parse_units(&cfg.gas_reserve, 18)
-                .context("gas_reserve")?,
+            gas_reserve: crate::route::parse_units(&cfg.gas_reserve, 18).context("gas_reserve")?,
             // Read once here so the first signal is judged on a real figure
             // rather than on a zero that would refuse it.
             gas_balance: std::sync::Mutex::new(
-                swap::balance_of(http, Address::zero(), owner).await.unwrap_or_default(),
+                swap::balance_of(http, Address::zero(), owner)
+                    .await
+                    .unwrap_or_default(),
             ),
             wallet,
             owner,
@@ -896,7 +906,10 @@ impl Executor {
                 );
                 self.ticks.put(key, Some(w), Some(state));
             }
-            Err(e) => self.keep_window(key, "could not read the tick window", e).await,
+            Err(e) => {
+                self.keep_window(key, "could not read the tick window", e)
+                    .await
+            }
         }
     }
 
@@ -1074,7 +1087,11 @@ impl Executor {
         let size = {
             let impact_at = |amount: U256| -> Option<f64> {
                 let walked = prepared.walk(crate::route::u256_to_f64(amount))?;
-                walked.impacts.iter().find(|(p, _)| *p == key).map(|(_, i)| *i)
+                walked
+                    .impacts
+                    .iter()
+                    .find(|(p, _)| *p == key)
+                    .map(|(_, i)| *i)
             };
             let sized = size_to_impact(cap, target, impact_at)?;
             // The whole balance still does not move the pool as far as asked.
@@ -1170,7 +1187,11 @@ impl Executor {
         let target = route.impact_pct / 100.0;
         let impact_at = |amount: U256| -> Option<f64> {
             let walked = prepared.walk(crate::route::u256_to_f64(amount))?;
-            walked.impacts.iter().find(|(p, _)| *p == key).map(|(_, i)| *i)
+            walked
+                .impacts
+                .iter()
+                .find(|(p, _)| *p == key)
+                .map(|(_, i)| *i)
         };
         // Falling back rather than failing: a measurement at the wrong size is
         // worth more than no measurement, and no measurement means no trading
@@ -1289,7 +1310,13 @@ impl Executor {
                     }
                 }
                 match build_plan(
-                    &self.http, cfg, rc, self.manager, self.router, self.owner, self.execute,
+                    &self.http,
+                    cfg,
+                    rc,
+                    self.manager,
+                    self.router,
+                    self.owner,
+                    self.execute,
                     &mut approve,
                 )
                 .await
@@ -1340,7 +1367,9 @@ impl Executor {
         // prices a sale, and a route that bought a position is the only thing
         // that knows how to sell it back.
         for plan in self.plans_now() {
-            let Some(trigger) = plan.source.trigger() else { continue };
+            let Some(trigger) = plan.source.trigger() else {
+                continue;
+            };
             if named.contains(&trigger) {
                 continue;
             }
@@ -1461,7 +1490,11 @@ impl Executor {
         }
         let amount_out = quoted.amount_out;
         let hash = self.broadcast(key, plan, &tx, spend, quoted).await?;
-        Ok(Some(Fill { hash, sold: spend, amount_out }))
+        Ok(Some(Fill {
+            hash,
+            sold: spend,
+            amount_out,
+        }))
     }
 
     /// Sell everything held of what a route buys, back down that same route.
@@ -1526,11 +1559,18 @@ impl Executor {
         // and refreshed in the background after every sale - so a revoked
         // approval is noticed by the pass after the one that used it, and a
         // partial one is never cached at all.
-        let cached = plan.as_ref().is_some_and(|p| p.sell_approved.load(Ordering::Relaxed));
+        let cached = plan
+            .as_ref()
+            .is_some_and(|p| p.sell_approved.load(Ordering::Relaxed));
         if sell.input.address != Address::zero() && !cached {
-            let (erc20, p2) =
-                swap::check_approvals(&self.http, sell.input.address, self.owner, self.permit2, self.router)
-                    .await?;
+            let (erc20, p2) = swap::check_approvals(
+                &self.http,
+                sell.input.address,
+                self.owner,
+                self.permit2,
+                self.router,
+            )
+            .await?;
             anyhow::ensure!(
                 erc20 >= size && p2 >= size,
                 "{} is not approved for the router (erc20->permit2 {erc20}, permit2->router {p2}); \
@@ -1606,7 +1646,9 @@ impl Executor {
         // A sale that already reverted is not re-quoted by the model, and one
         // with no live state was never going to be.
         let modelled = match !retry && fresh.is_some() {
-            true => prepared.as_ref().and_then(|p| self.model_quote(&sell, p, ppm, size)),
+            true => prepared
+                .as_ref()
+                .and_then(|p| self.model_quote(&sell, p, ppm, size)),
             false => None,
         };
         // The router's answer has no impact to report: it is not a model, so
@@ -1615,7 +1657,14 @@ impl Executor {
             Some(m) => (m.amount_out, "model", Some(m.impact)),
             None => (
                 execute::verify(
-                    &self.http, self.router, self.owner, &sell, size, hint, deadline, None,
+                    &self.http,
+                    self.router,
+                    self.owner,
+                    &sell,
+                    size,
+                    hint,
+                    deadline,
+                    None,
                 )
                 .await
                 .context("quoting the sale")?
@@ -1625,7 +1674,10 @@ impl Executor {
             ),
         };
         let min_out = execute::apply_slippage(amount_out, slippage_pct);
-        anyhow::ensure!(!min_out.is_zero(), "the sale's amountOutMinimum rounds to zero");
+        anyhow::ensure!(
+            !min_out.is_zero(),
+            "the sale's amountOutMinimum rounds to zero"
+        );
         let tx = execute::pending_swap(self.router, &sell, size, min_out, deadline)?;
 
         info!(
@@ -1666,15 +1718,20 @@ impl Executor {
         // Both from memory. Nothing between deciding to sell and broadcasting
         // may wait on a request - see `swap::FeeWatch::params` and
         // `claim_nonce`, which is why neither of them can ask any more.
-        let fees = self.fees.params().context(
-            "no gas price known yet - the header stream has not delivered one",
-        )?;
+        let fees = self
+            .fees
+            .params()
+            .context("no gas price known yet - the header stream has not delivered one")?;
         let nonce = self.claim_nonce().await?;
         match swap::send_nowait(&self.submit, &self.wallet, &tx, nonce.into(), fees, gas).await {
             Ok(hash) => {
                 info!(route = %sell.name, ?hash, nonce, %gas, "sold");
                 self.refresh_sell(key, size);
-                Ok(Some(Fill { hash, sold: size, amount_out }))
+                Ok(Some(Fill {
+                    hash,
+                    sold: size,
+                    amount_out,
+                }))
             }
             Err(e) => {
                 *self.next_nonce.lock().await = None;
@@ -1769,7 +1826,12 @@ impl Executor {
         // The model prices every buy or none does: there is no router
         // fallback on this path. Skip the buy instead of guessing; it costs
         // nothing but this one drop, and there will be another.
-        let Some(Modelled { amount_out, impact, crossed }) = modelled else {
+        let Some(Modelled {
+            amount_out,
+            impact,
+            crossed,
+        }) = modelled
+        else {
             anyhow::bail!(
                 "route '{}': the model could not price this trade - see the reason logged \
                  just above; skipping rather than guessing",
@@ -1845,9 +1907,9 @@ impl Executor {
         quoted: Quoted,
     ) -> Result<ethers::types::H256> {
         let name = plan.route.name.clone();
-        let fees = quoted.fees.context(
-            "no gas price known yet - the header stream has not delivered one",
-        )?;
+        let fees = quoted
+            .fees
+            .context("no gas price known yet - the header stream has not delivered one")?;
         let gas_limit = U256::from(plan.gas_limit.load(Ordering::Relaxed));
         let nonce = self.claim_nonce().await?;
         let started = Instant::now();
@@ -1892,7 +1954,11 @@ impl Executor {
             let sell = plan.route.reversed();
             if sell.input.address != Address::zero() {
                 match swap::check_approvals(
-                    &me.http, sell.input.address, me.owner, me.permit2, me.router,
+                    &me.http,
+                    sell.input.address,
+                    me.owner,
+                    me.permit2,
+                    me.router,
                 )
                 .await
                 {
@@ -2112,7 +2178,9 @@ impl Executor {
             });
             let mut here = match fresh {
                 Some((p, s)) if p == hop.pool_ref() => s,
-                _ => match scanned.or_else(|| known.as_ref().and_then(|k| k.get(&hop.pool_ref())).copied()) {
+                _ => match scanned
+                    .or_else(|| known.as_ref().and_then(|k| k.get(&hop.pool_ref())).copied())
+                {
                     Some(s) => s,
                     None => {
                         warn!(
@@ -2201,15 +2269,17 @@ impl Executor {
         yield_ppm: u64,
         amount_in: U256,
     ) -> Option<Modelled> {
-        let walked = prepared.walk(crate::route::u256_to_f64(amount_in)).or_else(|| {
-            warn!(
-                route = %route.name,
-                amount_in = %format_units(amount_in, route.input.decimals),
-                "not priced: the walk returned nothing for this size - it walks past what \
-                 the tick scan read, or a hop has no liquidity in this direction"
-            );
-            None
-        })?;
+        let walked = prepared
+            .walk(crate::route::u256_to_f64(amount_in))
+            .or_else(|| {
+                warn!(
+                    route = %route.name,
+                    amount_in = %format_units(amount_in, route.input.decimals),
+                    "not priced: the walk returned nothing for this size - it walks past what \
+                     the tick scan read, or a hop has no liquidity in this direction"
+                );
+                None
+            })?;
 
         // What the pools state, less what this direction was measured to pay
         // beyond them.
@@ -2217,7 +2287,11 @@ impl Executor {
         let raw = crate::route::f64_to_u256_pub(amount);
         // The worst hop, not the last: a quote is only as trustworthy as the
         // pool it strained most.
-        let worst = walked.impacts.iter().map(|(_, i)| *i).fold(0.0f64, f64::max);
+        let worst = walked
+            .impacts
+            .iter()
+            .map(|(_, i)| *i)
+            .fold(0.0f64, f64::max);
         (!raw.is_zero()).then_some(Modelled {
             amount_out: raw,
             impact: worst,
@@ -2349,13 +2423,20 @@ async fn build_plan(
     execute: bool,
     approve: &mut Approver<'_>,
 ) -> Result<(PoolRef, Plan)> {
-    let weth = cfg.weth.as_deref().map(str::parse).transpose().context("weth")?;
+    let weth = cfg
+        .weth
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .context("weth")?;
     let route = Route::resolve(http, manager, rc, &cfg.tokens, weth)
         .await
         .with_context(|| format!("auto_buy route '{}'", rc.name))?;
     // Default to the pool the route ends in: that is the one whose price the
     // buy is reacting to.
-    let trigger = rc.trigger().with_context(|| format!("route '{}': trigger pool", rc.name))?;
+    let trigger = rc
+        .trigger()
+        .with_context(|| format!("route '{}': trigger pool", rc.name))?;
 
     // A trigger nobody subscribes to is a route that can never fire. Not fatal
     // - the pool may be about to be added - but silent failure is exactly what
@@ -2391,8 +2472,13 @@ async fn build_plan(
     // Measured now, while nobody is waiting, so the hot path never has to ask.
     // A route that cannot be estimated yet still gets armed: the fallback is
     // generous and the next send re-measures.
-    let probe =
-        execute::pending_swap(router, &route, U256::one(), U256::one(), execute::deadline_in(600))?;
+    let probe = execute::pending_swap(
+        router,
+        &route,
+        U256::one(),
+        U256::one(),
+        execute::deadline_in(600),
+    )?;
     let gas_limit = match swap::measure_gas(http, owner, &probe).await {
         Ok(g) => g.min(U256::from(u64::MAX)).as_u64(),
         Err(e) => {
@@ -2559,9 +2645,15 @@ impl Approver<'_> {
     /// and Permit2's to the router. Both have to be there; either alone spends
     /// nothing.
     async fn allowances(&self, token: &Token) -> Result<(U256, U256)> {
-        swap::check_approvals(self.http, token.address, self.owner, self.permit2, self.router)
-            .await
-            .with_context(|| format!("reading {}'s allowances", token.symbol))
+        swap::check_approvals(
+            self.http,
+            token.address,
+            self.owner,
+            self.permit2,
+            self.router,
+        )
+        .await
+        .with_context(|| format!("reading {}'s allowances", token.symbol))
     }
 }
 
@@ -2585,7 +2677,11 @@ mod tests {
     }
 
     fn token(sym: &str) -> Token {
-        Token { address: Address::from([7u8; 20]), decimals: 18, symbol: sym.into() }
+        Token {
+            address: Address::from([7u8; 20]),
+            decimals: 18,
+            symbol: sym.into(),
+        }
     }
 
     fn plan_of(rc: &crate::config::RouteConfig) -> Plan {
@@ -2623,7 +2719,10 @@ mod tests {
         numbers.impact_pct = 3.0;
         numbers.max_slippage_pct = 5.0;
         numbers.cooldown_secs = 9;
-        assert!(same_path(&a, &numbers), "the same pools, spending the same token");
+        assert!(
+            same_path(&a, &numbers),
+            "the same pools, spending the same token"
+        );
         assert!(changed_numbers(&a, &numbers));
 
         let mut path = a.clone();
@@ -2632,13 +2731,19 @@ mod tests {
 
         let mut spend = a.clone();
         spend.input = "USDC".into();
-        assert!(!same_path(&a, &spend), "a different token in is a different trade");
+        assert!(
+            !same_path(&a, &spend),
+            "a different token in is a different trade"
+        );
 
         let mut trigger = a.clone();
         trigger.trigger_pool = Some("0xpool9".into());
         assert!(!same_path(&a, &trigger));
 
-        assert!(!changed_numbers(&a, &a.clone()), "an untouched route is not retuned");
+        assert!(
+            !changed_numbers(&a, &a.clone()),
+            "an untouched route is not retuned"
+        );
     }
 
     /// Retuning one number must not stop the route: a plan built fresh reads
@@ -2655,14 +2760,31 @@ mod tests {
         after.cooldown_secs = 11;
         let new = retuned(&old, &after);
 
-        assert_eq!(new.route.impact_pct, 3.5, "the new number is in the route that gets priced");
+        assert_eq!(
+            new.route.impact_pct, 3.5,
+            "the new number is in the route that gets priced"
+        );
         assert_eq!(new.cooldown, Duration::from_secs(11));
-        assert_eq!(new.yield_ppm.load(Ordering::Relaxed), 990_000, "measured yield carried");
+        assert_eq!(
+            new.yield_ppm.load(Ordering::Relaxed),
+            990_000,
+            "measured yield carried"
+        );
         assert_eq!(new.sell_yield_ppm.load(Ordering::Relaxed), 980_000);
-        assert_eq!(new.gas_limit.load(Ordering::Relaxed), 1_234_567, "measured gas carried");
+        assert_eq!(
+            new.gas_limit.load(Ordering::Relaxed),
+            1_234_567,
+            "measured gas carried"
+        );
         assert_eq!(new.sell_gas_limit.load(Ordering::Relaxed), 7_654_321);
-        assert!(new.sell_approved.load(Ordering::Relaxed), "the approval still stands");
-        assert!(!new.armed.load(Ordering::Relaxed), "a disarmed route is not armed by a retune");
+        assert!(
+            new.sell_approved.load(Ordering::Relaxed),
+            "the approval still stands"
+        );
+        assert!(
+            !new.armed.load(Ordering::Relaxed),
+            "a disarmed route is not armed by a retune"
+        );
     }
 
     /// Sizing decides how much money leaves the wallet, so what it must never
@@ -2677,7 +2799,10 @@ mod tests {
         // Target reachable well inside the ceiling.
         let got = size_to_impact(cap, 0.01, linear).expect("sizeable");
         assert!(linear(got).unwrap() <= 0.01, "must not overshoot");
-        assert!(got > U256::from(900u64) && got <= U256::from(1_000u64), "{got}");
+        assert!(
+            got > U256::from(900u64) && got <= U256::from(1_000u64),
+            "{got}"
+        );
 
         // Target the ceiling cannot reach: spend the ceiling, which is the
         // whole reason a ceiling is kept.
@@ -2695,13 +2820,17 @@ mod tests {
     fn an_unpriceable_size_is_treated_as_too_big() {
         let cap = U256::from(10_000u64);
         // Anything past 2000 walks off the end of what was read.
-        let short = |a: U256| {
-            (a <= U256::from(2_000u64)).then(|| a.as_u64() as f64 / 100_000.0)
-        };
+        let short = |a: U256| (a <= U256::from(2_000u64)).then(|| a.as_u64() as f64 / 100_000.0);
 
         let got = size_to_impact(cap, 0.05, short).expect("the smaller sizes are priceable");
-        assert!(got <= U256::from(2_000u64), "never past what could be priced: {got}");
-        assert!(got > U256::from(1_900u64), "and not needlessly small either: {got}");
+        assert!(
+            got <= U256::from(2_000u64),
+            "never past what could be priced: {got}"
+        );
+        assert!(
+            got > U256::from(1_900u64),
+            "and not needlessly small either: {got}"
+        );
 
         // Nothing priceable at all is a refusal, not a guess.
         assert_eq!(size_to_impact(cap, 0.05, |_| None), None);
@@ -2717,18 +2846,27 @@ mod tests {
 
         // What the approval this bot sends actually sets.
         let permit2_max = (U256::one() << 160) - 1;
-        assert!(permit2_max > bar, "a full Permit2 approval must clear the bar");
+        assert!(
+            permit2_max > bar,
+            "a full Permit2 approval must clear the bar"
+        );
         assert!(U256::MAX > bar, "a full ERC20 approval must clear the bar");
 
         // A billion tokens at 18 decimals - orders of magnitude past anything
         // these routes trade, and still nowhere near the bar.
         let absurd = U256::from(10u64).pow(U256::from(27u64));
-        assert!(absurd < bar, "no position this bot can build may reach the bar");
+        assert!(
+            absurd < bar,
+            "no position this bot can build may reach the bar"
+        );
 
         // And an approval sized for a trade, however generously, must NOT pass
         // for unlimited: a million tokens at 18 decimals is still a ceiling,
         // and startup has to replace it rather than accept it.
         let generous = U256::from(10u64).pow(U256::from(24u64));
-        assert!(generous < bar, "a trade-sized allowance must not read as unlimited");
+        assert!(
+            generous < bar,
+            "a trade-sized allowance must not read as unlimited"
+        );
     }
 }

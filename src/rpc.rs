@@ -91,14 +91,20 @@ mod tests {
     /// three times, on every signal, into a limit that is already biting.
     #[test]
     fn only_capacity_refusals_are_worth_asking_again() {
-        assert!(transient("(code: -32000, message: fullnode request limit exceeded)"));
+        assert!(transient(
+            "(code: -32000, message: fullnode request limit exceeded)"
+        ));
         assert!(transient("(code: -32005, message: rate limit exceeded)"));
-        assert!(transient("(code: -32000, message: fullnode unavailable, data: None)"));
+        assert!(transient(
+            "(code: -32000, message: fullnode unavailable, data: None)"
+        ));
         assert!(transient("error sending request for url (https://...)"));
         assert!(transient("operation timed out"));
 
         assert!(!transient("execution reverted: V4TooLittleReceived"));
-        assert!(!transient("(code: 3, message: execution reverted, data: Some(\"0xbe8b8507\"))"));
+        assert!(!transient(
+            "(code: 3, message: execution reverted, data: Some(\"0xbe8b8507\"))"
+        ));
         assert!(!transient("Block range is too large"));
         assert!(!transient("invalid api key"));
         assert!(!transient(""));

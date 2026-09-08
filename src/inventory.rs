@@ -391,9 +391,8 @@ impl Inventory {
                 self.cash.insert(ctoken.clone(), corrected.to_string());
             }
         }
-        let amount = moved.unwrap_or_else(|| {
-            ethers::types::U256::from_dec_str(&p.raw).unwrap_or_default()
-        });
+        let amount =
+            moved.unwrap_or_else(|| ethers::types::U256::from_dec_str(&p.raw).unwrap_or_default());
         let human = raw_to_f64(amount, p.decimals);
         match p.side {
             Side::Buy => {
@@ -546,7 +545,9 @@ impl Inventory {
     /// Write to disk. Through a temporary file, so a crash mid-write leaves the
     /// previous state rather than half of this one.
     pub fn save(&self) -> Result<()> {
-        let Some(path) = &self.path else { return Ok(()) };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         let tmp = path.with_extension("json.tmp");
         let body = serde_json::to_string_pretty(self).context("serialising inventory")?;
         std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
@@ -636,7 +637,11 @@ mod tests {
         assert!(target > 10.5 && target < 12.5, "{target}");
         // ...and nowhere near the route's cost, which is what it became when
         // the two were confused.
-        assert!(target < p.avg_cost, "{target} should be far below {}", p.avg_cost);
+        assert!(
+            target < p.avg_cost,
+            "{target} should be far below {}",
+            p.avg_cost
+        );
     }
 
     /// A 5% take-profit has to mean 5% kept, so the target sits above the entry
@@ -731,11 +736,22 @@ mod tests {
         assert_eq!(inv.cash(cash), U256::from(750u64));
 
         // ...and the reservation carries that figure with it.
-        assert!(inv.reserve(hash(1), buy_committing(addr(1), 10.0, 10.0, U256::from(250u64))));
-        assert_eq!(inv.cash(cash), U256::from(750u64), "reserving must not move it again");
+        assert!(inv.reserve(
+            hash(1),
+            buy_committing(addr(1), 10.0, 10.0, U256::from(250u64))
+        ));
+        assert_eq!(
+            inv.cash(cash),
+            U256::from(750u64),
+            "reserving must not move it again"
+        );
 
         assert_eq!(inv.rollback(hash(1)), Some(Side::Buy));
-        assert_eq!(inv.cash(cash), U256::from(1_000u64), "the whole 250 comes back");
+        assert_eq!(
+            inv.cash(cash),
+            U256::from(1_000u64),
+            "the whole 250 comes back"
+        );
     }
 
     /// A buy that lands keeps its money: the refund is for trades that never
@@ -746,10 +762,17 @@ mod tests {
         let cash = addr(9);
         inv.set_cash(cash, U256::from(1_000u64));
         inv.debit_cash(cash, U256::from(250u64));
-        assert!(inv.reserve(hash(1), buy_committing(addr(1), 10.0, 10.0, U256::from(250u64))));
+        assert!(inv.reserve(
+            hash(1),
+            buy_committing(addr(1), 10.0, 10.0, U256::from(250u64))
+        ));
 
         inv.settle(hash(1), None, None, Some(10.5));
-        assert_eq!(inv.cash(cash), U256::from(750u64), "a spent 250 stays spent");
+        assert_eq!(
+            inv.cash(cash),
+            U256::from(750u64),
+            "a spent 250 stays spent"
+        );
 
         // The reservation is gone, so a second answer about it changes nothing.
         assert_eq!(inv.rollback(hash(1)), None);
@@ -826,8 +849,14 @@ mod tests {
     fn a_buy_that_delivered_nothing_is_not_a_position() {
         let mut inv = Inventory::default();
         inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
-        assert_eq!(inv.settle(hash(1), Some(U256::zero()), None, None), Some(Side::Buy));
-        assert!(inv.get(addr(1)).is_none(), "nothing arrived, so nothing is held");
+        assert_eq!(
+            inv.settle(hash(1), Some(U256::zero()), None, None),
+            Some(Side::Buy)
+        );
+        assert!(
+            inv.get(addr(1)).is_none(),
+            "nothing arrived, so nothing is held"
+        );
     }
 
     #[test]
@@ -874,10 +903,20 @@ mod tests {
             (5, raw(10.0), f64::INFINITY),
         ] {
             assert!(
-                !inv.reserve(hash(n), Trade { raw: size, price, ..buy(addr(1), 1.0, 1.0) }),
+                !inv.reserve(
+                    hash(n),
+                    Trade {
+                        raw: size,
+                        price,
+                        ..buy(addr(1), 1.0, 1.0)
+                    }
+                ),
                 "{size} at {price} should be refused"
             );
-            assert!(inv.settle(hash(n), None, None, None).is_none(), "and nothing to settle");
+            assert!(
+                inv.settle(hash(n), None, None, None).is_none(),
+                "and nothing to settle"
+            );
         }
         let p = inv.get(addr(1)).unwrap();
         assert_eq!(p.held(), raw(100.0));
@@ -920,7 +959,10 @@ mod tests {
     fn a_reservation_changes_nothing_until_it_settles() {
         let mut inv = Inventory::default();
         assert!(inv.reserve(hash(1), buy(addr(1), 100.0, 10.0)));
-        assert!(inv.get(addr(1)).is_none(), "a sent transaction is not a fill");
+        assert!(
+            inv.get(addr(1)).is_none(),
+            "a sent transaction is not a fill"
+        );
         assert_eq!(inv.settle(hash(1), None, None, None), Some(Side::Buy));
         assert_eq!(inv.get(addr(1)).unwrap().held(), raw(100.0));
     }
@@ -943,7 +985,10 @@ mod tests {
         let mut inv = Inventory::default();
         filled(&mut inv, 1, addr(1), 100.0, 10.0);
         inv.reserve(hash(3), sale(addr(1), 100.0));
-        assert!(inv.get(addr(1)).is_some(), "still held while the sale is in flight");
+        assert!(
+            inv.get(addr(1)).is_some(),
+            "still held while the sale is in flight"
+        );
         // A sale that fails leaves the position exactly as it was, so the next
         // attempt still knows what it is selling and at what average.
         assert_eq!(inv.rollback(hash(3)), Some(Side::Sell));
@@ -973,8 +1018,16 @@ mod tests {
         let mut inv = Inventory::default();
         inv.reserve(hash(1), buy(addr(1), 100.0, 10.0));
         assert_eq!(inv.settle(hash(1), None, None, None), Some(Side::Buy));
-        assert_eq!(inv.settle(hash(1), None, None, None), None, "the reservation is gone");
-        assert_eq!(inv.get(addr(1)).unwrap().held(), raw(100.0), "and was counted once");
+        assert_eq!(
+            inv.settle(hash(1), None, None, None),
+            None,
+            "the reservation is gone"
+        );
+        assert_eq!(
+            inv.get(addr(1)).unwrap().held(),
+            raw(100.0),
+            "and was counted once"
+        );
     }
 
     #[test]
@@ -985,13 +1038,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut inv = Inventory::load(&path).unwrap();
-        assert!(inv.is_empty(), "a missing file is a first run, not a failure");
+        assert!(
+            inv.is_empty(),
+            "a missing file is a first run, not a failure"
+        );
         // A number f64 cannot hold, which is the whole reason it is stored as
         // a string: a sale asks for exactly this.
         let odd = U256::from_dec_str("123456789012345678901").unwrap();
         inv.reserve(
             hash(7),
-            Trade { symbol: "CAMELTOE".into(), raw: odd, ..buy(addr(7), 1.0, 0.0000123) },
+            Trade {
+                symbol: "CAMELTOE".into(),
+                raw: odd,
+                ..buy(addr(7), 1.0, 0.0000123)
+            },
         );
         inv.settle(hash(7), None, None, None);
         inv.reserve(hash(8), buy(addr(8), 1.0, 5.0));
@@ -1000,7 +1060,11 @@ mod tests {
         let back = Inventory::load(&path).unwrap();
         assert_eq!(back.get(addr(7)).unwrap().held(), odd);
         assert_eq!(back.get(addr(7)).unwrap().symbol, "CAMELTOE");
-        assert_eq!(back.unsettled().len(), 1, "a trade in flight is not lost either");
+        assert_eq!(
+            back.unsettled().len(),
+            1,
+            "a trade in flight is not lost either"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -1011,13 +1075,20 @@ mod tests {
         inv.reserve(hash(2), sale(addr(1), 100.0));
         inv.settle(hash(2), None, None, None);
         assert!(inv.get(addr(1)).is_none());
-        assert!(inv.settle(hash(2), None, None, None).is_none(), "and stays forgotten");
+        assert!(
+            inv.settle(hash(2), None, None, None).is_none(),
+            "and stays forgotten"
+        );
     }
 
     #[test]
     fn cash_starts_at_zero_and_is_set_by_seeding() {
         let mut inv = Inventory::default();
-        assert_eq!(inv.cash(addr(9)), U256::zero(), "untouched means zero, not unknown");
+        assert_eq!(
+            inv.cash(addr(9)),
+            U256::zero(),
+            "untouched means zero, not unknown"
+        );
         inv.set_cash(addr(9), raw(50.0));
         assert_eq!(inv.cash(addr(9)), raw(50.0));
         // The chain is always the source of truth for this number, so a
@@ -1034,7 +1105,11 @@ mod tests {
         inv.debit_cash(addr(9), raw(30.0));
         assert_eq!(inv.cash(addr(9)), raw(70.0), "spoken for immediately");
         inv.debit_cash(addr(9), raw(1000.0));
-        assert_eq!(inv.cash(addr(9)), U256::zero(), "floors rather than wraps negative");
+        assert_eq!(
+            inv.cash(addr(9)),
+            U256::zero(),
+            "floors rather than wraps negative"
+        );
     }
 
     #[test]
@@ -1055,7 +1130,10 @@ mod tests {
         let mut inv = Inventory::default();
         let proceeds = addr(2);
         inv.set_cash(proceeds, raw(10.0));
-        let trade = Trade { credit: Some((proceeds, raw(40.0))), ..sale(addr(1), 5.0) };
+        let trade = Trade {
+            credit: Some((proceeds, raw(40.0))),
+            ..sale(addr(1), 5.0)
+        };
         inv.reserve(hash(1), trade);
         assert_eq!(
             inv.cash(proceeds),
@@ -1069,10 +1147,17 @@ mod tests {
         let mut inv = Inventory::default();
         let proceeds = addr(2);
         inv.set_cash(proceeds, raw(10.0));
-        let trade = Trade { credit: Some((proceeds, raw(40.0))), ..sale(addr(1), 5.0) };
+        let trade = Trade {
+            credit: Some((proceeds, raw(40.0))),
+            ..sale(addr(1), 5.0)
+        };
         inv.reserve(hash(1), trade);
         assert_eq!(inv.rollback(hash(1)), Some(Side::Sell));
-        assert_eq!(inv.cash(proceeds), raw(10.0), "the credit never really happened either");
+        assert_eq!(
+            inv.cash(proceeds),
+            raw(10.0),
+            "the credit never really happened either"
+        );
     }
 
     #[test]
@@ -1083,10 +1168,17 @@ mod tests {
         let proceeds = addr(2);
         inv.set_cash(proceeds, raw(10.0));
         filled(&mut inv, 9, addr(1), 5.0, 1.0);
-        let trade = Trade { credit: Some((proceeds, raw(40.0))), ..sale(addr(1), 5.0) };
+        let trade = Trade {
+            credit: Some((proceeds, raw(40.0))),
+            ..sale(addr(1), 5.0)
+        };
         inv.reserve(hash(1), trade);
         assert_eq!(inv.settle(hash(1), None, None, None), Some(Side::Sell));
-        assert_eq!(inv.cash(proceeds), raw(50.0), "the quoted 40 is still all there is to go on");
+        assert_eq!(
+            inv.cash(proceeds),
+            raw(50.0),
+            "the quoted 40 is still all there is to go on"
+        );
     }
 
     #[test]
@@ -1099,11 +1191,21 @@ mod tests {
         let proceeds = addr(2);
         inv.set_cash(proceeds, raw(10.0));
         filled(&mut inv, 9, addr(1), 5.0, 1.0);
-        let trade = Trade { credit: Some((proceeds, raw(40.0))), ..sale(addr(1), 5.0) };
+        let trade = Trade {
+            credit: Some((proceeds, raw(40.0))),
+            ..sale(addr(1), 5.0)
+        };
         inv.reserve(hash(1), trade);
         assert_eq!(inv.cash(proceeds), raw(50.0), "optimistic, before settling");
-        assert_eq!(inv.settle(hash(1), None, Some(raw(33.0)), None), Some(Side::Sell));
-        assert_eq!(inv.cash(proceeds), raw(43.0), "10 starting + 33 real, not +40 quoted");
+        assert_eq!(
+            inv.settle(hash(1), None, Some(raw(33.0)), None),
+            Some(Side::Sell)
+        );
+        assert_eq!(
+            inv.cash(proceeds),
+            raw(43.0),
+            "10 starting + 33 real, not +40 quoted"
+        );
     }
 
     #[test]
@@ -1114,7 +1216,10 @@ mod tests {
         let proceeds = addr(2);
         inv.set_cash(proceeds, raw(10.0));
         filled(&mut inv, 9, addr(1), 5.0, 1.0);
-        let trade = Trade { credit: Some((proceeds, raw(40.0))), ..sale(addr(1), 5.0) };
+        let trade = Trade {
+            credit: Some((proceeds, raw(40.0))),
+            ..sale(addr(1), 5.0)
+        };
         inv.reserve(hash(1), trade);
         inv.settle(hash(1), None, Some(raw(45.0)), None);
         assert_eq!(inv.cash(proceeds), raw(55.0), "10 starting + 45 real");
@@ -1131,7 +1236,10 @@ mod tests {
         let shared = addr(2);
         inv.set_cash(shared, raw(10.0));
         filled(&mut inv, 9, addr(1), 5.0, 1.0);
-        let trade = Trade { credit: Some((shared, raw(40.0))), ..sale(addr(1), 5.0) };
+        let trade = Trade {
+            credit: Some((shared, raw(40.0))),
+            ..sale(addr(1), 5.0)
+        };
         inv.reserve(hash(1), trade);
         inv.debit_cash(shared, raw(45.0));
         assert_eq!(inv.cash(shared), raw(5.0));
@@ -1144,7 +1252,10 @@ mod tests {
         let mut inv = Inventory::default();
         inv.set_cash(shared, raw(10.0));
         filled(&mut inv, 9, addr(1), 5.0, 1.0);
-        let trade = Trade { credit: Some((shared, raw(40.0))), ..sale(addr(1), 5.0) };
+        let trade = Trade {
+            credit: Some((shared, raw(40.0))),
+            ..sale(addr(1), 5.0)
+        };
         inv.reserve(hash(1), trade);
         inv.debit_cash(shared, raw(45.0));
         inv.settle(hash(1), None, Some(raw(47.0)), None);
@@ -1160,7 +1271,10 @@ mod tests {
         inv.credit_cash(addr(9), raw(1.0));
         assert_eq!(inv.cash(addr(9)), U256::MAX);
         filled(&mut inv, 1, addr(1), 5.0, 1.0);
-        let trade = Trade { credit: Some((addr(9), raw(1.0))), ..sale(addr(1), 5.0) };
+        let trade = Trade {
+            credit: Some((addr(9), raw(1.0))),
+            ..sale(addr(1), 5.0)
+        };
         inv.reserve(hash(2), trade);
         inv.settle(hash(2), None, Some(raw(3.0)), None);
         assert_eq!(inv.cash(addr(9)), U256::MAX, "and the reconciliation too");
@@ -1188,7 +1302,10 @@ mod tests {
 
         let mut inv = Inventory::load(&path).unwrap();
         inv.set_cash(addr(9), raw(123.0));
-        let trade = Trade { credit: Some((addr(9), raw(7.0))), ..sale(addr(1), 5.0) };
+        let trade = Trade {
+            credit: Some((addr(9), raw(7.0))),
+            ..sale(addr(1), 5.0)
+        };
         inv.reserve(hash(1), trade);
         inv.save().unwrap();
 

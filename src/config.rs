@@ -16,7 +16,11 @@ impl Secret {
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_empty() { "[unset]" } else { "[redacted]" })
+        f.write_str(if self.0.is_empty() {
+            "[unset]"
+        } else {
+            "[redacted]"
+        })
     }
 }
 
@@ -65,6 +69,10 @@ pub struct Config {
     /// price moves this much". In-range liquidity only (no tick walking).
     #[serde(default = "default_max_move")]
     pub max_move_pct: f64,
+    /// What the launch sniper is willing to do. Absent means the defaults
+    /// below, which buy nothing until a size is given.
+    #[serde(default)]
+    pub snipe: SnipeConfig,
     /// Ticker -> address registry, e.g. `POOLS = "0x385b..."`. Any pool field
     /// that takes a token accepts either a ticker from here or a raw address.
     #[serde(default)]
@@ -309,12 +317,137 @@ pub struct PoolConfig {
     pub hooks: Option<String>,
 }
 
+/// The sniper's standing policy.
+///
+/// Kept here rather than in the code because every number in it is a judgement
+/// about this launchpad at this moment - what a creator tax is worth paying,
+/// how far a curve may have run - and those are the things that change without
+/// the code changing. Only the rules stay in the code.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct SnipeConfig {
+    /// The deployed `PonsSniper`, which a launch is bought THROUGH rather than
+    /// from. It holds the standing approval for each quote token, so a curve
+    /// that did not exist a second ago is approved and bought from in one
+    /// transaction instead of two.
+    ///
+    /// Absent means buying straight from the curve, which a native launch can
+    /// do - `buy` is payable and takes ETH from the wallet. An ERC-20 launch
+    /// cannot: it needs an approval to an address that only comes into being
+    /// in the launch transaction itself, and that second transaction does not
+    /// fit in the window.
+    #[serde(default)]
+    pub contract: Option<String>,
+    /// What to spend on one launch, as hundredths of a percent of the curve's
+    /// phantom reserve. 100 is one percent.
+    ///
+    /// A fraction rather than an amount, because the same amount means
+    /// different things on different pairs: 0.05 into a native curve, whose
+    /// phantom reserve is 1.68 ETH, is three percent of it - and into a USDG
+    /// one, whose reserve is 3236, it is nothing at all. What decides the
+    /// result is the share of the curve taken, since that is what our own
+    /// buying and selling moves.
+    ///
+    /// Zero means nothing is followed and nothing is decided.
+    #[serde(default = "default_size_x100")]
+    pub size_x100: u64,
+    /// A ceiling on that, in the PAIR TOKEN's own units - "0.1" is 0.1 ETH on
+    /// a native launch. Empty means no ceiling. For the pairs whose reserves
+    /// are large enough that a percent of them is more than is wanted at risk.
+    #[serde(default)]
+    pub size: String,
+    /// How much of the price to give away. Must stay BELOW the gap between two
+    /// tax steps, or the minimum stops telling them apart: a fill one second
+    /// early would satisfy it, and the point of the minimum is that it cannot.
+    #[serde(default = "default_slippage_bps")]
+    pub slippage_bps: u64,
+    /// The most snipe tax worth paying. The launch second is not reachable
+    /// through this at any value - the curve charges 99% there and the wrapper
+    /// refuses it outright.
+    #[serde(default = "default_max_tax_bps")]
+    pub max_tax_bps: u64,
+    /// A creator tax is charged on the way in AND on the way out, so it is
+    /// paid twice before the price has moved at all. Zero by default: a launch
+    /// that wants a cut of both legs is a launch there is no need to be in.
+    #[serde(default)]
+    pub max_creator_tax_bps: u64,
+    /// How far above the opening price this will still buy, in hundredths.
+    /// A launch whose exempt wallets bundled into its own block opens the free
+    /// window at four or five times what the curve started at, and buying
+    /// there is buying their exit.
+    #[serde(default = "default_max_run_x100")]
+    pub max_run_x100: u64,
+    /// More declared exemptions than this and the launch is an arrangement
+    /// rather than a market.
+    #[serde(default = "default_max_exempt")]
+    pub max_exempt: usize,
+    /// Refuse a launch whose maker bought none of it - `launchToken` rather
+    /// than `launchAndBuy`.
+    ///
+    /// The sharpest thing in the journals so far, and known from the feed
+    /// before the block exists: of the launches made without a dev buy, four
+    /// in five saw no trade at all in their first minute; of those made with
+    /// one, none were dead.
+    #[serde(default = "default_true")]
+    pub require_dev_buy: bool,
+    /// The smallest dev buy worth following, against the curve's phantom
+    /// reserve, in hundredths of a percent. 500 is five percent.
+    #[serde(default = "default_min_dev_buy_x100")]
+    pub min_dev_buy_x100: u64,
+    /// How long before a step opens the decision is made, in milliseconds. The
+    /// transaction still has to be signed and sent after it.
+    #[serde(default = "default_lead_ms")]
+    pub lead_ms: u64,
+}
+
+fn default_slippage_bps() -> u64 {
+    100
+}
+fn default_max_tax_bps() -> u64 {
+    19
+}
+fn default_max_run_x100() -> u64 {
+    200
+}
+fn default_max_exempt() -> usize {
+    4
+}
+fn default_lead_ms() -> u64 {
+    100
+}
+fn default_true() -> bool {
+    true
+}
+fn default_min_dev_buy_x100() -> u64 {
+    500
+}
+fn default_size_x100() -> u64 {
+    100
+}
+
+impl Default for SnipeConfig {
+    fn default() -> Self {
+        Self {
+            contract: None,
+            size_x100: default_size_x100(),
+            size: String::new(),
+            slippage_bps: default_slippage_bps(),
+            max_tax_bps: default_max_tax_bps(),
+            max_creator_tax_bps: 0,
+            max_run_x100: default_max_run_x100(),
+            max_exempt: default_max_exempt(),
+            require_dev_buy: true,
+            min_dev_buy_x100: default_min_dev_buy_x100(),
+            lead_ms: default_lead_ms(),
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let mut cfg: Config = toml::from_str(&raw)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+        let mut cfg: Config =
+            toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
         // The environment wins over the file, so a checkout can carry a config
         // with no endpoints and no key at all.
         if let Some(v) = env_var("WS_URL") {
@@ -343,7 +476,9 @@ impl Config {
     /// against a pool here, and a reload has to find the SAME route or it would
     /// retune a pool against somebody else's numbers.
     pub fn armed_route(&self, trigger: crate::route::PoolRef) -> Option<&RouteConfig> {
-        self.routes.iter().find(|r| r.auto_buy && r.trigger() == Some(trigger))
+        self.routes
+            .iter()
+            .find(|r| r.auto_buy && r.trigger() == Some(trigger))
     }
 }
 
@@ -351,7 +486,10 @@ impl RouteConfig {
     /// The pool whose price this route reacts to: the one named, else the pool
     /// it ends in. `None` when neither parses as a pool.
     pub fn trigger(&self) -> Option<crate::route::PoolRef> {
-        let raw = self.trigger_pool.clone().or_else(|| self.pools.last().cloned())?;
+        let raw = self
+            .trigger_pool
+            .clone()
+            .or_else(|| self.pools.last().cloned())?;
         crate::route::parse_pool_ref(&raw).ok()
     }
 }
@@ -385,11 +523,20 @@ pub fn restart_only(running: &Config, next: &Config) -> Vec<&'static str> {
     differs("ws_url", running.ws_url == next.ws_url);
     differs("http_url", running.http_url == next.http_url);
     differs("submit_urls", running.submit_urls == next.submit_urls);
-    differs("private_key", running.private_key.expose() == next.private_key.expose());
+    differs(
+        "private_key",
+        running.private_key.expose() == next.private_key.expose(),
+    );
     differs("gas_reserve", running.gas_reserve == next.gas_reserve);
-    differs("calibrate_secs", running.calibrate_secs == next.calibrate_secs);
+    differs(
+        "calibrate_secs",
+        running.calibrate_secs == next.calibrate_secs,
+    );
     differs("pool_manager", running.pool_manager == next.pool_manager);
-    differs("universal_router", running.universal_router == next.universal_router);
+    differs(
+        "universal_router",
+        running.universal_router == next.universal_router,
+    );
     differs("permit2", running.permit2 == next.permit2);
     differs("weth", running.weth == next.weth);
     // Additions are fine - a pool added by a reload is resolved against the
@@ -397,10 +544,19 @@ pub fn restart_only(running: &Config, next: &Config) -> Vec<&'static str> {
     // every pool and route already resolved is holding the old address.
     differs(
         "tokens",
-        running.tokens.iter().all(|(k, v)| next.tokens.get(k) == Some(v)),
+        running
+            .tokens
+            .iter()
+            .all(|(k, v)| next.tokens.get(k) == Some(v)),
     );
-    differs("inventory_path", running.inventory_path == next.inventory_path);
-    differs("pool_cache_path", running.pool_cache_path == next.pool_cache_path);
+    differs(
+        "inventory_path",
+        running.inventory_path == next.inventory_path,
+    );
+    differs(
+        "pool_cache_path",
+        running.pool_cache_path == next.pool_cache_path,
+    );
     out
 }
 
@@ -456,13 +612,47 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
         cfg.max_move_pct.is_finite() && cfg.max_move_pct > 0.0,
         "max_move_pct must be > 0"
     );
+    anyhow::ensure!(
+        cfg.snipe.slippage_bps < 10_000,
+        "[snipe] slippage_bps is the whole trade"
+    );
+    // Below the gap between two tax steps, or the minimum it produces stops
+    // refusing a fill at the dearer one - which is the only thing that makes a
+    // buy landing a second early revert instead of paying six percent.
+    if cfg.snipe.slippage_bps >= 600 {
+        tracing::warn!(
+            slippage_bps = cfg.snipe.slippage_bps,
+            "[snipe] slippage_bps is wider than the gap between the 618 and 19 bps steps, so \
+             minTokensOut no longer tells them apart"
+        );
+    }
+    anyhow::ensure!(
+        cfg.snipe.max_tax_bps < 10_000,
+        "[snipe] max_tax_bps is the whole trade"
+    );
+    if let Some(c) = &cfg.snipe.contract {
+        let addr = c
+            .parse::<ethers::types::Address>()
+            .map_err(|e| anyhow::anyhow!("[snipe] contract \"{c}\" is not an address: {e}"))?;
+        anyhow::ensure!(
+            !addr.is_zero(),
+            "[snipe] contract is the zero address - remove the line rather than blanking it"
+        );
+    }
+    anyhow::ensure!(
+        cfg.snipe.size_x100 < 10_000,
+        "[snipe] size_x100 is the whole curve"
+    );
+    if !cfg.snipe.size.trim().is_empty() {
+        // Parsed against eighteen decimals only to prove it is a number; the
+        // real parse happens per pair token, in that token\'s own units.
+        crate::route::parse_units(cfg.snipe.size.trim(), 18)
+            .with_context(|| format!("[snipe] size \"{}\" is not an amount", cfg.snipe.size))?;
+    }
+
     let mut seen = std::collections::HashSet::new();
     for r in &cfg.routes {
-        anyhow::ensure!(
-            seen.insert(&r.name),
-            "duplicate route name '{}'",
-            r.name
-        );
+        anyhow::ensure!(seen.insert(&r.name), "duplicate route name '{}'", r.name);
         anyhow::ensure!(!r.pools.is_empty(), "route '{}': no pools listed", r.name);
         if let Some(t) = &r.trigger_pool {
             crate::route::parse_pool_ref(t)
@@ -471,11 +661,7 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
         // Without a gap a single dip fires one buy per block for as long as it
         // lasts, which is never what "buy the dip" is meant to mean.
         if let Some(secs) = r.exit_after_secs {
-            anyhow::ensure!(
-                secs > 0,
-                "route '{}': exit_after_secs must be > 0",
-                r.name
-            );
+            anyhow::ensure!(secs > 0, "route '{}': exit_after_secs must be > 0", r.name);
         }
         // An impact at or past the slippage tolerance is a size the trade could
         // not survive anyway: the move it makes would eat the whole budget meant
@@ -494,7 +680,9 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
             );
         }
         anyhow::ensure!(
-            r.max_slippage_pct.is_finite() && r.max_slippage_pct > 0.0 && r.max_slippage_pct < 100.0,
+            r.max_slippage_pct.is_finite()
+                && r.max_slippage_pct > 0.0
+                && r.max_slippage_pct < 100.0,
             "route '{}': max_slippage_pct must be in (0, 100)",
             r.name
         );
@@ -551,7 +739,11 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
             // Initialize log (found via pool_id), or from token0/token1 in
             // config, or from decimals0/decimals1 directly.
             if p.pool_id.is_none() {
-                anyhow::ensure!(p.fee.is_some(), "pool '{}': v4 requires pool_id or fee", p.name);
+                anyhow::ensure!(
+                    p.fee.is_some(),
+                    "pool '{}': v4 requires pool_id or fee",
+                    p.name
+                );
                 anyhow::ensure!(
                     p.tick_spacing.is_some(),
                     "pool '{}': v4 requires pool_id or tick_spacing",
@@ -574,15 +766,15 @@ mod tests {
 
     /// Everything `validate` insists on, so a test can vary one thing at a time.
     fn with(extra: &str) -> anyhow::Result<Config> {
-        let src = format!(
-            "ws_url = \"wss://x\"\nhttp_url = \"https://x\"\nthreshold_pct = 3\n{extra}"
-        );
+        let src =
+            format!("ws_url = \"wss://x\"\nhttp_url = \"https://x\"\nthreshold_pct = 3\n{extra}");
         let cfg: Config = toml::from_str(&src)?;
         validate(&cfg)?;
         Ok(cfg)
     }
 
     const MANAGER: &str = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
+    const SNIPER: &str = "0x1D8F08f47b60349925fB45064e80C3e4E8AD0184";
 
     /// Every v4 pool on a chain shares one PoolManager, so it is written once at
     /// the top and the pools say nothing about it.
@@ -675,7 +867,9 @@ mod tests {
              impact_pct = 1\npools = [\"{id}\"]\nauto_buy = true\n"
         ))
         .expect("a route over the watched pool");
-        let key = cfg.pools[0].pool_ref().expect("a v4 pool is named by its id");
+        let key = cfg.pools[0]
+            .pool_ref()
+            .expect("a v4 pool is named by its id");
         assert_eq!(cfg.routes[0].trigger(), Some(key));
         assert_eq!(cfg.armed_route(key).map(|r| r.name.as_str()), Some("buy A"));
 
@@ -694,9 +888,8 @@ mod tests {
     /// endpoint, sends SIGHUP and believes the bot took it.
     #[test]
     fn a_field_only_a_restart_applies_is_named() {
-        let pool = format!(
-            "[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"{MANAGER}\"\n"
-        );
+        let pool =
+            format!("[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"{MANAGER}\"\n");
         let running = with(&pool).expect("valid");
         let mut next = running.clone();
         assert!(restart_only(&running, &next).is_empty(), "nothing changed");
@@ -716,5 +909,34 @@ mod tests {
         let e = with("[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"0xnope\"\n")
             .expect_err("not an address");
         assert!(format!("{e:#}").contains("not an address"), "{e:#}");
+    }
+
+    /// The wrapper an ERC-20 launch is bought through. A blanked-out entry is
+    /// refused rather than read as "no wrapper": the two mean different things
+    /// and only one of them is ever meant.
+    #[test]
+    fn the_snipe_contract_is_read_and_checked() {
+        let pools =
+            format!("[[pools]]\nname = \"A/B\"\nversion = \"v3\"\naddress = \"{MANAGER}\"\n");
+
+        let cfg = with(&format!(
+            "{pools}[snipe]\ncontract = \"{SNIPER}\"\nsize = \"0.1\"\n"
+        ))
+        .expect("a good address");
+        assert_eq!(cfg.snipe.contract.as_deref(), Some(SNIPER));
+
+        let e =
+            with(&format!("{pools}[snipe]\ncontract = \"0xnope\"\n")).expect_err("not an address");
+        assert!(format!("{e:#}").contains("not an address"), "{e:#}");
+
+        let e = with(&format!(
+            "{pools}[snipe]\ncontract = \"0x0000000000000000000000000000000000000000\"\n"
+        ))
+        .expect_err("the zero address");
+        assert!(format!("{e:#}").contains("zero address"), "{e:#}");
+
+        // Absent is a position too: a native launch is still bought straight
+        // from the curve.
+        assert!(with(&pools).unwrap().snipe.contract.is_none());
     }
 }

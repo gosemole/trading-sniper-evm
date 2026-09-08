@@ -66,8 +66,9 @@ static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 /// every lookup simply misses and the bot behaves as it always did.
 pub fn open(path: &Path) -> Result<usize> {
     let store: Store = match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?,
+        Ok(raw) => {
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };

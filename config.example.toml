@@ -36,6 +36,61 @@ max_move_pct = 1.0    # depth line: what it costs to move the price this much (%
 #   spends the native currency directly is refused, because that balance is
 #   what gas is paid from.
 
+# The launch sniper. Everything here is a judgement about the launchpad rather
+# than a rule, which is why it lives in the config: the rules are in the code.
+# Without `size` nothing is followed and nothing is decided.
+# [snipe]
+# contract            = "0x..."
+#   The deployed PonsSniper, which a launch is bought THROUGH rather than from.
+#   It holds the standing approval for each quote token, so a curve that did
+#   not exist a second ago is approved and bought from in one transaction.
+#   Approve it once per quote token, from the wallet this bot signs with, for
+#   an amount you are willing to lose - the approval outlives every trade.
+#   Omitted, a native launch is still bought straight from the curve and an
+#   ERC-20 launch is not bought at all: its approval would not fit the window.
+# size_x100           = 100
+#   What to spend on one launch, as hundredths of a percent of the curve's
+#   phantom reserve. 100 is one percent. A fraction rather than an amount:
+#   0.05 is three percent of a native curve, whose reserve is 1.68 ETH, and
+#   nothing at all of a USDG one, whose reserve is 3236. What decides the
+#   result is the share of the curve taken, because that is what our own
+#   buying and selling moves against us. Zero follows nothing.
+# size                = "0.1"
+#   A ceiling on that, in the PAIR TOKEN's own units. Empty means none.
+# slippage_bps        = 100
+#   Must stay BELOW the gap between two tax steps. The steps are 618 bps and
+#   then 19, about six percent apart in price; an allowance wider than that
+#   would be satisfied by a fill one second early, and the whole point of the
+#   minimum is that it is not.
+# max_tax_bps         = 19
+#   The dearest snipe tax worth paying. The launch second charges 99% and is
+#   refused by the wrapper outright, whatever is set here.
+# max_creator_tax_bps = 0
+#   A creator tax is charged on the way in AND on the way out. Zero by default:
+#   a launch that wants a cut of both legs is one there is no need to be in.
+#   Above this the launch is not even followed.
+# max_run_x100        = 200
+#   How far above the opening price this will still buy, in hundredths. A
+#   launch whose exempt wallets bundled into its own block opens the free
+#   window at four or five times what the curve started at.
+# max_exempt          = 4
+#   More declared exemptions than this and the launch is an arrangement rather
+#   than a market. Above it the launch is not followed at all.
+# require_dev_buy     = true
+#   Refuse a launch whose maker bought none of it - `launchToken` rather than
+#   `launchAndBuy`. The sharpest thing in the journals so far, and known from
+#   the feed before the block exists: of the launches made without a dev buy,
+#   four in five saw no trade at all in their first minute; of those made with
+#   one, none were dead.
+# min_dev_buy_x100    = 500
+#   The smallest dev buy worth following, against the curve's phantom reserve,
+#   in hundredths of a percent. 500 is five percent - the same statement on
+#   every pair, since it is measured against the curve rather than in absolute
+#   terms.
+# lead_ms             = 100
+#   How long before a step opens the decision is made. The transaction still
+#   has to be signed and sent after it.
+
 [tokens]
 ETH      = "0x0000000000000000000000000000000000000000"
 WETH     = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
