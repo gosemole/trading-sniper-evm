@@ -48,8 +48,16 @@ max_creator_tax_bps = 0
 max_dev_buy_x100 = 1500
 
 # An operator with a record of losses is passed over, once there is enough of
-# a record to be one. Behind 35 different deployer addresses on that night sat
-# one operator with nothing worth holding on any of them.
+# a record to be one. Insurance rather than edge, and said so honestly: inside
+# this group it does nothing measurable - 218 of the 266 launches come from an
+# operator never seen before, and turning it on moves the total from +43.0 to
+# +43.4, which is noise. The clustering that catches "a fresh deployer every
+# time" barely merges anything here: 223 operators for 266 launches.
+#
+# It earned its place on the WHOLE flow, where one operator ran 38 launches
+# with nothing worth holding on 35 of them - and the filters above have
+# already removed that flow. Kept because it costs nothing and covers the day
+# a serial launcher does turn up inside the group.
 operator_needs = 5
 
 # A maker who put in nothing. On 4193 launches the band under 2% of the curve
