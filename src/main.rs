@@ -1189,6 +1189,17 @@ async fn watch_launches_cmd(
                                         };
                                         h.mark(exit::worth(&f.curve, h.tokens));
                                         f.shadow = Some(h);
+                                        // The position the decision implies.
+                                        // Without this every later step of the
+                                        // same window asks again and answers
+                                        // BUY again - which on paper is two
+                                        // lines and with a wallet behind it is
+                                        // two buys.
+                                        f.position = snipe::Position::Bought {
+                                            step,
+                                            spend: fill.spent,
+                                            tokens: fill.tokens_out,
+                                        };
                                     }
                                     Err(e) => tracing::warn!(
                                         curve = ?curve_addr, err = %format!("{e:#}"),
