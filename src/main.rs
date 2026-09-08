@@ -1886,12 +1886,14 @@ async fn watch_launches_cmd(
                                 snipe::render(&signal, &decision, *curve_addr, now.elapsed())
                             );
                         }
-                        if let Err(e) = journal::append(
-                            &f.journal,
-                            &journal::decision_line(&signal, &decision),
-                        ) {
-                            tracing::warn!(err = %format!("{e:#}"), "cannot write the decision");
-                        }
+                        // Built here, where the signal is still borrowable,
+                        // and written after the transaction has gone. Opening
+                        // a file, appending and closing it is not free, and it
+                        // sat between deciding to buy and signing the buy - on
+                        // the one path with a hundred milliseconds to spend
+                        // and a step of somebody else's tax window to hit. The
+                        // journal is read hours later; the send is not.
+                        let record = journal::decision_line(&signal, &decision);
                         // Nothing is sent yet, so a buy is recorded as the
                         // decision it is and the position stays open. When
                         // there is a wallet behind this, the position becomes
@@ -1997,6 +1999,10 @@ async fn watch_launches_cmd(
                                 }
                             }
                             _ => {}
+                        }
+                        // The transaction is away; now the file.
+                        if let Err(e) = journal::append(&f.journal, &record) {
+                            tracing::warn!(err = %format!("{e:#}"), "cannot write the decision");
                         }
                     }
                 }
