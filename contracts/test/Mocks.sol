@@ -112,6 +112,33 @@ contract MockCurve {
         return taxBps;
     }
 
+    function token() external view returns (address) {
+        return address(launched);
+    }
+
+    /// The other half of the curve: pulls the tokens, pays out the quote.
+    function sell(uint256 tokensIn, uint256 minQuoteOut, address recipient)
+        external
+        returns (uint256 quoteOut)
+    {
+        uint256 before = launched.balanceOf(address(this));
+        _safeCall(address(launched), abi.encodeWithSelector(0x23b872dd, msg.sender, address(this), tokensIn));
+        uint256 received = launched.balanceOf(address(this)) - before;
+        require(received != 0, "zero");
+
+        quoteOut = (quoteReserve * received) / (tokenReserve + received);
+        if (quoteOut < minQuoteOut) revert SlippageExceeded(quoteOut, minQuoteOut);
+        quoteReserve -= quoteOut;
+        tokenReserve += received;
+
+        if (pairToken == address(0)) {
+            (bool ok,) = recipient.call{value: quoteOut}("");
+            require(ok, "native");
+        } else {
+            _safeCall(pairToken, abi.encodeWithSelector(0xa9059cbb, recipient, quoteOut));
+        }
+    }
+
     function _safeCall(address token, bytes memory data) internal {
         (bool ok, bytes memory returned) = token.call(data);
         require(ok && (returned.length == 0 || abi.decode(returned, (bool))), "safe call");

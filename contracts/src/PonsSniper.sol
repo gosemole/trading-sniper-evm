@@ -50,9 +50,19 @@ pragma solidity ^0.8.26;
  * this at all. It is a defence against a typo, which is the failure that
  * happens.
  *
- * Nothing is held here between trades. Quote assets are pulled from the owner
- * when a buy is made and whatever the curve refunds goes straight back, so a
- * key compromised tomorrow finds an empty contract.
+ * A position bought to this contract is sold from it, by `unwind`, and that is
+ * a deliberate trade against the paragraph below. The curve pulls the launched
+ * token with `transferFrom` too, and that token does not exist until the
+ * launch - so selling from an EOA is an approval and then a sale, two
+ * transactions, and the exit measured on the journals is worth what it is
+ * because it happens within a block of the price that triggered it. Held here,
+ * approved here, it is one call.
+ *
+ * The cost is that this is no longer empty between trades. Quote assets are
+ * still pulled from the owner per buy and every refund goes straight back, so
+ * nothing idle accumulates - but an open position sits here until it is sold,
+ * and a key compromised in that minute finds it. `rescue` is the way out for a
+ * position whose curve will no longer take it back.
  */
 contract PonsSniper {
     error NotOwner();
@@ -70,6 +80,8 @@ contract PonsSniper {
     error NotAPonsCurve(address curve, address itsFactory);
     error CurveNotOpen();
     error TheLaunchSecond(uint256 nowAt, uint256 launchedAt);
+    error NothingHeld(address token);
+    error MoreThanHeld(uint256 asked, uint256 held);
 
     event Sniped(
         address indexed curve,
@@ -78,6 +90,13 @@ contract PonsSniper {
         uint256 spent,
         uint256 tokensOut,
         uint256 taxBps
+    );
+    event Unwound(
+        address indexed curve,
+        address indexed token,
+        address quoteToken,
+        uint256 tokensIn,
+        uint256 quoteOut
     );
     event Rescued(address indexed asset, address indexed to, uint256 amount);
     event SnipeTaxCeilingUpdated(uint256 ceilingBps);
@@ -228,6 +247,60 @@ contract PonsSniper {
     }
 
     /**
+     * @notice Sells a position this contract holds back to the curve it came
+     * from, paying the owner directly.
+     *
+     * The mirror of `snipe`, and shorter, because a sale has none of the
+     * timing that a buy has: there is no snipe tax on the way out, so no
+     * ceiling, no launch second to refuse, and no reason to ask the curve
+     * anything before committing. What is left is the approval - the curve
+     * pulls the launched token the same way it pulls the quote asset - and
+     * that approval is exactly why the position is held here.
+     *
+     * The proceeds go to the owner rather than staying here. There is nothing
+     * this contract could do with them, and an empty contract is a smaller
+     * thing to lose.
+     *
+     * @param curve The curve the position came from. Checked against the
+     * factory for the same reason `snipe` checks it: the mistake that happens
+     * is a wrong address, not a hostile one.
+     * @param tokensIn How much to sell, or **zero for the whole balance**. The
+     * whole balance is the ordinary case and the safer argument: an exact
+     * figure a wei off what is actually held reverts, and a revert on the way
+     * out is a position kept while the price it was leaving keeps falling.
+     * @param minQuoteOut Passed to the curve unchanged.
+     * @param notAfter Latest timestamp this may execute at; zero for none.
+     */
+    function unwind(address curve, uint256 tokensIn, uint256 minQuoteOut, uint256 notAfter)
+        external
+        onlyOwner
+        nonReentrant
+        returns (uint256 quoteOut)
+    {
+        if (curve == address(0)) revert ZeroAddress();
+        if (notAfter != 0 && block.timestamp > notAfter) revert TooLate(block.timestamp, notAfter);
+
+        address itsFactory = IPonsV2BondingCurve(curve).factory();
+        if (itsFactory != factory) revert NotAPonsCurve(curve, itsFactory);
+
+        // From the curve, not from an argument: a token argument that
+        // disagreed with the curve would approve one token and sell another.
+        address token = IPonsV2BondingCurve(curve).token();
+        uint256 held = _balanceOf(token, address(this));
+        if (held == 0) revert NothingHeld(token);
+        uint256 amount = tokensIn == 0 ? held : tokensIn;
+        if (amount > held) revert MoreThanHeld(amount, held);
+
+        _forceApprove(token, curve, amount);
+        quoteOut = IPonsV2BondingCurve(curve).sell(amount, minQuoteOut, owner);
+        // Whatever the curve did or did not pull, nothing of ours stays
+        // spendable by it afterwards.
+        _forceApprove(token, curve, 0);
+
+        emit Unwound(curve, token, IPonsV2BondingCurve(curve).pairToken(), amount, quoteOut);
+    }
+
+    /**
      * @notice Moves the limit any single call may agree to.
      *
      * Unbounded on purpose. Every step this can now reach is one a launch may
@@ -335,4 +408,6 @@ interface IPonsV2BondingCurve {
     function factory() external view returns (address);
     function launchedAt() external view returns (uint256);
     function currentSnipeTaxBps(address recipient) external view returns (uint256);
+    function token() external view returns (address);
+    function sell(uint256 tokensIn, uint256 minQuoteOut, address recipient) external returns (uint256 quoteOut);
 }

@@ -363,4 +363,163 @@ contract PonsSniperTest is Test {
         sniper.acceptOwnership();
         assertEq(sniper.owner(), stranger);
     }
+    // ---- unwind: the way out ----------------------------------------------
+    //
+    // A position bought to the wrapper is sold from it, which is the whole
+    // reason the wrapper holds one at all: the curve pulls the launched token
+    // with `transferFrom`, and that token does not exist until the launch, so
+    // an EOA would need an approval and then a sale. The exit measured on the
+    // journals is worth what it is because it lands within a block of the
+    // price that triggered it, and two transactions are not one block.
+
+    /// Buy to the wrapper, sell from it, and the proceeds reach the owner.
+    function test_unwind_pays_the_owner() public {
+        MockCurve curve = _nativeCurve();
+        curve.setTax(19);
+        vm.prank(owner);
+        uint256 bought = sniper.snipe{value: 1 ether}(address(curve), 1 ether, 0, address(sniper), 19, 0);
+        assertEq(curve.launched().balanceOf(address(sniper)), bought);
+
+        uint256 before = owner.balance;
+        vm.prank(owner);
+        uint256 out = sniper.unwind(address(curve), bought, 0, 0);
+
+        assertGt(out, 0);
+        assertEq(owner.balance - before, out, "the owner was not paid");
+        assertEq(curve.launched().balanceOf(address(sniper)), 0, "a position was left behind");
+        assertEq(
+            curve.launched().allowance(address(sniper), address(curve)),
+            0,
+            "an allowance was left standing"
+        );
+    }
+
+    /// Zero means the whole balance, which is the ordinary case: an exact
+    /// figure a wei off what is held would revert, and a revert on the way out
+    /// keeps a position while the price it was leaving falls.
+    function test_unwind_zero_sells_everything() public {
+        MockToken quote = new MockToken(0, false, false);
+        MockCurve curve = _tokenCurve(quote);
+        curve.setTax(19);
+        quote.mint(owner, 10 ether);
+        vm.prank(owner);
+        quote.approve(address(sniper), type(uint256).max);
+        vm.prank(owner);
+        sniper.snipe(address(curve), 1 ether, 0, address(sniper), 19, 0);
+
+        uint256 held = curve.launched().balanceOf(address(sniper));
+        assertGt(held, 0);
+        uint256 before = quote.balanceOf(owner);
+
+        vm.prank(owner);
+        uint256 out = sniper.unwind(address(curve), 0, 0, 0);
+
+        assertEq(curve.launched().balanceOf(address(sniper)), 0);
+        assertEq(quote.balanceOf(owner) - before, out);
+    }
+
+    /// Part of a position, when that is what was asked for.
+    function test_unwind_sells_part() public {
+        MockCurve curve = _nativeCurve();
+        curve.setTax(19);
+        vm.prank(owner);
+        uint256 bought = sniper.snipe{value: 1 ether}(address(curve), 1 ether, 0, address(sniper), 19, 0);
+
+        vm.prank(owner);
+        sniper.unwind(address(curve), bought / 2, 0, 0);
+        assertEq(curve.launched().balanceOf(address(sniper)), bought - bought / 2);
+    }
+
+    /// The minimum is the curve's to enforce, and it does.
+    function test_unwind_respects_the_minimum() public {
+        MockCurve curve = _nativeCurve();
+        curve.setTax(19);
+        vm.prank(owner);
+        uint256 bought = sniper.snipe{value: 1 ether}(address(curve), 1 ether, 0, address(sniper), 19, 0);
+
+        vm.prank(owner);
+        vm.expectRevert();
+        sniper.unwind(address(curve), bought, 100 ether, 0);
+        // And the position is still here, unspent, with nothing approved.
+        assertEq(curve.launched().balanceOf(address(sniper)), bought);
+        assertEq(curve.launched().allowance(address(sniper), address(curve)), 0);
+    }
+
+    /// The mistakes that actually happen: a wrong curve, an empty one, an
+    /// amount larger than the position, a deadline gone by, and somebody else.
+    function test_unwind_refuses_the_mistakes() public {
+        MockCurve curve = _nativeCurve();
+        curve.setTax(19);
+        vm.prank(owner);
+        uint256 bought = sniper.snipe{value: 1 ether}(address(curve), 1 ether, 0, address(sniper), 19, 0);
+
+        vm.prank(stranger);
+        vm.expectRevert(PonsSniper.NotOwner.selector);
+        sniper.unwind(address(curve), bought, 0, 0);
+
+        vm.prank(owner);
+        vm.expectRevert(PonsSniper.ZeroAddress.selector);
+        sniper.unwind(address(0), bought, 0, 0);
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(PonsSniper.MoreThanHeld.selector, bought + 1, bought)
+        );
+        sniper.unwind(address(curve), bought + 1, 0, 0);
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(PonsSniper.TooLate.selector, block.timestamp, block.timestamp - 1)
+        );
+        sniper.unwind(address(curve), bought, 0, block.timestamp - 1);
+
+        // A curve that does not answer to our factory is not one we hand a
+        // position to - the same check the buy makes, for the same reason.
+        MockCurve other = _nativeCurve();
+        other.setFactory(address(0xDEAD));
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(PonsSniper.NotAPonsCurve.selector, address(other), address(0xDEAD))
+        );
+        sniper.unwind(address(other), bought, 0, 0);
+
+        // Nothing of it was spent by any of that.
+        assertEq(curve.launched().balanceOf(address(sniper)), bought);
+    }
+
+    /// Selling a position that is not here is a mistake worth naming rather
+    /// than a sale of nothing.
+    function test_unwind_with_nothing_held() public {
+        MockCurve curve = _nativeCurve();
+        address launched = address(curve.launched());
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(PonsSniper.NothingHeld.selector, launched));
+        sniper.unwind(address(curve), 0, 0, 0);
+    }
+
+    /// A quote asset that keeps a cut of every transfer pays the owner less
+    /// than the curve says it sent, and there is nothing this contract can do
+    /// about that - the token is between them. Written down because the number
+    /// in the event is the curve's, not the owner's, and reading it as the
+    /// owner's would overstate every trade in such a token by the fee.
+    function test_unwind_in_a_fee_on_transfer_quote_pays_the_owner_less() public {
+        MockToken quote = new MockToken(18, false, false); // 0.18% on transfer
+        MockCurve curve = _tokenCurve(quote);
+        curve.setTax(19);
+        quote.mint(owner, 10 ether);
+        vm.prank(owner);
+        quote.approve(address(sniper), type(uint256).max);
+        vm.prank(owner);
+        sniper.snipe(address(curve), 1 ether, 0, address(sniper), 19, 0);
+
+        uint256 before = quote.balanceOf(owner);
+        vm.prank(owner);
+        uint256 out = sniper.unwind(address(curve), 0, 0, 0);
+
+        uint256 arrived = quote.balanceOf(owner) - before;
+        assertLt(arrived, out, "the fee went missing somewhere it should not have");
+        assertEq(arrived, out - (out * 18) / 10_000);
+        assertEq(curve.launched().balanceOf(address(sniper)), 0);
+    }
+
 }
