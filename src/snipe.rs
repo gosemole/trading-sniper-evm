@@ -48,6 +48,12 @@ pub enum Position {
     /// The chain refused the buy. A later step may be tried - the price moved
     /// or the tax fell - but never this one again.
     Failed { step: u64, why: String },
+    /// Bought, and a sale of ours has landed. Distinct from `Bought` because
+    /// that is where a launch sits from the moment the buy decision is made,
+    /// wallet or no wallet, and the caller needs one state that means "there
+    /// is nothing of ours left in this curve". Not re-entered: the exit fired
+    /// once and the launch it fired on does not come back.
+    Sold { step: u64 },
 }
 
 /// What is known about a launch that does not change.
@@ -335,6 +341,11 @@ pub fn decide(s: &Signal, p: &Policy) -> Decision {
                 why: format!("a buy from +{step}s is still in flight"),
             }
         }
+        Position::Sold { step } => {
+            return Decision::Wait {
+                why: format!("bought at +{step}s and already sold"),
+            }
+        }
         Position::Failed { step, .. } if *step == s.step => {
             return Decision::Wait {
                 why: "this step already failed".to_string(),
@@ -541,6 +552,27 @@ mod tests {
             decide(&signal(3, 0, &now, &f, &held), &p),
             Decision::Wait { .. }
         ));
+    }
+
+    /// A launch that was bought and sold is finished with. The exit fired
+    /// once, and a later step of the same window offering a cheaper tax is not
+    /// an invitation to buy back into a launch we have just left.
+    #[test]
+    fn a_launch_already_sold_is_not_bought_back_into() {
+        let f = facts(0, 0);
+        let now = curve(168, 1_000_000_000);
+        let p = policy();
+        let out = Position::Sold { step: 1 };
+        for step in [2, 3] {
+            let tax = if step == 2 { 19 } else { 0 };
+            assert!(
+                matches!(
+                    decide(&signal(step, tax, &now, &f, &out), &p),
+                    Decision::Wait { .. }
+                ),
+                "bought back in at +{step}s after selling"
+            );
+        }
     }
 
     /// A refusal from the chain is not a reason to stop, but the step that

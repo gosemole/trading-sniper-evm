@@ -129,11 +129,6 @@ impl Policy {
     }
 }
 
-/// TODO(money): this is only ever asked when a trade arrives on the curve.
-/// `hold_blocks` is written for a position nobody is trading and therefore
-/// never fires - the very case it exists for is the one that cannot reach it.
-/// The caller has a tick; the question belongs there too.
-///
 /// Hold it, or let it go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {
@@ -176,6 +171,14 @@ pub fn worth(c: &Curve, tokens: U256) -> U256 {
 /// The caller marks the high before asking. Not doing so makes the trailing
 /// stop compare against a stale peak, which is the difference between a stop
 /// and a coin toss.
+///
+/// **Ask this on the clock as well as on a trade.** The three rules do not
+/// share a trigger: the target and the stop are about a price, which only a
+/// trade moves, but `hold_blocks` is about the block, which moves whether or
+/// not anybody trades - and the position it was written for is precisely the
+/// one nobody is trading. A caller that only asks on a trade has a rule that
+/// cannot fire in the case it exists for, and a holding on a curve that went
+/// quiet is never sold at all.
 pub fn decide(h: &Held, c: &Curve, block: u64, p: &Policy) -> Exit {
     let worth = worth(c, h.tokens);
     let min_out = worth * U256::from(BASIS_POINTS - p.slippage_bps) / U256::from(BASIS_POINTS);

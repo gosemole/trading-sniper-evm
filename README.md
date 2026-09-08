@@ -2,7 +2,8 @@
 
 Watches the PonsV2 launchpad on the Robinhood chain (`chain_id 4663`), buys
 into a new bonding curve inside its snipe-tax window through a wrapper
-contract, and sells the position back on a trailing stop or a target.
+contract, and sells the position back on a trailing stop, a target, or a
+minute of nobody trading it.
 
 Nothing is ever sent without `--execute`, and with it the run refuses to start
 unless the wrapper it is pointed at answers that this wallet owns it.
@@ -49,7 +50,12 @@ A PonsV2 launch opens a bonding curve whose snipe tax falls in whole seconds -
 the launch from its log, prices the curve from the same numbers the curve
 prices itself with, and decides at each step whether to buy. It follows every
 curve it hears about for a minute, records every trade on it, and closes the
-position it took on a trailing stop or a target.
+position it took on a trailing stop, a target, or a minute of holding.
+
+A curve it has money in is followed past that minute, however quiet it goes,
+until the sale has landed - the exit is asked on every block and not only on a
+trade, because the rule written for a curve nobody is trading is one that
+nothing but the clock can reach.
 
 Nothing about the launch second is configurable: the wrapper refuses to buy in
 it structurally, because that second costs 99% and no argument should be able

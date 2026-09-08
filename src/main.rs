@@ -440,11 +440,119 @@ async fn launch_call(
     }
 }
 
+/// The chain's second right now, from the last turnover we were shown.
+///
+/// Used for the deadline on a transaction, which is why a missing anchor
+/// answers zero rather than guessing: a deadline built on a guess either
+/// refuses a good transaction or lets a stale one through, and both are worse
+/// than the wrapper refusing an obviously expired one outright.
+fn chain_second(
+    anchor: &std::sync::RwLock<Option<(u64, std::time::Instant)>>,
+) -> u64 {
+    anchor
+        .read()
+        .ok()
+        .and_then(|a| *a)
+        .map(|(s, at)| s + at.elapsed().as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether money of ours is still in a curve.
+///
+/// `position` alone does not answer it. It reads `Bought` from the moment the
+/// buy decision is made, wallet or no wallet - every launch that passes the
+/// filters has one, and without `--execute` not one of them ever had a
+/// transaction behind it. What says money left is `sent`, and what says it
+/// came back is `Sold`, written only when a sale of ours lands.
+///
+/// A buy still in flight counts as held. The receipt has not arrived, so the
+/// position may well exist on chain, and forgetting the launch now means never
+/// learning that it does - the receipt is delivered to the launch it belongs
+/// to and nowhere else.
+///
+/// This is what keeps a followed launch alive past its minute, so it must not
+/// answer yes to a position that is only on paper: every shadow would then be
+/// followed forever.
+fn holding(sent: ethers::types::U256, position: &snipe::Position) -> bool {
+    !sent.is_zero()
+        && matches!(
+            position,
+            snipe::Position::InFlight { .. } | snipe::Position::Bought { .. }
+        )
+}
+
+/// What the exit rules have returned so far.
+///
+/// One place, because closing a position is one event that now happens from
+/// two: a trade that moves the price, and a tick that moves only the clock.
+/// Eight counters bumped by hand in two arms of the same loop is how the two
+/// paths come to disagree about the same run.
+#[derive(Default)]
+struct Tally {
+    /// Positions opened and closed in the last window.
+    open: u64,
+    closed: u64,
+    x100: u64,
+    wins: u64,
+    /// The same, for the launches the filters would actually have bought. Two
+    /// numbers rather than one, because the whole flow and the traded subset
+    /// are different questions and one process answers both.
+    kept_closed: u64,
+    kept_x100: u64,
+    /// The same, never reset. Thirty seconds holds a handful of closes and a
+    /// handful says nothing; the run as a whole is the number worth reading,
+    /// and it is the one that cannot be recovered from a window that scrolled
+    /// past an hour ago.
+    all_closed: u64,
+    all_x100: u64,
+    all_wins: u64,
+}
+
+impl Tally {
+    fn opened(&mut self) {
+        self.open += 1;
+    }
+
+    /// One position closed at `x100` hundredths of what it cost. `kept` says
+    /// the entry filters would have bought this one.
+    fn close(&mut self, x100: u64, kept: bool) {
+        self.closed += 1;
+        self.x100 += x100;
+        self.all_closed += 1;
+        self.all_x100 += x100;
+        if kept {
+            self.kept_closed += 1;
+            self.kept_x100 += x100;
+        }
+        if x100 > 100 {
+            self.wins += 1;
+            self.all_wins += 1;
+        }
+    }
+
+    /// A new reporting window. The run's own totals are not touched.
+    fn window(&mut self) {
+        self.open = 0;
+        self.closed = 0;
+        self.x100 = 0;
+        self.wins = 0;
+        self.kept_closed = 0;
+        self.kept_x100 = 0;
+    }
+
+    /// The average close of `n` of them, as a multiple, for a log line.
+    fn average(x100: u64, n: u64) -> String {
+        match n {
+            0 => "-".to_string(),
+            n => format!("{}.{:02}x", x100 / n / 100, x100 / n % 100),
+        }
+    }
+}
+
 /// Watch launchpads and say what launched. Nothing else.
 ///
-/// The sniper's eyes before it has hands: it reads no wallet, holds no
-/// inventory and cannot send anything, so it is safe to leave running next to
-/// the fall bot while what to do about a launch is still being decided.
+/// Without `--execute` it reads no wallet and cannot send anything: the same
+/// watching, the same journals, the same shadow positions, and no money.
 ///
 /// One socket, reconnected on the same backoff as the pool feed - an endpoint
 /// that has just dropped everyone is not helped by being dialled in a tight
@@ -818,6 +926,13 @@ async fn watch_launches_cmd(
         model_off: bool,
         /// What was actually sent for this position, when something was.
         sent: ethers::types::U256,
+        /// What the buy we sent was priced to fill at. Kept beside `sent`
+        /// rather than read off the shadow when the receipt lands, because the
+        /// exit can fire on a trade while that buy is still in the air - and
+        /// then the shadow is gone by the time there is a position to write it
+        /// into, which left the position recording nothing and no price to
+        /// sell it at.
+        expected_tokens: ethers::types::U256,
         /// A sale is in flight, so the exit rules do not send another.
         selling: bool,
         /// Why the filters would not buy this one, when they would not. The
@@ -828,6 +943,14 @@ async fn watch_launches_cmd(
         /// not land has to be tried again: the reason for leaving does not
         /// stop being true because a transaction was dropped.
         leaving: bool,
+        /// The earliest the next sale may be sent, and how many have gone
+        /// already. A retry driven by the tick would otherwise go out fifty
+        /// times a second at whatever the endpoint charges for a revert, and
+        /// a sale reported as still pending is one that may yet land - so the
+        /// gap is wide enough for the first answer to arrive before a second
+        /// is asked.
+        sell_next: std::time::Instant,
+        sell_tries: u32,
         /// The pair token. Execution refuses anything but the native one, and
         /// a symbol is not proof: this is the address the curve named.
         pair_token: ethers::types::Address,
@@ -848,6 +971,159 @@ async fn watch_launches_cmd(
         shadow: Option<exit::Held>,
     }
 
+    impl Followed {
+        /// Whether money of ours is still in this curve. See [`holding`].
+        fn holding(&self) -> bool {
+            holding(self.sent, &self.position)
+        }
+    }
+
+    /// The exit, asked and answered. Returns whether a sale should now be sent.
+    ///
+    /// Called from a trade on the curve and from the tick, because the rules
+    /// do not share a trigger: the target and the stop are about a price,
+    /// which only a trade moves, and `hold_blocks` is about the block, which
+    /// moves whether or not anybody trades. Asked only on a trade, the rule
+    /// written for a curve that goes quiet was the one rule a quiet curve
+    /// could never reach - and the position went unsold until the launch was
+    /// dropped out from under it.
+    fn ask_exit(
+        f: &mut Followed,
+        block: u64,
+        p: &exit::Policy,
+        verbose: bool,
+        tally: &mut Tally,
+        ops: &mut operators::Operators,
+        ops_dirty: &mut bool,
+    ) {
+        let Some(h) = f.shadow.as_mut() else { return };
+        // The high is marked BEFORE the question is asked, or the stop
+        // measures a give-back from a peak it has not seen yet.
+        h.mark(exit::worth(&f.curve, h.tokens));
+        let decision = exit::decide(h, &f.curve, block, p);
+        let exit::Exit::Sell { worth, why, .. } = &decision else {
+            return;
+        };
+        if verbose {
+            println!(
+                "{}",
+                exit::render(h, &decision, f.quote_decimals, &f.facts.quote_symbol)
+            );
+        }
+        if let Err(e) = journal::append(&f.journal, &journal::exit_line(h, *worth, why, block)) {
+            tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
+        }
+        tally.close(h.x100(*worth), f.refused.is_none());
+        ops.record(f.operator, h.x100(*worth));
+        *ops_dirty = true;
+        f.shadow = None;
+        f.leaving = true;
+    }
+
+    /// Out, and keep trying until we are.
+    ///
+    /// The reason for leaving does not stop being true because a transaction
+    /// was dropped, so the retry hangs on `leaving` rather than on another
+    /// decision - the shadow that raised it has already closed and will not
+    /// answer again. Also called from both the trade and the tick: a sale
+    /// that reverted on a curve nobody trades again would otherwise never get
+    /// its second attempt.
+    #[allow(clippy::too_many_arguments)]
+    fn send_exit(
+        f: &mut Followed,
+        at: ethers::types::Address,
+        trader: Option<&mut Trader>,
+        http: &ethers::providers::Provider<ethers::providers::Http>,
+        tx: &tokio::sync::mpsc::Sender<launch::Heard>,
+        second: u64,
+        slippage_bps: u64,
+    ) {
+        /// Wide enough that a sale reported as still pending has landed or
+        /// been dropped before the next one is signed.
+        const SELL_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+        /// After this many the chain is refusing for a reason no retry will
+        /// change, and the tokens need a person: `rescue` on the wrapper.
+        const SELL_TRIES: u32 = 12;
+
+        if !f.leaving || f.selling || !f.holding() {
+            return;
+        }
+        let Some(t) = trader else { return };
+        let snipe::Position::Bought { tokens, .. } = f.position else {
+            // In flight. The receipt settles it, and until it does there is
+            // nothing to sell and no figure to sell it at.
+            return;
+        };
+        if tokens.is_zero() || std::time::Instant::now() < f.sell_next {
+            return;
+        }
+        if f.sell_tries >= SELL_TRIES {
+            // Once, not once a tick: the counter is pushed one past the cap so
+            // this arm is never taken again. The launch is still followed and
+            // still counts as held, which is the point - it holds `max_open`
+            // down and keeps the line above saying so, rather than quietly
+            // forgetting the money.
+            if f.sell_tries == SELL_TRIES {
+                f.sell_tries += 1;
+                tracing::error!(
+                    curve = ?at, tries = SELL_TRIES,
+                    "cannot sell this position; it is still in the wrapper and \
+                     needs rescue(token, owner) by hand"
+                );
+            }
+            return;
+        }
+        f.sell_tries += 1;
+        // TODO(money): `tokens` is what the model said the buy would fill at,
+        // not what the wrapper actually holds - the balance is only knowable
+        // from the chain, and asking costs a round trip on the way out. The
+        // slippage allowance absorbs the usual difference, but a curve where
+        // the model has already been caught disagreeing (`model_off`) can put
+        // `min_out` above what the sale can return, and then every retry
+        // reverts for the same reason until the cap gives up. Reading the
+        // balance once, on the first attempt, would settle it.
+        let worth = exit::worth(&f.curve, tokens);
+        let min_out = worth * ethers::types::U256::from(10_000 - slippage_bps)
+            / ethers::types::U256::from(10_000u64);
+        let nonce = t.take_nonce();
+        let fees = t.fees.read().map(|f| *f).unwrap_or_default();
+        let call = wrapper::unwind(
+            t.wrapper,
+            at,
+            // The whole balance, whatever it turned out to be. An exact
+            // figure a wei off reverts, and a revert here keeps a position
+            // while the price it is leaving falls.
+            ethers::types::U256::zero(),
+            min_out,
+            // No deadline when the chain's clock is not known, rather than a
+            // deadline built on zero - which the wrapper reads as already
+            // expired and refuses, so a run that lost the header socket could
+            // not sell at all. What bounds an exit is `min_out`, enforced by
+            // the curve itself; the deadline only keeps a queued sale from
+            // arriving at a price nobody meant, and a late exit still gets the
+            // money back. That is the opposite of a late entry, which is why
+            // the buy above has no such fallback.
+            match second {
+                0 => 0,
+                s => s + 12,
+            },
+        );
+        f.selling = true;
+        f.sell_next = std::time::Instant::now() + SELL_GAP;
+        tokio::spawn(fire(
+            http.clone(),
+            t.to.clone(),
+            t.wallet.clone(),
+            call,
+            nonce,
+            fees,
+            t.gas,
+            at,
+            launch::Leg::Sell,
+            tx.clone(),
+        ));
+    }
+
     /// One followed launch, once its minute is up: into the file, not onto
     /// the console. Everything else the console used to say about a launch is
     /// already a record - the entry is `launch`, a step is `decision`, a close
@@ -860,6 +1136,7 @@ async fn watch_launches_cmd(
             snipe::Position::InFlight { step } => format!("in flight from +{step}s"),
             snipe::Position::Failed { step, why } => format!("failed at +{step}s: {why}"),
             snipe::Position::Bought { step, .. } => format!("bought at +{step}s"),
+            snipe::Position::Sold { step } => format!("bought at +{step}s and sold"),
         };
         if let Err(e) = journal::append(
             &f.journal,
@@ -1011,6 +1288,8 @@ async fn watch_launches_cmd(
     // store is the one thing here that grows without an upper bound.
     const REMEMBER_BLOCKS: u64 = 5_927_040;
     let mut newest_block = 0u64;
+    // The block the exit was last asked about, so it is asked once per block.
+    let mut asked_at = 0u64;
 
     // The wrapper is checked whenever one is configured, whether or not this
     // run may spend anything. A dry run that does not verify the contract is a
@@ -1116,23 +1395,8 @@ async fn watch_launches_cmd(
     // `--verbose` to get the entries back on the console.
     let mut seen_launches: u64 = 0;
     let mut refused_launches: u64 = 0;
-    let mut shadow_open: u64 = 0;
-    let mut shadow_closed: u64 = 0;
-    let mut shadow_x100: u64 = 0;
-    let mut shadow_wins: u64 = 0;
-    // The same, for the launches the filters would actually have bought. Two
-    // numbers rather than one, because the whole flow and the traded subset
-    // are different questions and one process now answers both.
-    let mut kept_closed: u64 = 0;
-    let mut kept_x100: u64 = 0;
-    // The same, never reset. Thirty seconds holds a handful of closes and a
-    // handful says nothing; the run as a whole is the number worth reading,
-    // and it is the one that cannot be recovered from a window that scrolled
-    // past an hour ago.
     let mut all_launches: u64 = 0;
-    let mut all_closed: u64 = 0;
-    let mut all_x100: u64 = 0;
-    let mut all_wins: u64 = 0;
+    let mut tally = Tally::default();
     let started = std::time::Instant::now();
     let mut heard_from_feed: u64 = 0;
     let mut feed_wait_ms: u64 = 0;
@@ -1223,28 +1487,61 @@ async fn watch_launches_cmd(
                 };
                 let Some(t) = tax else { continue };
                 let now = std::time::Instant::now();
+
+                // The exit, on the clock rather than on a trade. The stop and
+                // the target cannot have moved - only a trade moves the price
+                // and a trade would have asked already - so what this reaches
+                // is `hold_blocks`, which is about the block and is the one
+                // rule a curve that went quiet can satisfy. Asked against the
+                // chain's own head, not ours: the last block we saw a trade in
+                // stops advancing the moment the curve does, which is exactly
+                // when this has to keep counting.
+                let head = block_seconds
+                    .read()
+                    .ok()
+                    .and_then(|s| s.keys().next_back().copied())
+                    .unwrap_or(0);
+                newest_block = newest_block.max(head);
+                // Once per block, not once per tick. Nothing the exit reads
+                // moves in between - the curve only changes on a trade, and a
+                // trade asks for itself - so the other four ticks of every
+                // block would ask the same question and get the same answer,
+                // on the same path that has 100ms to aim an entry.
+                if head > asked_at {
+                    asked_at = head;
+                    let chain_now = chain_second(&second_anchor);
+                    for (curve, f) in followed.iter_mut() {
+                        ask_exit(
+                            f, head, &exit_policy, verbose, &mut tally, &mut ops, &mut ops_dirty,
+                        );
+                        send_exit(
+                            f,
+                            *curve,
+                            trader.as_mut(),
+                            http,
+                            &tx,
+                            chain_now,
+                            slippage_bps,
+                        );
+                    }
+                }
+
                 // A launch is followed for a minute. Shed the ones whose
                 // minute is up here rather than waiting for a trade on them:
                 // a curve nobody trades on would otherwise be watched forever,
                 // and the set the subscription filters on would only grow.
+                //
+                // Except one that is still holding. Dropping a `Followed`
+                // drops the only record of what is in the wrapper and the
+                // only thing that would sell it, and it drops the receipt of a
+                // buy still in flight along with it - so a launch whose money
+                // has not come back is kept past its minute however quiet it
+                // goes. `hold_blocks` above is what ends it; if the chain
+                // refuses the sale twelve times over, `send_exit` says so and
+                // the tokens want a person.
                 followed.retain(|curve, f| {
-                    let keep = f.until > now;
+                    let keep = f.until > now || f.holding();
                     if !keep {
-                        // TODO(money): a position still open here is abandoned.
-                        // The exit is only ever asked on a trade, so a curve
-                        // that goes quiet is never sold out of - and a minute
-                        // later this drops the position with the launch. On
-                        // paper that is a shadow that expires unsold; with
-                        // `--execute` it is tokens left in the wrapper that
-                        // only `rescue` can reach, by hand.
-                        //
-                        // Two halves to it: ask `exit::decide` from this tick
-                        // as well as from a trade (the `hold_blocks` rule is
-                        // written for exactly this and never fires), and
-                        // refuse to drop a `Followed` whose position is not
-                        // closed - keep it, keep selling, and let it go when
-                        // it is empty. Must be done before `--execute` runs
-                        // unattended.
                         finish(f);
                         if f.exempt_known && f.outsiders.is_empty() {
                             ops.note_dead(f.operator);
@@ -1265,22 +1562,24 @@ async fn watch_launches_cmd(
                         launches = seen_launches,
                         refused = refused_launches,
                         following = followed.len(),
-                        bought = shadow_open,
-                        closed = shadow_closed,
+                        // Followed past their minute because money of ours is
+                        // still in them. Anything but zero for long is a sale
+                        // that is not going through.
+                        holding = followed.values().filter(|f| f.holding()).count(),
+                        bought = tally.open,
+                        closed = tally.closed,
                         // The shadow so far, as a multiple of what it cost.
-                        // Nothing was sent: this is what the rules would have
-                        // returned, and the only running answer there is.
-                        shadow = %match shadow_closed {
+                        // Without `--execute` nothing was sent: this is what
+                        // the rules would have returned, and the only running
+                        // answer there is.
+                        shadow = %Tally::average(tally.x100, tally.closed),
+                        win_pct = %match tally.closed {
                             0 => "-".to_string(),
-                            n => format!("{}.{:02}x", shadow_x100 / n / 100, shadow_x100 / n % 100),
+                            n => (100 * tally.wins / n).to_string(),
                         },
-                        win_pct = %match shadow_closed {
+                        kept = %match tally.kept_closed {
                             0 => "-".to_string(),
-                            n => (100 * shadow_wins / n).to_string(),
-                        },
-                        kept = %match kept_closed {
-                            0 => "-".to_string(),
-                            n => format!("{}.{:02}x on {n}", kept_x100 / n / 100, kept_x100 / n % 100),
+                            n => format!("{} on {n}", Tally::average(tally.kept_x100, n)),
                         },
                         feed_heard = heard_from_feed,
                         feed_late = feed_was_late,
@@ -1296,25 +1595,17 @@ async fn watch_launches_cmd(
                     tracing::info!(
                         minutes = started.elapsed().as_secs() / 60,
                         launches = all_launches,
-                        closed = all_closed,
-                        shadow = %match all_closed {
+                        closed = tally.all_closed,
+                        shadow = %Tally::average(tally.all_x100, tally.all_closed),
+                        win_pct = %match tally.all_closed {
                             0 => "-".to_string(),
-                            n => format!("{}.{:02}x", all_x100 / n / 100, all_x100 / n % 100),
-                        },
-                        win_pct = %match all_closed {
-                            0 => "-".to_string(),
-                            n => (100 * all_wins / n).to_string(),
+                            n => (100 * tally.all_wins / n).to_string(),
                         },
                         "the whole run"
                     );
                     seen_launches = 0;
                     refused_launches = 0;
-                    shadow_open = 0;
-                    shadow_closed = 0;
-                    shadow_x100 = 0;
-                    shadow_wins = 0;
-                    kept_closed = 0;
-                    kept_x100 = 0;
+                    tally.window();
                     heard_from_feed = 0;
                     feed_was_late = 0;
                     feed_wait_ms = 0;
@@ -1423,7 +1714,7 @@ async fn watch_launches_cmd(
                                         };
                                         h.mark(exit::worth(&f.curve, h.tokens));
                                         f.shadow = Some(h);
-                                        shadow_open += 1;
+                                        tally.opened();
                                         // The position the decision implies.
                                         // Without this every later step of the
                                         // same window asks again and answers
@@ -1477,6 +1768,7 @@ async fn watch_launches_cmd(
                                                     t.open += 1;
                                                     t.spent += *spend;
                                                     f.sent = *spend;
+                                                    f.expected_tokens = fill.tokens_out;
                                                     f.position =
                                                         snipe::Position::InFlight { step };
                                                     tokio::spawn(fire(
@@ -1636,102 +1928,17 @@ async fn watch_launches_cmd(
                     f.peak_quote = f.peak_quote.max(f.curve.quote_reserve);
                     f.last_block = block;
                     newest_block = newest_block.max(block);
-                    // The shadow, against the curve this trade just made. The
-                    // high is marked BEFORE the question is asked, or the stop
-                    // measures a give-back from a peak it has not seen yet.
-                    if let Some(h) = f.shadow.as_mut() {
-                        h.mark(exit::worth(&f.curve, h.tokens));
-                        let decision = exit::decide(h, &f.curve, block, &exit_policy);
-                        if let exit::Exit::Sell { worth, why, .. } = &decision {
-                            if verbose {
-                                println!(
-                                    "{}",
-                                    exit::render(
-                                        h,
-                                        &decision,
-                                        f.quote_decimals,
-                                        &f.facts.quote_symbol
-                                    )
-                                );
-                            }
-                            if let Err(e) = journal::append(
-                                &f.journal,
-                                &journal::exit_line(h, *worth, why, block),
-                            ) {
-                                tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
-                            }
-                            let x100 = h.x100(*worth);
-                            shadow_closed += 1;
-                            shadow_x100 += x100;
-                            if f.refused.is_none() {
-                                kept_closed += 1;
-                                kept_x100 += x100;
-                            }
-                            all_closed += 1;
-                            all_x100 += x100;
-                            if x100 > 100 {
-                                shadow_wins += 1;
-                                all_wins += 1;
-                            }
-                            ops.record(f.operator, x100);
-                            ops_dirty = true;
-                            f.shadow = None;
-                            f.leaving = true;
-                        }
-                    }
-                    // Out, and keep trying until we are. The reason for
-                    // leaving does not stop being true because a transaction
-                    // was dropped, and the shadow that raised it has closed -
-                    // so the retry hangs on this rather than on another
-                    // decision.
-                    if f.leaving && !f.selling {
-                        let held = match &f.position {
-                            snipe::Position::Bought { tokens, .. } => *tokens,
-                            _ => ethers::types::U256::zero(),
-                        };
-                        if let Some(t) = trader.as_mut() {
-                            let tokens = held;
-                            if !tokens.is_zero() {
-                                let worth = exit::worth(&f.curve, tokens);
-                                let min_out = worth
-                                    * ethers::types::U256::from(10_000 - slippage_bps)
-                                    / ethers::types::U256::from(10_000u64);
-                                let nonce = t.take_nonce();
-                                let fees = t.fees.read().map(|f| *f).unwrap_or_default();
-                                let now = second_anchor
-                                    .read()
-                                    .ok()
-                                    .and_then(|a| *a)
-                                    .map(|(s, at)| s + at.elapsed().as_secs())
-                                    .unwrap_or(0);
-                                let call = wrapper::unwind(
-                                    t.wrapper,
-                                    at,
-                                    // The whole balance, whatever it turned
-                                    // out to be. An exact figure a wei off
-                                    // reverts, and a revert here keeps a
-                                    // position while the price it is leaving
-                                    // falls.
-                                    ethers::types::U256::zero(),
-                                    min_out,
-                                    now + 12,
-                                );
-                                f.selling = true;
-                                tokio::spawn(fire(
-                                    http.clone(),
-                                    t.to.clone(),
-                                    t.wallet.clone(),
-                                    call,
-                                    nonce,
-                                    fees,
-                                    t.gas,
-                                    at,
-                                    launch::Leg::Sell,
-                                    tx.clone(),
-                                ));
-                            }
-                        }
-                    }
+                    // The exit, against the curve this trade just made.
+                    ask_exit(f, block, &exit_policy, verbose, &mut tally, &mut ops, &mut ops_dirty);
+                    send_exit(
+                        f,
+                        at,
+                        trader.as_mut(),
+                        http,
+                        &tx,
+                        chain_second(&second_anchor),
+                        slippage_bps,
+                    );
                     let elapsed = match (
                         f.launched_at,
                         block_seconds.read().ok().and_then(|s| s.get(&block).copied()),
@@ -1909,7 +2116,7 @@ async fn watch_launches_cmd(
                                     f.position = snipe::Position::Bought {
                                         step,
                                         spend: f.sent,
-                                        tokens: f.shadow.map(|h| h.tokens).unwrap_or_default(),
+                                        tokens: f.expected_tokens,
                                     };
                                 }
                             }
@@ -1931,11 +2138,24 @@ async fn watch_launches_cmd(
                                 if let Some(t) = trader.as_mut() {
                                     t.open = t.open.saturating_sub(1);
                                 }
+                                // The money is back. This is the one state
+                                // that says so, and without it the launch is
+                                // held past its minute forever waiting for a
+                                // sale that already happened.
+                                if let snipe::Position::Bought { step, .. } = f.position {
+                                    f.position = snipe::Position::Sold { step };
+                                }
+                                f.selling = false;
+                                f.leaving = false;
                             }
                             (launch::Leg::Sell, false) => {
-                                // Still held. The exit rules will ask again on
-                                // the next trade, and the stop has already
-                                // fired, so the next answer is the same one.
+                                // Still held, or possibly not: a transaction
+                                // reported as pending may yet land. Either way
+                                // the stop has already fired, so the answer
+                                // does not change - the tick asks again after
+                                // the gap, and unwinding the whole balance a
+                                // second time reverts harmlessly if the first
+                                // one got there.
                                 f.selling = false;
                             }
                         }
@@ -2217,6 +2437,9 @@ async fn watch_launches_cmd(
                                         refused: refused.clone(),
                                         selling: false,
                                         leaving: false,
+                                        expected_tokens: Default::default(),
+                                        sell_next: std::time::Instant::now(),
+                                        sell_tries: 0,
                                         outsiders: Default::default(),
                                         seen: Default::default(),
                                         model_off: false,
@@ -2405,4 +2628,102 @@ async fn chain_id(
         }
     }
     anyhow::bail!("the http endpoint would not answer eth_chainId after {TRIES} tries: {last}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::types::U256;
+
+    fn spent() -> U256 {
+        U256::from(1_000u64)
+    }
+
+    /// The predicate that keeps a followed launch alive past its minute. Yes
+    /// where it should be no strands nothing but leaks a watcher; no where it
+    /// should be yes strands the tokens themselves, which is the expensive
+    /// direction and the one this exists for.
+    #[test]
+    fn only_a_launch_that_money_went_into_counts_as_held() {
+        // The shadow writes `Bought` on every launch the filters pass, and
+        // nothing was sent for any of them.
+        let on_paper = snipe::Position::Bought {
+            step: 2,
+            spend: spent(),
+            tokens: U256::from(5u64),
+        };
+        assert!(!holding(U256::zero(), &on_paper));
+        assert!(holding(spent(), &on_paper));
+
+        // A buy in the air is held: the receipt has nowhere else to go.
+        assert!(holding(spent(), &snipe::Position::InFlight { step: 2 }));
+
+        // And everything that is over is over.
+        for done in [
+            snipe::Position::Watching,
+            snipe::Position::Skipped { why: "no".into() },
+            snipe::Position::Failed { step: 2, why: "reverted".into() },
+            snipe::Position::Sold { step: 2 },
+        ] {
+            assert!(!holding(spent(), &done), "{done:?} read as still held");
+        }
+    }
+
+    /// A sale that landed has to be the thing that lets go, or the launch is
+    /// kept forever waiting for one that already happened.
+    #[test]
+    fn a_landed_sale_is_what_releases_a_launch() {
+        let bought = snipe::Position::Bought {
+            step: 1,
+            spend: spent(),
+            tokens: U256::from(5u64),
+        };
+        assert!(holding(spent(), &bought));
+        let snipe::Position::Bought { step, .. } = bought else { unreachable!() };
+        assert!(!holding(spent(), &snipe::Position::Sold { step }));
+    }
+
+    /// The window resets and the run does not. The run's total is the number
+    /// that cannot be recovered once a window has scrolled past.
+    #[test]
+    fn a_new_window_keeps_the_run_and_forgets_the_window() {
+        let mut t = Tally::default();
+        t.opened();
+        t.close(250, true);
+        t.close(50, false);
+        assert_eq!((t.closed, t.wins, t.kept_closed), (2, 1, 1));
+        assert_eq!((t.all_closed, t.all_wins, t.all_x100), (2, 1, 300));
+        t.window();
+        assert_eq!((t.open, t.closed, t.wins, t.kept_closed, t.x100), (0, 0, 0, 0, 0));
+        assert_eq!((t.all_closed, t.all_wins, t.all_x100), (2, 1, 300));
+    }
+
+    /// Exactly at cost is not a win. Half the launches close near enough to it
+    /// that a `>=` here would report a losing run as a winning one.
+    #[test]
+    fn breaking_even_is_not_counted_as_a_win() {
+        let mut t = Tally::default();
+        t.close(100, true);
+        assert_eq!(t.wins, 0);
+        t.close(101, true);
+        assert_eq!(t.wins, 1);
+    }
+
+    #[test]
+    fn an_average_of_nothing_is_not_a_number() {
+        assert_eq!(Tally::average(0, 0), "-");
+        assert_eq!(Tally::average(250, 1), "2.50x");
+        assert_eq!(Tally::average(300, 2), "1.50x");
+    }
+
+    /// Without an anchor the deadline is zero, which the wrapper refuses. A
+    /// guess here would either expire a good transaction or let a stale one
+    /// through.
+    #[test]
+    fn a_deadline_without_a_clock_is_not_guessed_at() {
+        let none = std::sync::RwLock::new(None);
+        assert_eq!(chain_second(&none), 0);
+        let known = std::sync::RwLock::new(Some((1_700u64, std::time::Instant::now())));
+        assert_eq!(chain_second(&known), 1_700);
+    }
 }
