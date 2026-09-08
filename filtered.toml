@@ -42,11 +42,17 @@ max_dev_buy_x100 = 1500
 # one operator with nothing worth holding on any of them.
 operator_needs = 5
 
+# A maker who put in nothing. On 4193 launches the band under 2% of the curve
+# returns 0.955x with a 10% win rate and a confidence band that does not touch
+# one - it is mostly `launchToken`, where the maker bought none of it, and four
+# in five of those never saw a trade at all. The band that measured best is
+# 5-15% at 1.061x, so the floor is set where the losing one ends.
+min_dev_buy_x100 = 200
+
 # Not filters. Left open because they are not what separates.
-max_run_x100     = 1000000
-max_exempt       = 100000
-require_dev_buy  = false
-min_dev_buy_x100 = 0
+max_run_x100    = 1000000
+max_exempt      = 100000
+require_dev_buy = false
 
 # The exit, unchanged from the measured defaults so the two runs differ in
 # exactly one thing.

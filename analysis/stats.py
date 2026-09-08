@@ -184,8 +184,15 @@ def main():
                     reverse=True)[:3]
     print("  самые частые: " + ", ".join(f"{d[:10]}… x{n}" for n, d in serial))
     peak = by_deployer(ROWS, lambda r: max(v for _, v in r["path"]))
-    print(f"  средний пик {st.mean(peak):.3f}x     "
-          f"шум {noise_floor(ROWS, 30):.3f}x  (всё ниже этого — не сигнал)")
+    # Two numbers about the same paths, and NOT a comparison. The floor is
+    # what the best moment of a shuffled path is worth - it applies to "how
+    # much upside was still ahead", which is a statistic this report no longer
+    # uses. The P&L below is measured by rules that could actually be run, and
+    # nothing about it needs clearing a noise floor.
+    print(f"  средний пик {st.mean(peak):.3f}x")
+    print(f"  для справки: у пути с перемешанными шагами лучший момент стоит "
+          f"{noise_floor(ROWS, 30):.3f}x —")
+    print(f"  это про \"сколько было впереди\", а не про итог правил ниже")
 
     report("выход, без всякого отбора", [(args.exit, lambda r: True)], rule)
     report("dev buy, % фантома", [
