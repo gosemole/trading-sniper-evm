@@ -207,11 +207,15 @@ def main():
     # What a number in this report is. Every column below is one of these two
     # and nothing else, and reading a stake as ETH or a multiple as a total is
     # how a result gets quoted at ten times what it was.
-    stake = next((r.get("stake") for r in ROWS if r.get("stake")), None)
+    # From an ETH row specifically. Taken from whichever row came first it
+    # printed an NVDA curve's stake and called it ETH, which is a factor of ten
+    # in the one line whose whole job is to say what the numbers mean.
+    stake = next((r.get("stake") for r in ROWS
+                  if r.get("pair") == "ETH" and r.get("stake")), None)
     print("\n  единицы:")
     print("    СТАВКА  — то, что кладётся в один запуск: доля фантомного резерва")
-    print("              его кривой, заданная size_x100. На ETH-парах при"
-          f" size_x100=100{' это ' + stake + ' ETH' if stake else ''}.")
+    print("              его кривой, заданная size_x100."
+          f"{' На ETH-парах это ' + stake + ' ETH.' if stake else ''}")
     print("    итого   — ставок в плюсе, если положить ПО ОДНОЙ в каждый запуск")
     print("              группы. +43.8 значит: вложено 296 ставок, вернулось 339.8.")
     print("    на зап  — то же, делённое на число запусков. +0.148 это +14.8%.")

@@ -2426,6 +2426,49 @@ async fn watch_launches_cmd(
                                                 curve = ?l.curve, err = %format!("{e:#}"),
                                                 "a trade from before we were following does not fit"
                                             );
+                                            continue;
+                                        }
+                                        // Written like any other. These moved
+                                        // the reserves, and a journal whose
+                                        // first recorded reserve already
+                                        // includes trades it does not contain
+                                        // cannot be replayed from the opening
+                                        // curve at all - every fill after them
+                                        // is priced off a state the file never
+                                        // shows. It was a third of the
+                                        // journals once the backfill started
+                                        // feeding this buffer.
+                                        let elapsed = launched_at.and_then(|at| {
+                                            block_seconds
+                                                .read()
+                                                .ok()
+                                                .and_then(|s| s.get(&b).copied())
+                                                .map(|now| now as i64 - at as i64)
+                                        });
+                                        if let Err(e) = journal::append(
+                                            &f.journal,
+                                            &journal::trade_line(
+                                                &t,
+                                                b,
+                                                elapsed,
+                                                config.map(|c| c.curve_fee_bps).unwrap_or(0),
+                                                f.quote_decimals,
+                                                f.exempt_known.then(|| match &t {
+                                                    curve::Trade::Buy { recipient, .. } => {
+                                                        f.exempt.contains(recipient)
+                                                    }
+                                                    curve::Trade::Sell { seller, .. } => {
+                                                        f.exempt.contains(seller)
+                                                    }
+                                                    _ => false,
+                                                }),
+                                                &f.curve,
+                                            ),
+                                        ) {
+                                            tracing::warn!(
+                                                err = %format!("{e:#}"),
+                                                "cannot write a trade from before we were following"
+                                            );
                                         }
                                     }
                                     followed.insert(l.curve, f);
