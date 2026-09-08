@@ -313,12 +313,14 @@ async fn fire(
     out: tokio::sync::mpsc::Sender<launch::Heard>,
 ) {
     let owner = ethers::signers::Signer::address(&wallet);
+    let mut cost = ethers::types::U256::zero();
     let (ok, pending, hash, why) =
         match swap::send_nowait(&to, &wallet, &tx, nonce.into(), fees, gas).await {
             Ok(hash) => {
                 tracing::info!(?leg, ?curve, ?hash, nonce, "sent");
                 let landed = swap::await_receipt(&http, hash, &tx.label).await;
                 let ok = landed.outcome == swap::Outcome::Confirmed;
+                cost = landed.cost;
                 // Not knowing is its own answer. Everything treats it as "did
                 // not happen", but a replacement sent against a transaction
                 // that may still land is a second trade, not a retry.
@@ -349,6 +351,7 @@ async fn fire(
             nonce,
             resync_nonce,
             pending,
+            cost,
         })))
         .await;
 }
@@ -1608,6 +1611,8 @@ async fn watch_launches_cmd(
     // model's opinion; this pair is the chain's. Only ETH pairs are traded, so
     // the two add up.
     let mut realized = (ethers::types::U256::zero(), ethers::types::U256::zero());
+    // And what the chain charged to do it, reverts included.
+    let mut gas_paid = ethers::types::U256::zero();
 
     // The wrapper is checked whenever one is configured, whether or not this
     // run may spend anything. A dry run that does not verify the contract is a
@@ -1963,17 +1968,22 @@ async fn watch_launches_cmd(
                     // not one - it is the absence of a wallet.
                     if !realized.0.is_zero() {
                         let (paid, back) = realized;
+                        // Trading and gas as two numbers and then as one.
+                        // Separately because they answer different questions -
+                        // whether the rules work, and whether they work at
+                        // this size - and together because only the last one
+                        // is the wallet.
+                        let gross = |a: ethers::types::U256, b: ethers::types::U256| match a >= b {
+                            true => format!("+{}", launch::amount_of(a - b, 18)),
+                            false => format!("-{}", launch::amount_of(b - a, 18)),
+                        };
                         tracing::info!(
                             paid = %launch::amount_of(paid, 18),
                             back = %launch::amount_of(back, 18),
-                            // Gas is not in here. It is paid in the same token
-                            // and never reaches a curve log, so this is the
-                            // trading result and not the wallet's balance.
-                            net = %match back >= paid {
-                                true => format!("+{}", launch::amount_of(back - paid, 18)),
-                                false => format!("-{}", launch::amount_of(paid - back, 18)),
-                            },
-                            "on chain, before gas"
+                            trading = %gross(back, paid),
+                            gas = %launch::amount_of(gas_paid, 18),
+                            net = %gross(back, paid + gas_paid),
+                            "on chain"
                         );
                     }
                     seen_launches = 0;
@@ -2553,8 +2563,15 @@ async fn watch_launches_cmd(
                 // A transaction of ours ended. Nothing here waited for it.
                 Some(launch::Heard::Landed(l)) => {
                     let launch::Settled {
-                        curve, leg, ok, why, hash, nonce, resync_nonce, pending,
+                        curve, leg, ok, why, hash, nonce, resync_nonce, pending, cost,
                     } = *l;
+                    // Every transaction, landed or reverted. A reverted buy
+                    // costs this and returns nothing, and a run that leaves
+                    // those out of its total is reporting a cheaper run than
+                    // it had. This is also the number the whole live run is
+                    // for: the strategy's edge at this size is measured in
+                    // hundreds of microETH, and so is a round trip's gas.
+                    gas_paid += cost;
                     if let Some(t) = trader.as_mut() {
                         t.inflight = t.inflight.saturating_sub(1);
                     }

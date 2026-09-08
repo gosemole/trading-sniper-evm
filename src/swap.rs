@@ -337,12 +337,29 @@ const RECEIPT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// A transaction that has stopped being pending.
 pub struct Landed {
     pub outcome: Outcome,
+    /// What the chain charged for it, in the native token: gas used times the
+    /// price actually paid. Present for anything that reached a block -
+    /// **including a revert**, which is the case that matters, because a
+    /// reverted trade costs its gas and returns nothing.
+    pub cost: U256,
     /// Present whenever the chain had a receipt to give, whatever it said. Not
     /// read today: a buy is confirmed by its outcome and sized by what was
     /// asked for, and the wrapper reports the fill in an event nobody parses
     /// yet. Kept because that event is where a real fill would come from.
     #[allow(dead_code)]
     pub logs: Vec<ethers::types::Log>,
+}
+
+/// What a receipt says the transaction cost, in the native token.
+///
+/// `effective_gas_price` is what was actually charged after the base fee and
+/// the tip were settled, not what was offered - on EIP-1559 the offer is a
+/// ceiling and the difference comes back.
+fn gas_cost(r: &ethers::types::TransactionReceipt) -> U256 {
+    match (r.gas_used, r.effective_gas_price) {
+        (Some(used), Some(price)) => used.saturating_mul(price),
+        _ => U256::zero(),
+    }
 }
 
 /// Why a transaction reverted, by running it again as a call.
@@ -425,12 +442,15 @@ pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> La
 
     match outcome {
         Ok(Some(r)) if r.status == Some(1u64.into()) => {
+            let cost = gas_cost(&r);
             tracing::info!(
-                tx = ?hash, block = ?r.block_number, gas_used = ?r.gas_used, label,
+                tx = ?hash, block = ?r.block_number, gas_used = ?r.gas_used,
+                gas_eth = %crate::units::format_units(cost, 18), label,
                 "confirmed"
             );
             Landed {
                 outcome: Outcome::Confirmed,
+                cost,
                 logs: r.logs,
             }
         }
@@ -439,12 +459,15 @@ pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> La
             // minimum and the size are all in the log above, and none of them
             // says which was wrong.
             let why = why_reverted(http, hash, r.block_number).await;
+            let cost = gas_cost(&r);
             tracing::error!(
                 tx = ?hash, block = ?r.block_number, label, why = %why,
+                gas_eth = %crate::units::format_units(cost, 18),
                 "REVERTED"
             );
             Landed {
                 outcome: Outcome::Reverted,
+                cost,
                 logs: r.logs,
             }
         }
@@ -452,6 +475,7 @@ pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> La
             tracing::warn!(tx = ?hash, label, "dropped from the mempool");
             Landed {
                 outcome: Outcome::Dropped,
+                cost: U256::zero(),
                 logs: Vec::new(),
             }
         }
@@ -459,6 +483,10 @@ pub async fn await_receipt(http: &Provider<Http>, hash: H256, label: &str) -> La
             tracing::warn!(tx = ?hash, err = %e, label, "lost track of the transaction");
             Landed {
                 outcome: Outcome::Unknown,
+                // Not zero because it was free - unknown because we stopped
+                // being able to ask. A cost left out of the total reads as a
+                // run that was cheaper than it was.
+                cost: U256::zero(),
                 logs: Vec::new(),
             }
         }
