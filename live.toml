@@ -96,13 +96,23 @@ operators    = "operators.json"
 #            never sees. At 16.8 mETH a stake the old reading would also have
 #            stopped this run after three buys.
 #
-#            Sixty is a little over the worst drawdown the journals show, 3.1
-#            stakes: a bad patch does not halt the run, and something actually
-#            broken does. It is also about half the wallet, which leaves the
-#            other half for gas and the open position.
+#            It stops BEFORE a buy that could break the cap, not after one
+#            that has - the worst a buy can do is lose all of it. So the
+#            effective threshold is `max_spend` minus one stake: at 40 mETH and
+#            a 16.8 mETH stake, buying stops once the run is down 23 mETH.
+#
+#            Forty because the wallet, not because the journals. The worst
+#            drawdown they show is 3.1 stakes, which at this size is 52 mETH -
+#            more than the balance this is being run with. A cap the wallet
+#            runs out before reaching is not a cap, so this one is set below
+#            the balance and will therefore fire during a bad patch the
+#            journals call normal. That is the trade being made: at this size
+#            and this balance, the run stops before the strategy has room to
+#            come back. Raising the balance is what widens it; raising the cap
+#            past the balance only removes the brake.
 # gas_limit  not estimated per trade: an estimate is a round trip inside the
 #            window the whole thing is aimed at. Unused gas comes back; a limit
 #            reached is a trade lost.
 max_open  = 1
-max_spend = "0.06"
+max_spend = "0.04"
 gas_limit = 2000000
