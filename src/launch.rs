@@ -571,8 +571,26 @@ pub async fn watch_feed(
     const PHASE_SAMPLES: usize = 20;
     let connected = std::time::Instant::now();
     let mut phase: Vec<u64> = Vec::with_capacity(PHASE_SAMPLES);
+    // How much this connection actually carried, so a run that reconnects
+    // forever says whether it is being refused or is going quiet.
+    let mut frames: u64 = 0;
 
-    while let Some(msg) = stream.next().await {
+    // A connection that stops speaking without closing looks identical to a
+    // quiet chain, and this chain is never quiet: blocks land every ~100ms, so
+    // silence this long is a dead socket rather than a lull. Without it a
+    // half-open connection is held forever and nothing reconnects.
+    const SILENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    loop {
+        let Ok(next) = tokio::time::timeout(SILENCE, stream.next()).await else {
+            anyhow::bail!(
+                "no frame for {}s (carried {frames} in {:?})",
+                SILENCE.as_secs(),
+                connected.elapsed()
+            );
+        };
+        let Some(msg) = next else { break };
+        frames += 1;
         let text = match msg.context("reading the feed")? {
             tokio_tungstenite::tungstenite::Message::Text(t) => t,
             tokio_tungstenite::tungstenite::Message::Close(_) => break,
@@ -667,7 +685,11 @@ pub async fn watch_feed(
             }
         }
     }
-    warn!("feed stream ended");
+    warn!(
+        frames,
+        lived = ?connected.elapsed(),
+        "the sequencer feed ended"
+    );
     Ok(())
 }
 

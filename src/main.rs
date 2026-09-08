@@ -466,6 +466,41 @@ fn opening_curve(
     .ok()
 }
 
+/// The second a block carries, asked of the endpoint.
+///
+/// The feed gives this earlier and for free, and while it is up nothing here
+/// is called at all. But the second is what the whole tax window is measured
+/// from: without it no step can be aimed at, no trade can be placed in the
+/// window, and the loop below decides nothing whatsoever. A run that lost the
+/// feed lost the bot with it - one overnight run caught 3% of launches and
+/// made not one decision - and a number that is sitting in a block we already
+/// know the number of is not a number worth being inert over.
+///
+/// One request per launch, and only for launches the feed did not stamp.
+async fn block_second(
+    http: &ethers::providers::Provider<ethers::providers::Http>,
+    block: u64,
+) -> Option<u64> {
+    let got = rpc::retrying("eth_getBlockByNumber", || async {
+        http.get_block(block)
+            .await
+            .map_err(anyhow::Error::from)
+            .context("get_block")
+    })
+    .await;
+    match got {
+        Ok(Some(b)) => Some(b.timestamp.as_u64()),
+        Ok(None) => {
+            tracing::warn!(block, "the endpoint does not have this block yet");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(block, err = %format!("{e:#}"), "cannot read the launch second");
+            None
+        }
+    }
+}
+
 /// What the launch transaction asked for, or nothing.
 ///
 /// One request per launch, and never on anything's critical path: this is a
@@ -730,10 +765,15 @@ async fn watch_launches_cmd(
                     )
                     .await
                     {
-                        Ok(()) => tracing::warn!("feed closed, reconnecting"),
-                        Err(e) => {
-                            tracing::error!(err = %format!("{e:#}"), "feed error, reconnecting")
-                        }
+                        Ok(()) => tracing::warn!(
+                            lived_s = started.elapsed().as_secs(),
+                            "feed closed, reconnecting"
+                        ),
+                        Err(e) => tracing::error!(
+                            lived_s = started.elapsed().as_secs(),
+                            err = %format!("{e:#}"),
+                            "feed error, reconnecting"
+                        ),
                     }
                     if started.elapsed() >= std::time::Duration::from_secs(60) {
                         backoff = std::time::Duration::from_secs(3);
@@ -1312,9 +1352,14 @@ async fn watch_launches_cmd(
                     // whose launches it caught - so a launch it missed still
                     // has a second, and without this one every trade on that
                     // curve loses its place in the tax window.
-                    let launched_at = launched_at.or_else(|| {
+                    let launched_at = match launched_at.or_else(|| {
                         block_seconds.read().ok().and_then(|s| s.get(&l.block).copied())
-                    });
+                    }) {
+                        Some(at) => Some(at),
+                        // Neither source had it, which on a healthy feed does
+                        // not happen and without one happens every time.
+                        None => block_second(http, l.block).await,
+                    };
 
                     match l.what {
                         launch::What::Created { pair_token, .. } => {
