@@ -1101,6 +1101,7 @@ async fn watch_launches_cmd(
         min_dev_buy_x100: cfg.snipe.min_dev_buy_x100,
         operator_needs: cfg.snipe.operator_needs,
         min_exempt: cfg.snipe.min_exempt,
+        pairs: cfg.snipe.pairs.clone(),
         max_dev_buy_x100: cfg.snipe.max_dev_buy_x100,
     };
 

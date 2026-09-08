@@ -425,6 +425,10 @@ pub struct SnipeConfig {
     /// which is what collecting wants; six is what the journals chose.
     #[serde(default)]
     pub min_exempt: usize,
+    /// Which pair tokens to trade, by symbol. Empty follows every pair, which
+    /// is what collecting wants.
+    #[serde(default)]
+    pub pairs: Vec<String>,
     /// The largest dev buy worth following, against the phantom reserve, in
     /// hundredths of a percent. 1500 is fifteen percent.
     #[serde(default = "default_max_dev_buy_x100")]
@@ -499,6 +503,7 @@ impl Default for SnipeConfig {
             hold_blocks: default_hold_blocks(),
             operator_needs: default_operator_needs(),
             min_exempt: 0,
+            pairs: Vec::new(),
             max_dev_buy_x100: default_max_dev_buy_x100(),
             operators: default_operators_path(),
         }

@@ -114,6 +114,17 @@ pub struct Policy {
     /// against +2.9 on the 2180 with one - and it replicated across a split by
     /// deployer, 1.131x against 1.132x on 494 operators.
     pub min_exempt: usize,
+    /// Which pair tokens are worth trading at all, by symbol. Empty follows
+    /// every pair.
+    ///
+    /// Not a preference: after the filters, 266 ETH launches returned +43.0
+    /// stakes and the 30 in every other token together returned +0.8, on
+    /// fourteen different tokens - two launches each, and even that carried by
+    /// two of them. Of the pairs with real volume, the only other one is USDG,
+    /// and over the whole flow it is the worst there is at -6.3% a launch.
+    /// Each of them also needs a balance held in its own token, which is
+    /// capital and work for nothing.
+    pub pairs: Vec<String>,
     /// The largest dev buy worth following, against the phantom reserve, in
     /// hundredths of a percent.
     ///
@@ -206,6 +217,21 @@ pub fn refuse_outright(facts: &Facts, p: &Policy) -> Option<String> {
         return Some(format!(
             "{} wallets exempt from the snipe tax; they buy before anyone else can",
             facts.exempt
+        ));
+    }
+    if !p.pairs.is_empty()
+        && !p
+            .pairs
+            .iter()
+            .any(|w| w.eq_ignore_ascii_case(&facts.quote_symbol))
+    {
+        return Some(format!(
+            "quoted in {}, which is not traded",
+            if facts.quote_symbol.is_empty() {
+                "an unnamed token"
+            } else {
+                &facts.quote_symbol
+            }
         ));
     }
     if facts.exempt < p.min_exempt {
@@ -427,6 +453,7 @@ mod tests {
             operator_needs: 0,
             min_exempt: 0,
             max_dev_buy_x100: u64::MAX,
+            pairs: Vec::new(),
             spend: U256::exp10(17), // 0.1
             slippage_bps: 100,
             max_tax_bps: 19,
@@ -714,6 +741,34 @@ mod tests {
         // And neither fires when it is not asked to.
         let off = Policy { min_exempt: 0, max_dev_buy_x100: u64::MAX, ..p };
         assert_eq!(refuse_outright(&with(1, 3860), &off), None);
+    }
+
+    /// The pair a launch is quoted in, which is a question of where the money
+    /// is rather than of taste: after the other filters, ETH returned +43.0
+    /// stakes over 266 launches and every other token together returned +0.8
+    /// over 30.
+    #[test]
+    fn a_launch_quoted_in_a_token_we_do_not_trade_is_passed_over() {
+        let eth = Facts { quote_symbol: "ETH".into(), ..facts(1, 0) };
+        let usdg = Facts { quote_symbol: "USDG".into(), ..facts(1, 0) };
+        let unnamed = Facts { quote_symbol: String::new(), ..facts(1, 0) };
+
+        // Empty is every pair, which is what collecting wants.
+        let all = Policy { pairs: Vec::new(), ..policy() };
+        assert_eq!(refuse_outright(&usdg, &all), None);
+
+        let only_eth = Policy { pairs: vec!["ETH".to_string()], ..policy() };
+        assert_eq!(refuse_outright(&eth, &only_eth), None);
+        // Case is the token's business, not ours.
+        let shouty = Policy { pairs: vec!["eth".to_string()], ..policy() };
+        assert_eq!(refuse_outright(&eth, &shouty), None);
+
+        let why = refuse_outright(&usdg, &only_eth).expect("should refuse");
+        assert!(why.contains("USDG"), "{why}");
+        // A pair whose symbol never resolved is not silently taken for one we
+        // trade: not knowing what it is quoted in is a reason to leave it.
+        let why = refuse_outright(&unnamed, &only_eth).expect("should refuse");
+        assert!(why.contains("unnamed"), "{why}");
     }
 
 }

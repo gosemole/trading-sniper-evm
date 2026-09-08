@@ -20,6 +20,16 @@ address = "0x0000000000000000000000000000000000000001"
 [snipe]
 size_x100 = 100
 
+# Where the money is, and nowhere else. After the filters below, 266 ETH
+# launches returned +43.0 stakes and the 30 in every other token together
+# returned +0.8 - across fourteen tokens, two launches each, and even that
+# carried by two of them. Of the pairs with real volume the only other is
+# USDG, which over the whole flow is the worst there is at -6.3% a launch.
+# Each also wants a balance held in its own token: capital and work for
+# nothing. Empty here would follow every pair, which is what collect.toml
+# does.
+pairs = ["ETH"]
+
 # The one entry filter that measured, and the surprise of the whole exercise.
 # On a night of 3473 launches the group with six or more exempt wallets carried
 # the entire profit of the flow - +70.7 stakes on 625 launches against +2.9 on
