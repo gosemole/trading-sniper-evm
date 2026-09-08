@@ -198,13 +198,11 @@ impl Broadcaster {
     }
 
     /// How many endpoints a broadcast reaches.
-    #[allow(dead_code)]
     pub fn width(&self) -> usize {
         self.endpoints.len()
     }
 
     /// The endpoints this will submit through, for logging at startup.
-    #[allow(dead_code)]
     pub fn labels(&self) -> Vec<&str> {
         self.endpoints.iter().map(|e| e.label.as_str()).collect()
     }

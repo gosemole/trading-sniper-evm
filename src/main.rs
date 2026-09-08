@@ -473,6 +473,38 @@ fn chain_second(
         .unwrap_or(0)
 }
 
+/// The fees to sign with: the tip as last suggested, the base fee as of the
+/// newest block we have seen.
+///
+/// The cached pair is refreshed on a twenty-second timer, and the headroom in
+/// it - twice the base fee - was reasoned about as "roughly six blocks of
+/// continuous growth". That reasoning is for a chain with twelve-second
+/// blocks. **This one runs 9.8 blocks a second**, so six blocks is 0.6
+/// seconds and the timer is 196 blocks wide. A base fee that climbs while the
+/// timer sleeps leaves every transaction signed in the meantime with a
+/// `max_fee` below it, and a transaction below the base fee is not slow, it is
+/// unmineable - on exactly the launches busy enough to be worth buying.
+///
+/// The header stream already carries the base fee of every block and is
+/// already subscribed to, so the current one costs nothing. The tip stays on
+/// the timer: it is a suggestion rather than a consensus rule, and nothing is
+/// stranded by a stale one.
+///
+/// Falls back to the cached pair entirely until the first header arrives.
+fn fees_now(
+    cached: (ethers::types::U256, ethers::types::U256),
+    base_fee: &std::sync::RwLock<ethers::types::U256>,
+) -> (ethers::types::U256, ethers::types::U256) {
+    let (max_fee, tip) = cached;
+    let base = base_fee.read().map(|b| *b).unwrap_or_default();
+    if base.is_zero() {
+        return (max_fee, tip);
+    }
+    // The same shape the cached figure has, against a base fee one block old
+    // instead of up to two hundred.
+    (base * ethers::types::U256::from(2u64) + tip, tip)
+}
+
 /// What to set the nonce counter to after a transaction did not land, if
 /// anything.
 ///
@@ -766,6 +798,11 @@ async fn watch_launches_cmd(
     let second_anchor: std::sync::Arc<std::sync::RwLock<Option<(u64, std::time::Instant)>>> =
         Default::default();
 
+    // The newest block's base fee, kept current by the header watcher below.
+    // Zero until the first header, which is what makes the cached figure the
+    // fallback rather than this.
+    let base_fee: std::sync::Arc<std::sync::RwLock<ethers::types::U256>> = Default::default();
+
     let (tx, mut launches) = tokio::sync::mpsc::channel(64);
     let ws = cfg.ws_url.clone();
     let watching = tokio::spawn({
@@ -800,11 +837,13 @@ async fn watch_launches_cmd(
         let ws = cfg.ws_url.clone();
         let anchor = second_anchor.clone();
         let seconds = block_seconds.clone();
+        let base = base_fee.clone();
         async move {
             let mut backoff = std::time::Duration::from_secs(3);
             loop {
                 let started = std::time::Instant::now();
-                match launch::watch_heads(&ws, anchor.clone(), seconds.clone()).await {
+                match launch::watch_heads(&ws, anchor.clone(), seconds.clone(), base.clone()).await
+                {
                     Ok(()) => tracing::warn!(
                         lived_s = started.elapsed().as_secs(),
                         "block headers ended, reconnecting"
@@ -1203,6 +1242,7 @@ async fn watch_launches_cmd(
         trader: Option<&mut Trader>,
         http: &ethers::providers::Provider<ethers::providers::Http>,
         tx: &tokio::sync::mpsc::Sender<launch::Heard>,
+        base_fee: &std::sync::RwLock<ethers::types::U256>,
         second: u64,
         slippage_bps: u64,
     ) {
@@ -1264,7 +1304,7 @@ async fn watch_launches_cmd(
         let min_out = worth * ethers::types::U256::from(10_000 - slippage_bps)
             / ethers::types::U256::from(10_000u64);
         let nonce = t.take_nonce();
-        let fees = t.fees.read().map(|f| *f).unwrap_or_default();
+        let fees = fees_now(t.fees.read().map(|f| *f).unwrap_or_default(), base_fee);
         let call = wrapper::unwind(
             t.wrapper,
             at,
@@ -1555,10 +1595,23 @@ async fn watch_launches_cmd(
                 gas_limit = cfg.snipe.gas_limit,
                 "EXECUTING: this run sends transactions and spends real money"
             );
+            let to = std::sync::Arc::new(swap::Broadcaster::new(&urls)?);
+            // Where a buy will actually go, said once at startup. It is the
+            // one round trip a buy waits on, it is set from the environment
+            // rather than from the config, and until now nothing said whether
+            // that setting had been picked up at all - a run submitting to one
+            // node looked exactly like a run submitting to five. Labels are
+            // scheme and host only: these URLs carry API keys.
+            tracing::info!(
+                endpoints = ?to.labels(),
+                count = to.width(),
+                from = if cfg.submit_urls.is_empty() { "http_url" } else { "SUBMIT_URLS" },
+                "submitting through"
+            );
             trader = Some(Trader {
                 nonce: swap::pending_nonce(http, me).await?,
                 wallet,
-                to: std::sync::Arc::new(swap::Broadcaster::new(&urls)?),
+                to,
                 wrapper,
                 inflight: 0,
                 fees,
@@ -1704,6 +1757,7 @@ async fn watch_launches_cmd(
                             trader.as_mut(),
                             http,
                             &tx,
+                            &base_fee,
                             chain_now,
                             slippage_bps,
                         );
@@ -1949,11 +2003,13 @@ async fn watch_launches_cmd(
                                                 ),
                                                 None => {
                                                     let nonce = t.take_nonce();
-                                                    let fees = t
-                                                        .fees
-                                                        .read()
-                                                        .map(|f| *f)
-                                                        .unwrap_or_default();
+                                                    let fees = fees_now(
+                                                        t.fees
+                                                            .read()
+                                                            .map(|f| *f)
+                                                            .unwrap_or_default(),
+                                                        &base_fee,
+                                                    );
                                                     let call = wrapper::snipe(
                                                         t.wrapper,
                                                         *curve_addr,
@@ -2154,6 +2210,7 @@ async fn watch_launches_cmd(
                         trader.as_mut(),
                         http,
                         &tx,
+                        &base_fee,
                         chain_second(&second_anchor),
                         slippage_bps,
                     );
@@ -3019,6 +3076,38 @@ mod tests {
     fn a_count_that_agrees_changes_nothing() {
         assert_eq!(resync_to(6, 6, 0, false), None);
         assert_eq!(resync_to(6, 6, 2, true), None);
+    }
+
+    /// The base fee has to come from the newest block, not from a cache that
+    /// is up to two hundred blocks old on this chain. The tip does not: it is
+    /// a suggestion, and a stale one strands nothing.
+    #[test]
+    fn the_base_fee_comes_from_the_newest_block() {
+        let cached = (U256::from(1_000u64), U256::from(7u64));
+        let head = std::sync::RwLock::new(U256::from(100u64));
+        // 100 * 2 + 7, and not the 1000 the timer last wrote.
+        assert_eq!(fees_now(cached, &head), (U256::from(207u64), U256::from(7u64)));
+    }
+
+    /// Before the first header there is nothing better than the cache, and a
+    /// zero base fee must not be mistaken for a real one - signing with a
+    /// max_fee of the tip alone is a transaction nothing will include.
+    #[test]
+    fn without_a_header_the_cached_pair_stands() {
+        let cached = (U256::from(1_000u64), U256::from(7u64));
+        let none = std::sync::RwLock::new(U256::zero());
+        assert_eq!(fees_now(cached, &none), cached);
+    }
+
+    /// A base fee that has climbed past what the cache allowed for is exactly
+    /// the case this exists for: the signed max_fee has to climb with it.
+    #[test]
+    fn a_risen_base_fee_raises_what_we_sign() {
+        let cached = (U256::from(207u64), U256::from(7u64));
+        let risen = std::sync::RwLock::new(U256::from(400u64));
+        let (max_fee, _) = fees_now(cached, &risen);
+        assert!(max_fee > U256::from(400u64), "signed below the base fee");
+        assert_eq!(max_fee, U256::from(807u64));
     }
 
     /// Without an anchor the deadline is zero, which the wrapper refuses. A

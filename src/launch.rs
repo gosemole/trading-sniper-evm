@@ -1064,6 +1064,12 @@ pub async fn watch_heads(
     ws_url: &str,
     anchor: std::sync::Arc<std::sync::RwLock<Option<(u64, std::time::Instant)>>>,
     seconds: std::sync::Arc<std::sync::RwLock<std::collections::BTreeMap<u64, u64>>>,
+    // The base fee of the newest block, for whoever is paying one. It arrives
+    // in the header we are already reading, so it costs nothing and is never
+    // more than one block old - which on a chain running ten blocks a second
+    // is the difference between a fee that can be included and one that
+    // cannot.
+    base_fee: std::sync::Arc<std::sync::RwLock<ethers::types::U256>>,
 ) -> Result<()> {
     use ethers::providers::{Middleware, Provider, Ws};
     use futures_util::StreamExt;
@@ -1095,6 +1101,11 @@ pub async fn watch_heads(
             continue;
         };
         let number = number.as_u64();
+        if let Some(fee) = head.base_fee_per_gas {
+            if let Ok(mut b) = base_fee.write() {
+                *b = fee;
+            }
+        }
         if let Ok(mut s) = seconds.write() {
             s.insert(number, stamped);
             while s.len() > 4096 {
