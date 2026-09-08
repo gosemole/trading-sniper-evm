@@ -1791,10 +1791,30 @@ async fn watch_launches_cmd(
                 wallet = ?me,
                 balance = %units::format_units(balance, 18),
                 max_open = cfg.snipe.max_open,
-                max_spend = %cfg.snipe.max_spend,
+                // Said in words, not as a string that may be empty. A run with
+                // no cap looked exactly like a run with one: last night's put
+                // 0.1512 ETH through the curves against a stated 0.05 and
+                // nothing in the log said which of the two was true.
+                loss_cap = %match max_spend {
+                    Some(c) => format!("stops after losing {}", units::format_units(c, 18)),
+                    None => "NONE - this run has no loss limit".to_string(),
+                },
                 gas_limit = cfg.snipe.gas_limit,
                 "EXECUTING: this run sends transactions and spends real money"
             );
+            if max_spend.is_none() {
+                tracing::error!(
+                    "[snipe] max_spend is not set: nothing will stop this run losing the                      whole wallet"
+                );
+            }
+            // A cap the wallet cannot reach is not a cap either.
+            if max_spend.is_some_and(|c| c >= balance) {
+                tracing::error!(
+                    balance = %units::format_units(balance, 18),
+                    cap = %units::format_units(max_spend.unwrap_or_default(), 18),
+                    "[snipe] max_spend is at or above the whole balance; the wallet runs out                      before the cap does"
+                );
+            }
             let to = std::sync::Arc::new(swap::Broadcaster::new(&urls)?);
             // Where a buy will actually go, said once at startup. It is the
             // one round trip a buy waits on, it is set from the environment
