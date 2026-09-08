@@ -101,6 +101,37 @@ def report(title, groups, rule):
               f"   {lo:.2f} .. {hi:<7.2f}{p:>4.0f}%")
 
 
+def totals(title, groups, rule):
+    """The portfolio, not the average.
+
+    One unit into every launch in the group, and what comes back out. A mean
+    hides which half of the ledger it came from: the same 1.03x is a business
+    if the profit is spread over hundreds of launches and a lottery ticket if
+    two of them carry it. These columns say which.
+
+    Amounts are multiples of the stake, so launches in different pair tokens
+    add up - a fixed fraction of each curve is the same bet in each currency.
+    """
+    print(f"\n  {title}")
+    print(f"    {'':<24}{'зап':>5}{'итого':>9}{'прибыль':>10}{'убыток':>9}"
+          f"{'лучший':>8}{'пик':>9}{'от пика':>8}{'top10':>7}")
+    for name, sel in groups:
+        g = [r for r in ROWS if sel(r)]
+        if not g:
+            print(f"    {name:<24}{0:>5}")
+            continue
+        out = [rule(r) - 1 for r in g]
+        peak = [max(v for _, v in r["path"]) - 1 for r in g]
+        win = sorted((x for x in out if x > 0), reverse=True)
+        loss = sum(x for x in out if x < 0)
+        net = sum(out)
+        pk = sum(peak)
+        top10 = sum(win[:10]) / sum(win) * 100 if win else 0.0
+        print(f"    {name:<24}{len(g):>5}{net:>+9.1f}{sum(win):>+10.1f}{loss:>+9.1f}"
+              f"{max(out, default=0):>+8.1f}{pk:>+9.1f}"
+              f"{(100*net/pk if pk else 0):>7.0f}%{top10:>6.0f}%")
+
+
 def halves(rows, seed=7):
     """Split by deployer, so an operator never appears in both sides."""
     who = sorted({r["deployer"] for r in rows})
@@ -176,6 +207,15 @@ def main():
         ("платившие: >= 2", lambda r: r["window_taxed"] >= 2),
         ("бандл: 2 - 4", lambda r: 2 <= r["window_bundled"] <= 4),
         ("бандл: >= 5", lambda r: r["window_bundled"] >= 5)], rule)
+
+    totals("портфель: одна единица в каждый запуск", [
+        ("всё", lambda r: True),
+        ("exempt = 1", lambda r: r["exempt"] <= 1),
+        ("exempt 2 - 5", lambda r: 2 <= r["exempt"] <= 5),
+        ("exempt >= 6", lambda r: r["exempt"] >= 6),
+        ("бандл >= 5", lambda r: r["window_bundled"] >= 5),
+        ("creator fee = 0", lambda r: r["creator_tax_bps"] == 0),
+        ("dev buy >= 15%", lambda r: r["dev_pct"] >= 15)], rule)
 
     a, b = halves(ROWS)
     print(f"\n  выборка пополам по деплойеру: {len(a)} / {len(b)} запусков")
