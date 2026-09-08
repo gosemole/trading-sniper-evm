@@ -1,8 +1,17 @@
-# trading-mm-fall
+# trading-sniper
 
-Watches Uniswap v3/v4 pools on the Robinhood chain (`chain_id 4663`), buys a
-token when it falls hard inside a single block, and sells it again on a target
-or a timeout.
+Two bots on the Robinhood chain (`chain_id 4663`), sharing one tree because
+they share the endpoints, the wallet handling and the execution layer.
+
+**The launch sniper** is the current work: it watches the PonsV2 launchpad,
+buys into a new bonding curve inside its snipe-tax window through a wrapper
+contract, and sells the position back on a trailing stop or a target. Start at
+[`live.toml`](live.toml) and `--watch-launches`; the analysis that chose every
+number in it is in [`analysis/`](analysis).
+
+**The fall bot** came first: it watches Uniswap v3/v4 pools, buys a token when
+it falls hard inside a single block, and sells it again on a target or a
+timeout. Everything below this line is about that one.
 
 Nothing is ever sent without `--execute`. Every command runs read-only by
 default and prints the exact transaction it would submit.
@@ -280,7 +289,7 @@ Watches every `[[pools]]`, and for routes marked `auto_buy` prints what it would
 buy. Add `--execute` to trade for real:
 
 ```bash
-./target/release/trading-mm-fall --execute
+./target/release/trading-sniper --execute
 ```
 
 Arming a route checks both tokens it touches - the one it spends and the one it

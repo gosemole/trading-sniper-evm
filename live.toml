@@ -10,7 +10,7 @@
 # idle for an hour at a time.
 #
 #   WS_URL=... HTTP_URL=... PRIVATE_KEY=... \
-#     ./target/release/trading-mm-fall --watch-launches --config live.toml --execute
+#     ./target/release/trading-sniper --watch-launches --config live.toml --execute
 #
 # Without --execute nothing is sent: the same watching, the same journals, the
 # same shadow, and no wallet is even loaded. That is the dry run - there is no

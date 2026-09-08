@@ -3419,7 +3419,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "trading-mm-fall"
+name = "trading-sniper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
