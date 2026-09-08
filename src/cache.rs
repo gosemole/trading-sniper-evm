@@ -1,25 +1,14 @@
 //! What the chain has already told us and cannot un-tell.
 //!
-//! Recovering one v4 PoolKey means finding the single `Initialize` log that
-//! ever published it, by walking the chain's logs backwards from the head in
-//! windows - see `pool::find_init_log`. One query for a pool created recently
-//! and a handful for an old one, but paid for every pool AND every hop of every
-//! route, on every start.
+//! One thing now: what a pair token is. Its decimals and symbol are fixed at
+//! deployment and have no setter, which is what makes keeping them honest
+//! rather than merely convenient - and without them every amount in a journal
+//! is unreadable, because a six-decimal token printed at eighteen says
+//! 0.00000000809.
 //!
-//! Everything kept here is immutable by construction, which is what makes
-//! caching it honest rather than merely convenient:
-//!
-//! - a v4 PoolKey **is** the preimage of the pool id, so it cannot change
-//!   without becoming a different pool - and a cached one is re-hashed and
-//!   checked against its id before it is used, so a corrupted or hand-edited
-//!   file is caught rather than believed;
-//! - a v3 pool's currencies, fee and tick spacing are set at creation and have
-//!   no setter;
-//! - an ERC-20's decimals and symbol are fixed in every token these routes
-//!   touch.
-//!
-//! Nothing that moves - prices, liquidity, balances, allowances - is ever kept
-//! here. Delete the file and the only cost is a slow start.
+//! Two calls per token ever seen, and none at all after that. Nothing that
+//! moves - prices, reserves, balances - is ever kept here. Delete the file and
+//! the only cost is a slow start.
 
 use anyhow::{Context, Result};
 use ethers::types::Address;
@@ -27,18 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-
-/// A pool's identity, as recovered once.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PoolKey {
-    pub currency0: Address,
-    pub currency1: Address,
-    pub fee: u32,
-    pub tick_spacing: i32,
-    /// v4 only; a v3 pool has no hooks.
-    #[serde(default)]
-    pub hooks: Option<Address>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokenInfo {
@@ -48,8 +25,6 @@ pub struct TokenInfo {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Store {
-    #[serde(default)]
-    pools: HashMap<String, PoolKey>,
     #[serde(default)]
     tokens: HashMap<String, TokenInfo>,
 }
@@ -62,8 +37,13 @@ struct Cache {
 
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
-/// Start using a file. Called once, before anything resolves a pool; without it
-/// every lookup simply misses and the bot behaves as it always did.
+/// Start using a file. Called once, before anything looks a token up; without
+/// it every lookup simply misses and the bot behaves as it always did.
+///
+/// Returns how many tokens it holds. It used to return how many POOLS - a map
+/// the fall bot filled and this one never has - so the startup line reported
+/// an empty cache on every run whatever the file contained, which is the kind
+/// of small lie that makes the rest of a log hard to trust.
 pub fn open(path: &Path) -> Result<usize> {
     let store: Store = match std::fs::read_to_string(path) {
         Ok(raw) => {
@@ -72,7 +52,7 @@ pub fn open(path: &Path) -> Result<usize> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let known = store.pools.len();
+    let known = store.tokens.len();
     let _ = CACHE.set(Mutex::new(Cache {
         path: path.to_path_buf(),
         store,
@@ -128,7 +108,7 @@ pub fn flush() {
             return Ok(false);
         }
         let tmp = c.path.with_extension("json.tmp");
-        let body = serde_json::to_string_pretty(&c.store).context("serialising pool cache")?;
+        let body = serde_json::to_string_pretty(&c.store).context("serialising the token cache")?;
         std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &c.path)
             .with_context(|| format!("replacing {}", c.path.display()))?;
@@ -140,6 +120,6 @@ pub fn flush() {
     match res {
         Ok(true) => tracing::info!("token cache written"),
         Ok(false) => {}
-        Err(e) => tracing::warn!(err = %format!("{e:#}"), "could not write the pool cache"),
+        Err(e) => tracing::warn!(err = %format!("{e:#}"), "could not write the token cache"),
     }
 }

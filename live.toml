@@ -114,5 +114,5 @@ operators    = "operators.json"
 #            window the whole thing is aimed at. Unused gas comes back; a limit
 #            reached is a trade lost.
 max_open  = 1
-max_spend = "0.04"
+max_spend = "0.06"
 gas_limit = 2000000

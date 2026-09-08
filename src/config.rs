@@ -64,8 +64,8 @@ pub struct Config {
     #[serde(default)]
     pub snipe: SnipeConfig,
     /// Where to keep what the chain has already told us about pools and
-    /// tokens - PoolKeys, decimals, symbols. All of it immutable, so the file
-    /// only ever saves time; delete it and the next start is merely slow.
+    /// tokens - their decimals and symbols. Both immutable, so the file only
+    /// ever saves time; delete it and the next start is merely slow.
     #[serde(default = "default_token_cache")]
     pub token_cache_path: String,
     /// Signing key for swap execution. Prefer the PRIVATE_KEY environment
