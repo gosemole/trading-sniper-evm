@@ -2983,8 +2983,9 @@ async fn watch_launches_cmd(
                                         let tx = tx.clone();
                                         let curve = l.curve;
                                         let from = l.block;
+                                        let seconds = block_seconds.clone();
                                         tokio::spawn(async move {
-                                            launch::backfill(&http, curve, from, tx).await
+                                            launch::backfill(&http, curve, from, seconds, tx).await
                                         });
                                     }
                                     let mut f = Followed {

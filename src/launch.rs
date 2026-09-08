@@ -1154,23 +1154,52 @@ pub async fn backfill(
     http: &ethers::providers::Provider<ethers::providers::Http>,
     curve: Address,
     from: u64,
+    // The blocks whose headers have actually arrived. What the second pass
+    // below asks for has to be inside this, or it is asking about blocks that
+    // do not exist yet.
+    seconds: std::sync::Arc<std::sync::RwLock<std::collections::BTreeMap<u64, u64>>>,
     out: mpsc::Sender<Heard>,
 ) {
     // In two passes, because the launch block IS the head. Asking for blocks
-    // that do not exist yet is not an empty answer, it is
-    // `invalid block range params` and the whole request is lost - including
-    // the launch block, which is the one that matters and the one we already
-    // know exists, having just read a log out of it.
+    // that do not exist yet loses the whole request - including the launch
+    // block, which is the one that matters and the one we already know exists,
+    // having just read a log out of it.
     //
-    // So: that block on its own, at once. Then the few after it, once enough
-    // time has passed for them to be there. The bundle's own buys are split
-    // across exactly these two.
-    let mut sent = ask(http, curve, from, from, &out).await;
-    // Six blocks of this chain, and well inside the second before the first
-    // step of the tax window opens.
-    tokio::time::sleep(std::time::Duration::from_millis(620)).await;
-    sent += ask(http, curve, from + 1, from + 4, &out).await;
-    debug!(curve = ?curve, from, sent, "backfilled a curve's opening trades");
+    // So: that block on its own, at once. Then the few after it, once they are
+    // there. The bundle's own buys are split across exactly these two.
+    let mut sent = ask(http, curve, from, from, "the launch block", &out).await;
+
+    // Sleeping a fixed 620ms and hoping was the old rule, and it was wrong in
+    // a way the logs showed plainly: every single backfill failure was the
+    // four-block pass and not one was the single-block one - twelve for
+    // twelve. The endpoint was not flaky, it was being asked about blocks it
+    // did not have.
+    //
+    // The head is already known, because its header came through a
+    // subscription that costs nothing, so the range is now clamped to what
+    // exists rather than guessed at.
+    let want = from + 4;
+    let mut head = 0;
+    for _ in 0..24 {
+        head = seconds
+            .read()
+            .ok()
+            .and_then(|s| s.keys().next_back().copied())
+            .unwrap_or(0);
+        if head >= want {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Not past the head, and nothing at all if the chain has not moved: a
+    // range that starts after it ends is a request with no answer to give.
+    let to = want.min(head);
+    if to > from {
+        sent += ask(http, curve, from + 1, to, "the blocks after it", &out).await;
+    } else {
+        debug!(curve = ?curve, from, head, "no block after the launch yet; nothing to backfill");
+    }
+    debug!(curve = ?curve, from, to, sent, "backfilled a curve's opening trades");
 }
 
 /// One range, or nothing and a reason.
@@ -1179,6 +1208,10 @@ async fn ask(
     curve: Address,
     from: u64,
     to: u64,
+    // Which of the two passes this is, so a failure says which one - the
+    // difference between an endpoint that is struggling and a range that was
+    // asked for too early.
+    which: &str,
     out: &mpsc::Sender<Heard>,
 ) -> usize {
     use ethers::providers::Middleware;
@@ -1197,7 +1230,7 @@ async fn ask(
             // Not fatal, and not silent: what is lost is the opening state of
             // exactly the launches worth having.
             warn!(
-                curve = ?curve, from, to, err = %format!("{e:#}"),
+                curve = ?curve, from, to, which, err = %format!("{e:#}"),
                 "cannot read what this curve did before we were listening"
             );
             return 0;
