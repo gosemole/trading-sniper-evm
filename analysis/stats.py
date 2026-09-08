@@ -302,13 +302,14 @@ def main():
                 o = [trail(pct, take=2.0, lag=lag)(r) - 1 for r in live]
                 row += f"{sum(o):>+9.1f} ({100*sum(1 for x in o if x>0)/len(o):>2.0f}%)"
             print(row)
-        print(f"\n    {'выход при задержке 1':<30}{'итого':>9}{'на зап':>9}{'медиана':>10}{'win':>6}")
+        print(f"\n    {f'выход при задержке {args.lag}':<30}"
+              f"{'итого':>9}{'на зап':>9}{'медиана':>10}{'win':>6}")
         for name, pct, take in (("трейлинг 5%", 5, None), ("трейлинг 3%", 3, None),
                                 ("трейлинг 10%", 10, None),
                                 ("трейлинг 5% + тейк 1.5x", 5, 1.5),
                                 ("трейлинг 5% + тейк 2x", 5, 2.0),
                                 ("трейлинг 5% + тейк 3x", 5, 3.0)):
-            o = [trail(pct, take=take, lag=1)(r) - 1 for r in live]
+            o = [trail(pct, take=take, lag=args.lag)(r) - 1 for r in live]
             print(f"    {name:<30}{sum(o):>+9.1f}{sum(o)/len(o):>+9.3f}"
                   f"{st.median(o):>+10.3f}{100*sum(1 for x in o if x>0)/len(o):>5.0f}%")
         # The two questions a portfolio of 69 launches cannot answer by
@@ -320,7 +321,7 @@ def main():
         # it appear once - and a portfolio is a sum, so it is the sum that has
         # to be resampled. Read the low end: that is the run this could have
         # been.
-        o = [trail(5, take=2.0, lag=1)(r) - 1 for r in live]
+        o = [rule(r) - 1 for r in live]
         rng = random.Random(7)
         draws = sorted(sum(rng.choices(o, k=len(o))) for _ in range(4000))
         lo, hi = draws[200], draws[3800]
@@ -341,7 +342,7 @@ def main():
         # differ - the sum of multiples is not what a wallet would show.
         staked = sum(float(r.get("stake", 0)) for r in live)
         if staked > 0:
-            got = sum(float(r["stake"]) * trail(5, take=2.0, lag=1)(r) for r in live)
+            got = sum(float(r["stake"]) * rule(r) for r in live)
             print(f"\n    в ETH: поставлено {staked:.3f}, вернулось {got:.3f}, "
                   f"итого {got - staked:+.3f} ETH ({100*(got-staked)/staked:+.1f}%)")
         else:
