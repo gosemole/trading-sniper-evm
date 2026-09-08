@@ -1065,6 +1065,10 @@ async fn watch_launches_cmd(
         sent: ethers::types::U256,
         /// A sale is in flight, so the exit rules do not send another.
         selling: bool,
+        /// Why the filters would not buy this one, when they would not. The
+        /// launch is followed and journalled either way; this decides only
+        /// whether money goes into it.
+        refused: Option<String>,
         /// The exit fired and we mean to be out. Kept because a sale that does
         /// not land has to be tried again: the reason for leaving does not
         /// stop being true because a transaction was dropped.
@@ -1354,6 +1358,11 @@ async fn watch_launches_cmd(
     let mut shadow_closed: u64 = 0;
     let mut shadow_x100: u64 = 0;
     let mut shadow_wins: u64 = 0;
+    // The same, for the launches the filters would actually have bought. Two
+    // numbers rather than one, because the whole flow and the traded subset
+    // are different questions and one process now answers both.
+    let mut kept_closed: u64 = 0;
+    let mut kept_x100: u64 = 0;
     // The same, never reset. Thirty seconds holds a handful of closes and a
     // handful says nothing; the run as a whole is the number worth reading,
     // and it is the one that cannot be recovered from a window that scrolled
@@ -1492,6 +1501,10 @@ async fn watch_launches_cmd(
                             0 => "-".to_string(),
                             n => (100 * shadow_wins / n).to_string(),
                         },
+                        kept = %match kept_closed {
+                            0 => "-".to_string(),
+                            n => format!("{}.{:02}x on {n}", kept_x100 / n / 100, kept_x100 / n % 100),
+                        },
                         feed_heard = heard_from_feed,
                         feed_late = feed_was_late,
                         // Ours, not theirs: decode to handled.
@@ -1523,6 +1536,8 @@ async fn watch_launches_cmd(
                     shadow_closed = 0;
                     shadow_x100 = 0;
                     shadow_wins = 0;
+                    kept_closed = 0;
+                    kept_x100 = 0;
                     heard_from_feed = 0;
                     feed_was_late = 0;
                     feed_wait_ms = 0;
@@ -1645,9 +1660,17 @@ async fn watch_launches_cmd(
                                         };
                                         // And with a wallet behind it, this is
                                         // where the money leaves.
+                                        let stopped = f
+                                            .refused
+                                            .clone()
+                                            .or_else(|| {
+                                                trader.as_ref().and_then(|t| {
+                                                    t.refuses(*spend, f.pair_token.is_zero())
+                                                })
+                                            });
                                         if let Some(t) = trader.as_mut() {
-                                            match t.refuses(*spend, f.pair_token.is_zero()) {
-                                                Some(why) => tracing::info!(
+                                            match stopped {
+                                                Some(why) => tracing::debug!(
                                                     curve = ?curve_addr, why,
                                                     "decided to buy and did not send"
                                                 ),
@@ -1863,6 +1886,10 @@ async fn watch_launches_cmd(
                             let x100 = h.x100(*worth);
                             shadow_closed += 1;
                             shadow_x100 += x100;
+                            if f.refused.is_none() {
+                                kept_closed += 1;
+                                kept_x100 += x100;
+                            }
                             all_closed += 1;
                             all_x100 += x100;
                             if x100 > 100 {
@@ -2322,12 +2349,14 @@ async fn watch_launches_cmd(
                                     refused_launches += 1;
                                 }
                                 if let Some(why) = &refused {
-                                    // Loud, and on its own line: the entry
-                                    // below says it too, but a refusal is what
-                                    // the policy DID, and a run of them is how
-                                    // a filter set too tight is noticed. One
-                                    // greppable line per launch passed over.
-                                    tracing::warn!(
+                                    // At debug, because a refusal is now the
+                                    // ordinary case: the filters keep about
+                                    // one launch in twenty, and twenty warning
+                                    // lines a minute is not a warning. The
+                                    // count that matters - how many were
+                                    // passed over - is in the summary, and the
+                                    // reason for each is in its journal.
+                                    tracing::debug!(
                                         launch = %if facts.symbol.is_empty() {
                                             format!("{:?}", l.token)
                                         } else {
@@ -2343,12 +2372,14 @@ async fn watch_launches_cmd(
                                         "launch passed over"
                                     );
                                 }
-                                if refused.is_some() {
-                                    if let Ok(mut w) = watched_curves.write() {
-                                        w.remove(&l.curve);
-                                    }
-                                    early.retain(|(c, _, _, _)| *c != l.curve);
-                                } else {
+                                // Followed and journalled whatever the filters
+                                // said. They gate the BUY, not the watching:
+                                // the only way to know when the flow that the
+                                // filters are looking for comes back is to
+                                // have kept the flow that is not it, and a
+                                // launch passed over leaves no record at all
+                                // if it is never followed.
+                                {
                                     let journal =
                                         journal::path_for(&journal_dir, l.block, l.curve);
                                     if let Err(e) = journal::append(
@@ -2361,6 +2392,7 @@ async fn watch_launches_cmd(
                                             tax,
                                             launched_at,
                                             &exempt,
+                                            refused.as_deref(),
                                         ),
                                     ) {
                                         tracing::warn!(
@@ -2405,6 +2437,7 @@ async fn watch_launches_cmd(
                                         operator,
                                         pair_token,
                                         sent: ethers::types::U256::zero(),
+                                        refused: refused.clone(),
                                         selling: false,
                                         leaving: false,
                                         outsiders: Default::default(),

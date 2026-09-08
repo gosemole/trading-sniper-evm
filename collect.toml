@@ -1,10 +1,10 @@
 # Collecting, not trading. Every filter here is open on purpose.
 #
-# A launch that `refuse_outright` passes over is never followed and no journal
-# is opened for it, so the tuned filters in sniper.toml would collect only the
-# launches we already believe in - and a night of those cannot say whether the
-# belief was right. This config follows everything the launchpad emits and
-# writes a file per launch.
+# The filters now gate the BUY rather than the watching, so every launch is
+# followed and journalled whatever they say - which means this file and
+# live.toml collect the same data and differ only in what they would spend on.
+# Kept because it also spends nothing at all, and because the filters being
+# open here is the baseline every filtered number is read against.
 #
 # Nothing is sent either way: there is no wallet behind this yet.
 #

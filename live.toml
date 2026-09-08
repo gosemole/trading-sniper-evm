@@ -1,5 +1,14 @@
 # Trading. Everything here is filtered.toml plus the parts that spend money.
 #
+# The filters below gate the BUY, not the watching. Every launch the launchpad
+# emits is still followed and journalled, because the only way to know when the
+# flow these filters look for comes back is to have kept the flow that is not
+# it - and right now most of it is not: on one afternoon 62% of launches
+# carried a creator fee above 300 bps and 88% had no dev buy worth the name,
+# against 8% and 19% the night before. So this run collects everything and buys
+# almost nothing, which is the correct behaviour and is also why it may sit
+# idle for an hour at a time.
+#
 #   WS_URL=... HTTP_URL=... PRIVATE_KEY=... \
 #     ./target/release/trading-mm-fall --watch-launches --config live.toml --execute
 #

@@ -30,6 +30,7 @@ pub fn path_for(dir: &Path, block: u64, curve: Address) -> PathBuf {
 
 /// The launch itself, as everything known about it at the moment it opens.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn launch_line(
     l: &crate::launch::Launch,
     call: Option<&crate::launch::LaunchCall>,
@@ -43,6 +44,7 @@ pub fn launch_line(
     // calldata list made the file disagree with the decisions written beside
     // it, which is worse than either number alone.
     exempt: &std::collections::HashSet<Address>,
+    refused: Option<&str>,
 ) -> Value {
     let mut v = json!({
         "kind": "launch",
@@ -70,6 +72,14 @@ pub fn launch_line(
     if call.is_none() {
         v["via"] = json!("unknown entry point");
         v["decoded"] = json!(false);
+    }
+    // Why the filters would not have bought it, when they would not. The
+    // launch is followed and recorded either way - the only way to know when
+    // the flow the filters look for comes back is to have kept the flow that
+    // is not it - so the file has to say which of the two it was.
+    match refused {
+        Some(why) => v["refused"] = json!(why),
+        None => v["refused"] = json!(false),
     }
     if let Some(at) = launched_at {
         v["launched_at"] = json!(at);
