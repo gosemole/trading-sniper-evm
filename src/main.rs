@@ -237,8 +237,17 @@ struct Trader {
     /// bot in this same repo - takes a nonce this counter still believes is
     /// free, and every transaction after it is replaced or rejected. Either
     /// refuse to start when the pending count has moved under us, or take the
-    /// key exclusively.
+    /// key exclusively. (The fall bot is gone from this repo, but a second
+    /// copy of this one is not a hypothesis.)
     nonce: u64,
+    /// How many of ours are signed and not yet settled.
+    ///
+    /// The node's pending count is the truth about this key, but only when
+    /// nothing of ours is in the air: while a transaction is pending it is
+    /// counted, and while it is dropped it is not, and the same number means
+    /// opposite things in the two cases. Zero here is what makes the node's
+    /// answer safe to take in both directions.
+    inflight: u32,
     fees: std::sync::Arc<std::sync::RwLock<(ethers::types::U256, ethers::types::U256)>>,
     gas: ethers::types::U256,
     /// Positions sent and not yet closed. Every one is money in a contract,
@@ -278,6 +287,7 @@ impl Trader {
     fn take_nonce(&mut self) -> u64 {
         let n = self.nonce;
         self.nonce += 1;
+        self.inflight += 1;
         n
     }
 }
@@ -301,17 +311,22 @@ async fn fire(
     out: tokio::sync::mpsc::Sender<launch::Heard>,
 ) {
     let owner = ethers::signers::Signer::address(&wallet);
-    let (ok, hash, why) = match swap::send_nowait(&to, &wallet, &tx, nonce.into(), fees, gas).await {
-        Ok(hash) => {
-            tracing::info!(?leg, ?curve, ?hash, nonce, "sent");
-            let landed = swap::await_receipt(&http, hash, &tx.label).await;
-            let ok = landed.outcome == swap::Outcome::Confirmed;
-            (ok, Some(hash), format!("{:?}", landed.outcome))
-        }
-        // Never broadcast, so the nonce it was given was never used - which
-        // the re-read below picks up.
-        Err(e) => (false, None, format!("{e:#}")),
-    };
+    let (ok, pending, hash, why) =
+        match swap::send_nowait(&to, &wallet, &tx, nonce.into(), fees, gas).await {
+            Ok(hash) => {
+                tracing::info!(?leg, ?curve, ?hash, nonce, "sent");
+                let landed = swap::await_receipt(&http, hash, &tx.label).await;
+                let ok = landed.outcome == swap::Outcome::Confirmed;
+                // Not knowing is its own answer. Everything treats it as "did
+                // not happen", but a replacement sent against a transaction
+                // that may still land is a second trade, not a retry.
+                let pending = landed.outcome == swap::Outcome::Unknown;
+                (ok, pending, Some(hash), format!("{:?}", landed.outcome))
+            }
+            // Never broadcast, so the nonce it was given was never used - which
+            // the re-read below picks up.
+            Err(e) => (false, false, None, format!("{e:#}")),
+        };
     // Only when something went wrong. A confirmed transaction consumed exactly
     // the nonce it was given and the count we keep is already right.
     let resync_nonce = if ok {
@@ -331,6 +346,7 @@ async fn fire(
             why,
             nonce,
             resync_nonce,
+            pending,
         })))
         .await;
 }
@@ -455,6 +471,35 @@ fn chain_second(
         .and_then(|a| *a)
         .map(|(s, at)| s + at.elapsed().as_secs())
         .unwrap_or(0)
+}
+
+/// What to set the nonce counter to after a transaction did not land, if
+/// anything.
+///
+/// A transaction that did not land leaves a gap, and every nonce after it
+/// waits behind that gap forever - so the node is asked rather than assumed.
+///
+/// **Backwards is the case that matters**, and the one the rule here used to
+/// refuse. A dropped transaction makes the node's pending count LOWER than our
+/// counter, never higher: we counted a nonce as used and the chain never saw
+/// it. A forward-only rule therefore never fired on the failure it was written
+/// for, and a single drop stopped the wallet for the rest of the run.
+///
+/// Going back is safe exactly when nothing of ours is in the air and this one
+/// is known not to be - then the node's count describes a key nobody here is
+/// racing. While anything is pending, only forward: reusing a nonce that may
+/// still land is a second trade wearing the first one's number, and on a buy
+/// that is the double-buy the whole position machinery exists to prevent.
+fn resync_to(ours: u64, node: u64, inflight: u32, pending: bool) -> Option<u64> {
+    if node > ours {
+        // Somebody else spent from this key, or a transaction we gave up on
+        // landed after all. Either way the chain has moved past us.
+        return Some(node);
+    }
+    if node < ours && inflight == 0 && !pending {
+        return Some(node);
+    }
+    None
 }
 
 /// Whether money of ours is still in a curve.
@@ -1137,6 +1182,12 @@ async fn watch_launches_cmd(
         f.leaving = true;
     }
 
+    /// How many reverted sales are chased at once before the gap applies.
+    /// A price that moved under the floor is retried immediately, because the
+    /// next quote is the one that fills; anything still failing after this is
+    /// not about the price.
+    const CHASE_TRIES: u32 = 4;
+
     /// Out, and keep trying until we are.
     ///
     /// The reason for leaving does not stop being true because a transaction
@@ -1509,6 +1560,7 @@ async fn watch_launches_cmd(
                 wallet,
                 to: std::sync::Arc::new(swap::Broadcaster::new(&urls)?),
                 wrapper,
+                inflight: 0,
                 fees,
                 gas: ethers::types::U256::from(cfg.snipe.gas_limit),
                 open: 0,
@@ -2243,15 +2295,29 @@ async fn watch_launches_cmd(
                 // out of order is a dev buy printed without its launch.
                 // A transaction of ours ended. Nothing here waited for it.
                 Some(launch::Heard::Landed(l)) => {
-                    let launch::Settled { curve, leg, ok, why, hash, nonce, resync_nonce } = *l;
+                    let launch::Settled {
+                        curve, leg, ok, why, hash, nonce, resync_nonce, pending,
+                    } = *l;
+                    if let Some(t) = trader.as_mut() {
+                        t.inflight = t.inflight.saturating_sub(1);
+                    }
                     if let (Some(t), Some(n)) = (trader.as_mut(), resync_nonce) {
-                        // A dropped transaction leaves a gap that stalls every
-                        // one after it, so the count is re-read rather than
-                        // assumed - but only forward, because a stale read
-                        // would replay a nonce that is already in flight.
-                        if n > t.nonce {
-                            tracing::warn!(from = t.nonce, to = n, "nonce re-read after a miss");
-                            t.nonce = n;
+                        match resync_to(t.nonce, n, t.inflight, pending) {
+                            Some(to) => {
+                                tracing::warn!(
+                                    from = t.nonce, to, inflight = t.inflight, pending,
+                                    "nonce re-read after a miss"
+                                );
+                                t.nonce = to;
+                            }
+                            // Behind the node and not allowed to go back: a gap
+                            // is open and something of ours may still fill it.
+                            None if n < t.nonce => tracing::warn!(
+                                ours = t.nonce, node = n, inflight = t.inflight,
+                                "a gap in the nonce sequence, and something still in the air; \
+                                 nothing of ours will land until it settles"
+                            ),
+                            None => {}
                         }
                     }
                     if let Some(f) = followed.get_mut(&curve) {
@@ -2289,8 +2355,17 @@ async fn watch_launches_cmd(
                                     t.spent = t.spent.saturating_sub(f.sent);
                                 }
                                 f.shadow = None;
+                                // The step it failed at, not zero. Zero is the
+                                // launch second, which is structurally
+                                // unbuyable - a record saying a buy failed
+                                // there describes something that cannot
+                                // happen, and `decide` reads this field to
+                                // refuse the step that has already failed.
                                 f.position = snipe::Position::Failed {
-                                    step: 0,
+                                    step: match f.position {
+                                        snipe::Position::InFlight { step } => step,
+                                        _ => 0,
+                                    },
                                     why: why.clone(),
                                 };
                             }
@@ -2309,14 +2384,41 @@ async fn watch_launches_cmd(
                                 f.leaving = false;
                             }
                             (launch::Leg::Sell, false) => {
-                                // Still held, or possibly not: a transaction
-                                // reported as pending may yet land. Either way
-                                // the stop has already fired, so the answer
-                                // does not change - the tick asks again after
-                                // the gap, and unwinding the whole balance a
-                                // second time reverts harmlessly if the first
-                                // one got there.
                                 f.selling = false;
+                                // Nothing of this token is in the wrapper, so
+                                // there is nothing to try again for. Either
+                                // the buy never landed or a sale already did -
+                                // and a run that keeps retrying this one ends
+                                // up reporting a stuck position that is not
+                                // there, which is worse than saying nothing.
+                                if why.contains("NothingHeld") {
+                                    tracing::warn!(
+                                        curve = ?curve,
+                                        "the wrapper holds none of this; nothing left to sell"
+                                    );
+                                    if let snipe::Position::Bought { step, .. } = f.position {
+                                        f.position = snipe::Position::Sold { step };
+                                    }
+                                    f.leaving = false;
+                                } else if !pending && f.sell_tries <= CHASE_TRIES {
+                                    // A revert is final and its nonce is spent,
+                                    // so the replacement is a retry and not a
+                                    // race. Sent on the next block rather than
+                                    // after the gap, because the usual reason
+                                    // is a floor set above a price that has
+                                    // moved - and it is still moving, so the
+                                    // next quote is the one that fills.
+                                    //
+                                    // Only for the first few. A receipt comes
+                                    // back inside a few hundred milliseconds,
+                                    // so chasing without a limit would spend
+                                    // every attempt in a couple of seconds and
+                                    // then give up on a launch that might still
+                                    // have been sellable a minute later. After
+                                    // the chase, whatever is wrong is not the
+                                    // price, and the gap applies.
+                                    f.sell_next = std::time::Instant::now();
+                                }
                             }
                         }
                     }
@@ -2875,6 +2977,42 @@ mod tests {
         assert_eq!(Tally::average(0, 0), "-");
         assert_eq!(Tally::average(250, 1), "2.50x");
         assert_eq!(Tally::average(300, 2), "1.50x");
+    }
+
+    /// The failure this rule exists for: one transaction we counted as used
+    /// that the chain never saw. Refusing to go back here is what left the
+    /// wallet unable to send anything for the rest of a run.
+    #[test]
+    fn a_dropped_transaction_gives_its_nonce_back() {
+        // Counter at 6, five confirmed and the sixth gone. Nothing else of
+        // ours is in the air, so the node's answer is the whole truth.
+        assert_eq!(resync_to(6, 5, 0, false), Some(5));
+    }
+
+    /// And the failure the old rule was protecting against, which is real: a
+    /// nonce that may still land must not be handed out twice.
+    #[test]
+    fn a_nonce_that_may_still_land_is_not_reused() {
+        // Reported pending - it may yet be mined under this very number.
+        assert_eq!(resync_to(6, 5, 0, true), None);
+        // Or something else of ours is still out there holding a number.
+        assert_eq!(resync_to(6, 5, 1, false), None);
+        assert_eq!(resync_to(6, 5, 3, true), None);
+    }
+
+    /// Forward is always taken: the chain having moved past us means somebody
+    /// else spent from this key, or one we gave up on landed after all.
+    #[test]
+    fn the_chain_moving_ahead_is_always_adopted() {
+        assert_eq!(resync_to(6, 9, 0, false), Some(9));
+        assert_eq!(resync_to(6, 9, 2, true), Some(9));
+    }
+
+    /// Agreement is not a change.
+    #[test]
+    fn a_count_that_agrees_changes_nothing() {
+        assert_eq!(resync_to(6, 6, 0, false), None);
+        assert_eq!(resync_to(6, 6, 2, true), None);
     }
 
     /// Without an anchor the deadline is zero, which the wrapper refuses. A

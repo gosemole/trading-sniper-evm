@@ -229,6 +229,11 @@ pub struct Settled {
     /// The sender's next nonce, re-read whenever a transaction did not land,
     /// so a gap left by a dropped one does not stall everything after it.
     pub resync_nonce: Option<u64>,
+    /// The chain could not say whether this happened, and it may still. The
+    /// difference between this and a plain failure is the difference between
+    /// two ways of retrying: a reverted transaction is gone and can be
+    /// replaced at once, and one that may yet land must not be raced.
+    pub pending: bool,
 }
 
 /// One trade on one curve, and where in the chain it sat.
