@@ -296,6 +296,31 @@ pub fn exit_line(
     })
 }
 
+/// What the position actually returned, once that is known.
+///
+/// A second record and not a rewrite of the first, because they are two facts
+/// and the distance between them is the thing worth reading: `exit` is the
+/// block a rule fired on and the price it fired at, and this is the price the
+/// position got. Live, that gap was 0.9x against 0.36x - the rule saw a 7%
+/// give-back on a curve that had already fallen 62%.
+pub fn closed_line(
+    h: &crate::exit::Held,
+    worth: U256,
+    why: &str,
+    block: u64,
+    quote_decimals: u8,
+) -> Value {
+    json!({
+        "kind": "closed",
+        "block": block,
+        "why": why,
+        "held_blocks": block.saturating_sub(h.opened_at),
+        "cost": crate::units::format_units(h.cost, quote_decimals),
+        "got": crate::units::format_units(worth, quote_decimals),
+        "x100": h.x100(worth),
+    })
+}
+
 /// How a followed launch ended: what happened on it while we watched.
 ///
 /// The only thing the console said that no record kept. The trades are all

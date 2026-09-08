@@ -1047,6 +1047,11 @@ async fn watch_launches_cmd(
         /// finally sold - and two of them writing `done` is a file that says
         /// the launch ended twice.
         finished: bool,
+        /// The block the exit fired on, plus the lag a sale actually takes.
+        /// Without a wallet there is no sale to learn the outcome from, so the
+        /// outcome is the price at this block instead of the price the rule
+        /// fired on.
+        exit_at: Option<u64>,
         /// The reserves stopped being the curve's and nothing may be priced
         /// from them. Set only for a launch that is still holding: anything
         /// else is dropped outright, which is what this used to do to both.
@@ -1246,10 +1251,28 @@ async fn watch_launches_cmd(
         ops: &mut operators::Operators,
         ops_dirty: &mut bool,
     ) {
-        // Decided once. With a real position the shadow stays open until the
-        // sale lands, so without this the rules would fire again on every
-        // block and journal an exit that already happened.
-        if f.lost || f.leaving {
+        if f.lost {
+            return;
+        }
+        // A shadow whose exit has fired is waiting to find out what it got.
+        // With money in it that answer comes from our own sale; without, from
+        // the price once a sale would have landed - which is the same rule
+        // `stats.py` uses, and the reason its lag argument exists.
+        if let Some(at) = f.exit_at {
+            if block >= at {
+                let worth = f
+                    .shadow
+                    .map(|h| exit::worth(&f.curve, h.tokens))
+                    .unwrap_or_default();
+                close_shadow(f, worth, "sold into the next blocks", block, tally, ops, ops_dirty);
+                f.exit_at = None;
+            }
+            return;
+        }
+        // Decided once. The shadow stays open until the outcome is known, so
+        // without this the rules would fire again on every block and journal
+        // an exit that already happened.
+        if f.leaving {
             return;
         }
         let Some(h) = f.shadow.as_mut() else { return };
@@ -1266,6 +1289,11 @@ async fn watch_launches_cmd(
                 exit::render(h, &decision, f.quote_decimals, &f.facts.quote_symbol)
             );
         }
+        // The rule fired: which block, at what price, and why. What the
+        // position then GOT is a second record, written when it is known.
+        if let Err(e) = journal::append(&f.journal, &journal::exit_line(h, *worth, why, block)) {
+            tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
+        }
         f.leaving = true;
         // With money in it, the outcome is not this number. This is what the
         // model thought the position was worth when the rule fired; what the
@@ -1277,7 +1305,17 @@ async fn watch_launches_cmd(
         // returned 0.36x, which is not a small error in a statistic - it is
         // the console describing a different run from the one happening.
         if !f.holding() {
-            close_shadow(f, *worth, why, block, tally, ops, ops_dirty);
+            // Not now, and not at this price. The rule fired on a block that
+            // was already made - selling into it is the impossible reaction
+            // the whole exit was chosen against - so the outcome is what the
+            // curve pays once a sale could actually have landed.
+            //
+            // Two blocks, because that is what the chain did: a sale broadcast
+            // at 22:42:49.279 was included at 22:42:49.459, two blocks later
+            // at this chain's rate. `stats.py --lag 1` is therefore one block
+            // optimistic, and its numbers should be read at `--lag 2`.
+            const EXIT_LAG: u64 = 2;
+            f.exit_at = Some(block + EXIT_LAG);
         }
     }
 
@@ -1298,8 +1336,11 @@ async fn watch_launches_cmd(
         ops_dirty: &mut bool,
     ) {
         let Some(h) = f.shadow.take() else { return };
-        if let Err(e) = journal::append(&f.journal, &journal::exit_line(&h, worth, why, block)) {
-            tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
+        if let Err(e) = journal::append(
+            &f.journal,
+            &journal::closed_line(&h, worth, why, block, f.quote_decimals),
+        ) {
+            tracing::warn!(err = %format!("{e:#}"), "cannot write the close");
         }
         tally.close(h.x100(worth));
         ops.record(f.operator, h.x100(worth));
@@ -3059,6 +3100,7 @@ async fn watch_launches_cmd(
                                         selling: false,
                                         leaving: false,
                                         finished: false,
+                                        exit_at: None,
                                         lost: false,
                                         filled: None,
                                         expected_tokens: Default::default(),
