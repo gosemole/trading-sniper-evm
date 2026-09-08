@@ -222,7 +222,15 @@ def main():
         ("exempt >= 6", lambda r: r["exempt"] >= 6),
         ("бандл >= 5", lambda r: r["window_bundled"] >= 5),
         ("creator fee = 0", lambda r: r["creator_tax_bps"] == 0),
-        ("dev buy >= 15%", lambda r: r["dev_pct"] >= 15)], rule)
+        ("dev buy >= 15%", lambda r: r["dev_pct"] >= 15),
+        # What filtered.toml actually refuses down to, in one row. The single
+        # columns above say which field separates; this says whether the
+        # combination pays for the launches it throws away, which is the only
+        # question a config answers.
+        ("filtered.toml",
+         lambda r: r["exempt"] >= 6
+         and r["creator_tax_bps"] == 0
+         and 2 <= r["dev_pct"] <= 15)], rule)
 
     a, b = halves(ROWS)
     print(f"\n  выборка пополам по деплойеру: {len(a)} / {len(b)} запусков")
