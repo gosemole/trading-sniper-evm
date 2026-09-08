@@ -543,6 +543,29 @@ fn raw_txs<'a>(l2: &'a [u8], depth: u8, out: &mut Vec<&'a [u8]>) {
     }
 }
 
+/// Where the feed's launches go, counted at every step.
+///
+/// The feed has now failed twice in a way nothing reported: it connects, it
+/// carries frames, it stamps every block - so the clock works and decisions
+/// are made - and not one launch is recognised in any of it. Every stage of
+/// the path from a frame to a launch ends in a `?`, so a break anywhere in it
+/// looks exactly like a quiet chain.
+///
+/// These say which stage. `to_a_pad` above zero with `decoded` at zero means
+/// the calldata changed; `txs` above zero with `to_a_pad` at zero means the
+/// launches are going somewhere new; `txs` at zero means the transactions are
+/// not being read out of the frames at all.
+#[derive(Debug, Default, Clone, Copy)]
+struct Funnel {
+    frames: u64,
+    messages: u64,
+    l2: u64,
+    txs: u64,
+    undecodable: u64,
+    to_a_pad: u64,
+    decoded: u64,
+}
+
 /// One signed transaction, if it is a launch sent to one of `pads`.
 ///
 /// Ordered to do the cheap work first: the feed carries every transaction on
@@ -550,14 +573,41 @@ fn raw_txs<'a>(l2: &'a [u8], depth: u8, out: &mut Vec<&'a [u8]>) {
 /// anything is decoded. Recovering the sender is left to the very end, for the
 /// same reason - it is an elliptic-curve operation, and it is not spent on
 /// somebody else's swap.
-fn launch_in_tx(raw: &[u8], seq: u64, chain_time: u64, pads: &[Address]) -> Option<Incoming> {
+fn launch_in_tx(
+    raw: &[u8],
+    seq: u64,
+    chain_time: u64,
+    pads: &[Address],
+    seen: &mut Funnel,
+) -> Option<Incoming> {
     use ethers::core::utils::rlp::{self, Decodable};
-    let mut tx = ethers::types::Transaction::decode(&rlp::Rlp::new(raw)).ok()?;
+    let Ok(mut tx) = ethers::types::Transaction::decode(&rlp::Rlp::new(raw)) else {
+        // Typed envelopes and this chain's own transaction types both land
+        // here, and most of them are nobody's business. Counted rather than
+        // logged: it is the ratio that says whether something changed.
+        seen.undecodable += 1;
+        return None;
+    };
     let to = tx.to?;
     if !pads.is_empty() && !pads.contains(&to) {
         return None;
     }
-    let call = decode_call(&tx.input).ok()?;
+    seen.to_a_pad += 1;
+    let call = match decode_call(&tx.input) {
+        Ok(c) => c,
+        Err(e) => {
+            // A transaction to the launchpad itself whose calldata we cannot
+            // read. Said out loud: this is a launch going past.
+            debug!(
+                tx = ?tx.hash, ?to,
+                selector = %format!("0x{}", hex::encode(tx.input.get(..4).unwrap_or_default())),
+                err = %format!("{e:#}"),
+                "the feed carried something to a launchpad that does not decode"
+            );
+            return None;
+        }
+    };
+    seen.decoded += 1;
     Some(Incoming {
         seen: std::time::Instant::now(),
         seq,
@@ -626,6 +676,12 @@ pub async fn watch_feed(
     // How much this connection actually carried, so a run that reconnects
     // forever says whether it is being refused or is going quiet.
     let mut frames: u64 = 0;
+    // Where the launches go, and a line about it every so often. The feed has
+    // twice carried frames all night and recognised nothing in them, and
+    // nothing said so.
+    let mut seen = Funnel::default();
+    let mut told = std::time::Instant::now();
+    const TELL_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
     // A connection that stops speaking without closing looks identical to a
     // quiet chain, and this chain is never quiet: blocks land every ~100ms, so
@@ -643,6 +699,26 @@ pub async fn watch_feed(
         };
         let Some(msg) = next else { break };
         frames += 1;
+        seen.frames += 1;
+        if told.elapsed() >= TELL_EVERY {
+            told = std::time::Instant::now();
+            // At info, because a feed that recognises nothing is the failure
+            // that has actually happened, twice, and it is invisible otherwise.
+            if seen.decoded == 0 {
+                warn!(
+                    frames = seen.frames, messages = seen.messages, l2 = seen.l2,
+                    txs = seen.txs, undecodable = seen.undecodable,
+                    to_a_pad = seen.to_a_pad,
+                    "the feed has recognised no launches at all"
+                );
+            } else {
+                info!(
+                    frames = seen.frames, txs = seen.txs, to_a_pad = seen.to_a_pad,
+                    decoded = seen.decoded, "the feed is finding launches"
+                );
+            }
+            seen = Funnel::default();
+        }
         let text = match msg.context("reading the feed")? {
             tokio_tungstenite::tungstenite::Message::Text(t) => t,
             tokio_tungstenite::tungstenite::Message::Close(_) => break,
@@ -722,16 +798,20 @@ pub async fn watch_feed(
                 }
                 last_stamp = stamped;
             }
+            seen.messages += 1;
             let Some(b64) = m.message.message.l2_msg else {
                 continue;
             };
             let Ok(raw) = base64_decode(&b64) else {
                 continue;
             };
+            seen.l2 += 1;
             let mut txs = Vec::new();
             raw_txs(&raw, 0, &mut txs);
+            seen.txs += txs.len() as u64;
             for tx in txs {
-                let Some(incoming) = launch_in_tx(tx, m.sequence_number, stamped, pads) else {
+                let Some(incoming) = launch_in_tx(tx, m.sequence_number, stamped, pads, &mut seen)
+                else {
                     continue;
                 };
                 if out.send(Heard::Incoming(Box::new(incoming))).await.is_err() {
