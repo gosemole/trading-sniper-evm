@@ -41,7 +41,8 @@ operator_needs = 0
 
 # What the shadow positions are closed by. Left at the measured defaults so the
 # outcomes recorded now are on the same scale as everything after.
-slippage_bps = 100
+slippage_bps      = 100
+exit_slippage_bps = 300
 max_tax_bps  = 19
 lead_ms      = 100
 trail_bps    = 500

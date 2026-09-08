@@ -62,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
     // What a launch would be bought with, in the pair token's own units, and
     // how much of the price to give away. Both override the config.
     let snipe_size = flag_value("--size");
+    // The ENTRY allowance only. The exit has its own and always has had a
+    // different job; see `[snipe] exit_slippage_bps`.
     let slippage_bps = flag_value("--slippage-bps");
     // How long before a step opens the decision is wanted, in milliseconds.
     let lead_ms = flag_value("--lead-ms");
@@ -1244,7 +1246,10 @@ async fn watch_launches_cmd(
         tx: &tokio::sync::mpsc::Sender<launch::Heard>,
         base_fee: &std::sync::RwLock<ethers::types::U256>,
         second: u64,
-        slippage_bps: u64,
+        // The EXIT allowance. Recomputed here rather than carried from the
+        // `Exit::Sell` that ordered this, because a retry is signed blocks
+        // after the stop fired and the floor has to be about the price now.
+        exit_slippage_bps: u64,
     ) {
         /// Wide enough that a sale reported as still pending has landed or
         /// been dropped before the next one is signed.
@@ -1301,7 +1306,7 @@ async fn watch_launches_cmd(
             );
         }
         let worth = exit::worth(&f.curve, tokens);
-        let min_out = worth * ethers::types::U256::from(10_000 - slippage_bps)
+        let min_out = worth * ethers::types::U256::from(10_000 - exit_slippage_bps)
             / ethers::types::U256::from(10_000u64);
         let nonce = t.take_nonce();
         let fees = fees_now(t.fees.read().map(|f| *f).unwrap_or_default(), base_fee);
@@ -1453,11 +1458,15 @@ async fn watch_launches_cmd(
 
     // How a position ends, refused at startup rather than at the moment one
     // has to be closed.
+    // The exit's own allowance, not the entry's. `--slippage-bps` overrides the
+    // entry only: it exists to aim a buy at a tax step, and the exit has never
+    // been what it was for.
+    let exit_slippage_bps = cfg.snipe.exit_slippage_bps;
     let exit_policy = exit::Policy {
         trail_bps: cfg.snipe.trail_bps,
         take_x100: cfg.snipe.take_x100,
         hold_blocks: cfg.snipe.hold_blocks,
-        slippage_bps,
+        slippage_bps: exit_slippage_bps,
     };
     exit_policy.check().context("[snipe] exit rules")?;
 
@@ -1759,7 +1768,7 @@ async fn watch_launches_cmd(
                             &tx,
                             &base_fee,
                             chain_now,
-                            slippage_bps,
+                            exit_slippage_bps,
                         );
                     }
                 }
@@ -2212,7 +2221,7 @@ async fn watch_launches_cmd(
                         &tx,
                         &base_fee,
                         chain_second(&second_anchor),
-                        slippage_bps,
+                        exit_slippage_bps,
                     );
                     let elapsed = match (
                         f.launched_at,

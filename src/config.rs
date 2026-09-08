@@ -118,11 +118,32 @@ pub struct SnipeConfig {
     /// are large enough that a percent of them is more than is wanted at risk.
     #[serde(default)]
     pub size: String,
-    /// How much of the price to give away. Must stay BELOW the gap between two
-    /// tax steps, or the minimum stops telling them apart: a fill one second
-    /// early would satisfy it, and the point of the minimum is that it cannot.
+    /// How much of the price to give away ON THE WAY IN. Must stay BELOW the
+    /// gap between two tax steps, or the minimum stops telling them apart: a
+    /// fill one second early would satisfy it, and the point of the minimum is
+    /// that it cannot.
     #[serde(default = "default_slippage_bps")]
     pub slippage_bps: u64,
+    /// And on the way out, which is a different question with a different
+    /// answer.
+    ///
+    /// The two were one field, and one percent both ways. On the entry that is
+    /// generous - the price barely moves inside the block being aimed at, and
+    /// the tax is guarded exactly by the wrapper rather than by this. On the
+    /// exit it is the opposite: the stop fires BECAUSE the price gave back 5%
+    /// of its high, so the floor is set at the one moment the price is moving
+    /// fastest, and the sale executes a block later. A floor that reverts is
+    /// not caution - it keeps the position while the price it is leaving keeps
+    /// falling.
+    ///
+    /// Three percent, because that is what the measurement assumed. `stats.py`
+    /// prices the exit one block later and fills it, full stop; the +13.7% a
+    /// night of journals reported is a number with no floor in it at all. Wide
+    /// enough to absorb what other trades do in one block on a curve that has
+    /// just dropped, and still under the 5% trail - so a fill here never gives
+    /// back more than the stop itself tolerates.
+    #[serde(default = "default_exit_slippage_bps")]
+    pub exit_slippage_bps: u64,
     /// The most snipe tax worth paying. The launch second is not reachable
     /// through this at any value - the curve charges 99% there and the wrapper
     /// refuses it outright.
@@ -220,6 +241,9 @@ pub struct SnipeConfig {
 fn default_slippage_bps() -> u64 {
     100
 }
+fn default_exit_slippage_bps() -> u64 {
+    300
+}
 fn default_max_tax_bps() -> u64 {
     19
 }
@@ -275,6 +299,7 @@ impl Default for SnipeConfig {
             size_x100: default_size_x100(),
             size: String::new(),
             slippage_bps: default_slippage_bps(),
+            exit_slippage_bps: default_exit_slippage_bps(),
             max_tax_bps: default_max_tax_bps(),
             max_creator_tax_bps: 0,
             max_run_x100: default_max_run_x100(),
@@ -364,6 +389,21 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
         );
     }
     anyhow::ensure!(
+        cfg.snipe.exit_slippage_bps < 10_000,
+        "[snipe] exit_slippage_bps is the whole position"
+    );
+    // The stop exists to cap the give-back at `trail_bps`. An exit allowed to
+    // be filled further below that than the stop itself tolerates gives back
+    // more than the rule was measured allowing, every time it fires.
+    if cfg.snipe.exit_slippage_bps >= cfg.snipe.trail_bps {
+        tracing::warn!(
+            exit_slippage_bps = cfg.snipe.exit_slippage_bps,
+            trail_bps = cfg.snipe.trail_bps,
+            "[snipe] the exit may be filled further below the high than the stop tolerates, \
+             so a sale can give back more than the rule that ordered it"
+        );
+    }
+    anyhow::ensure!(
         cfg.snipe.max_tax_bps < 10_000,
         "[snipe] max_tax_bps is the whole trade"
     );
@@ -388,4 +428,71 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two configs in the repo are what the bot is actually run with, so a
+    /// key added here and not added there is a run on defaults nobody chose.
+    fn shipped() -> Vec<(&'static str, Config)> {
+        ["live.toml", "collect.toml"]
+            .into_iter()
+            .map(|name| {
+                let raw = std::fs::read_to_string(name).expect(name);
+                (name, toml::from_str::<Config>(&raw).expect(name))
+            })
+            .collect()
+    }
+
+    /// Entry and exit are different questions. One percent on the way in is
+    /// generous - the price barely moves inside the block being aimed at, and
+    /// the wrapper guards the tax exactly. On the way out the stop fires
+    /// BECAUSE the price is moving, and a floor that reverts keeps the
+    /// position while the price it is leaving keeps falling.
+    #[test]
+    fn the_exit_is_allowed_more_room_than_the_entry() {
+        assert_eq!(default_slippage_bps(), 100);
+        assert_eq!(default_exit_slippage_bps(), 300);
+        for (name, cfg) in shipped() {
+            assert!(
+                cfg.snipe.exit_slippage_bps > cfg.snipe.slippage_bps,
+                "{name}: the exit is held to the entry's allowance"
+            );
+        }
+    }
+
+    /// Under the trail, or a sale gives back more than the rule that ordered
+    /// it was measured allowing - every time it fires.
+    #[test]
+    fn the_exit_allowance_stays_under_the_stop() {
+        for (name, cfg) in shipped() {
+            assert!(
+                cfg.snipe.exit_slippage_bps < cfg.snipe.trail_bps,
+                "{name}: a fill may give back more than the stop tolerates"
+            );
+        }
+    }
+
+    /// The entry's minimum is what makes a fill one second early revert
+    /// instead of quietly paying 618 bps, and it can only do that while it is
+    /// narrower than the gap between the steps.
+    #[test]
+    fn the_entry_allowance_still_tells_the_tax_steps_apart() {
+        for (name, cfg) in shipped() {
+            assert!(
+                cfg.snipe.slippage_bps < 599,
+                "{name}: minTokensOut no longer refuses a fill at 618 bps"
+            );
+        }
+    }
+
+    /// A config that omits both gets the pair above rather than one of them.
+    #[test]
+    fn an_empty_config_still_has_both_allowances() {
+        let cfg: Config = toml::from_str("[snipe]\nsize_x100 = 100\n").unwrap();
+        assert_eq!(cfg.snipe.slippage_bps, 100);
+        assert_eq!(cfg.snipe.exit_slippage_bps, 300);
+    }
 }

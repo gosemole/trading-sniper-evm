@@ -51,7 +51,17 @@ max_exempt          = 100000
 require_dev_buy     = false
 
 # The exit, measured with one block between seeing a price and selling into it.
-slippage_bps = 100
+#
+# Two allowances, not one. On the way in, 1%: the price barely moves inside the
+# block being aimed at, and what guards the tax is the wrapper, exactly, not
+# this. On the way out, 3%: the stop fires BECAUSE the price gave back 5% of
+# its high, so the floor is set at the moment the price is moving fastest and
+# the sale lands a block later. The measurement behind every number in this
+# file priced the exit one block later and filled it with no floor at all - 3%
+# is the closest a real floor gets to that, and it stays under the 5% trail so
+# a fill never gives back more than the stop itself tolerates.
+slippage_bps      = 100
+exit_slippage_bps = 300
 max_tax_bps  = 19
 lead_ms      = 100
 trail_bps    = 500

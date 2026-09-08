@@ -2,8 +2,8 @@
 //!
 //! The mirror of [`crate::snipe`]: it is handed a position and the curve as it
 //! stands, and it answers. Whether that answer becomes a transaction is
-//! somebody else's problem, and today nobody's - there is no wallet behind
-//! this yet.
+//! somebody else's problem - under `--execute` it becomes one, and without it
+//! the same answer closes a shadow instead.
 //!
 //! Three rules, in the order they are checked, and each of them earned its
 //! place on the journals rather than being reasoned into existence. Measured
@@ -104,6 +104,12 @@ pub struct Policy {
     /// then keeps costing attention.
     pub hold_blocks: u64,
     /// How far below what it is worth now we are willing to be filled.
+    ///
+    /// The exit's own allowance and not the entry's - they are different
+    /// questions. The stop fires BECAUSE the price gave back `trail_bps` of
+    /// its high, so this floor is set at the moment the price is moving
+    /// fastest, and the sale lands a block later. Keep it under `trail_bps`,
+    /// or a fill gives back more than the rule that ordered it tolerates.
     pub slippage_bps: u64,
 }
 
@@ -140,7 +146,15 @@ pub enum Exit {
         /// The whole position. There is no partial exit here on purpose - see
         /// the note at the top of this file.
         tokens: U256,
-        /// What we refuse to be filled below.
+        /// What we refuse to be filled below, as of the price that ordered
+        /// this.
+        ///
+        /// **Not what is sent.** A sale is signed from the caller's own
+        /// reading of the curve, and a retry is signed blocks after the stop
+        /// fired - a floor carried from here would be about a price that has
+        /// since moved, which is the difference between getting out and
+        /// reverting. This is the floor at the moment of the decision, for the
+        /// journal and for a caller with nothing better.
         min_out: U256,
         worth: U256,
         why: &'static str,
