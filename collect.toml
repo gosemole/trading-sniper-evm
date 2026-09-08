@@ -11,6 +11,11 @@
 #   WS_URL=... HTTP_URL=... \
 #     cargo run --release -- --watch-launches --config collect.toml
 #
+# FEED is deliberately absent. On this chain the sequencer relay delivers a
+# launch AFTER the log for the same launch reaches a decent node - measured at
+# 13 of 14, 11 of 11, 22 of 22 - so it buys no lead at all, and the chain's
+# clock now comes from block headers. Set it only to measure it again.
+#
 # The console reports how the whole run is doing, once every thirty seconds.
 # Every launch, every decision and every close is a record in the journal
 # already - add --verbose to print them as they happen as well.

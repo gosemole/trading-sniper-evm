@@ -1140,6 +1140,15 @@ async fn watch_launches_cmd(
     let mut shadow_closed: u64 = 0;
     let mut shadow_x100: u64 = 0;
     let mut shadow_wins: u64 = 0;
+    // The same, never reset. Thirty seconds holds a handful of closes and a
+    // handful says nothing; the run as a whole is the number worth reading,
+    // and it is the one that cannot be recovered from a window that scrolled
+    // past an hour ago.
+    let mut all_launches: u64 = 0;
+    let mut all_closed: u64 = 0;
+    let mut all_x100: u64 = 0;
+    let mut all_wins: u64 = 0;
+    let started = std::time::Instant::now();
     let mut heard_from_feed: u64 = 0;
     let mut feed_was_late: u64 = 0;
     let mut feed_told = std::time::Instant::now();
@@ -1263,14 +1272,28 @@ async fn watch_launches_cmd(
                             0 => "-".to_string(),
                             n => format!("{}.{:02}x", shadow_x100 / n / 100, shadow_x100 / n % 100),
                         },
-                        win_pct = match shadow_closed {
-                            0 => 0,
-                            n => 100 * shadow_wins / n,
+                        win_pct = %match shadow_closed {
+                            0 => "-".to_string(),
+                            n => (100 * shadow_wins / n).to_string(),
                         },
                         feed_heard = heard_from_feed,
                         feed_late = feed_was_late,
                         operators = ops.len(),
-                        "so far"
+                        "the last thirty seconds"
+                    );
+                    tracing::info!(
+                        minutes = started.elapsed().as_secs() / 60,
+                        launches = all_launches,
+                        closed = all_closed,
+                        shadow = %match all_closed {
+                            0 => "-".to_string(),
+                            n => format!("{}.{:02}x", all_x100 / n / 100, all_x100 / n % 100),
+                        },
+                        win_pct = %match all_closed {
+                            0 => "-".to_string(),
+                            n => (100 * all_wins / n).to_string(),
+                        },
+                        "the whole run"
                     );
                     seen_launches = 0;
                     refused_launches = 0;
@@ -1539,8 +1562,11 @@ async fn watch_launches_cmd(
                             let x100 = h.x100(*worth);
                             shadow_closed += 1;
                             shadow_x100 += x100;
+                            all_closed += 1;
+                            all_x100 += x100;
                             if x100 > 100 {
                                 shadow_wins += 1;
+                                all_wins += 1;
                             }
                             ops.record(f.operator, x100);
                             ops_dirty = true;
@@ -1869,6 +1895,7 @@ async fn watch_launches_cmd(
                                 // launch deliberately passed over.
                                 refused = snipe::refuse_outright(&facts, &policy);
                                 seen_launches += 1;
+                                all_launches += 1;
                                 if refused.is_some() {
                                     refused_launches += 1;
                                 }
