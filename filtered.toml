@@ -55,7 +55,10 @@ max_exempt      = 100000
 require_dev_buy = false
 
 # The exit, unchanged from the measured defaults so the two runs differ in
-# exactly one thing.
+# exactly one thing. On this group, with one block between seeing a price and
+# selling into it: trailing 5% alone returns +31.9 stakes over 296 launches
+# and the same with a hard exit at twice cost returns +43.8, which is what
+# take_x100 = 200 is.
 slippage_bps = 100
 max_tax_bps  = 19
 lead_ms      = 100

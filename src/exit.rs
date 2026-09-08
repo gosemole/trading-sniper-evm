@@ -7,29 +7,42 @@
 //!
 //! Three rules, in the order they are checked, and each of them earned its
 //! place on the journals rather than being reasoned into existence. Measured
-//! over 3473 launches of one night, entering a fixed fraction of every curve
-//! and allowing two blocks between seeing a price and selling into it:
+//! over the 296 launches of one night that the entry filters would have taken,
+//! entering a fixed fraction of each curve and allowing ONE block between
+//! seeing a price and selling into it:
 //!
-//! | rule                            | total over 270 launches |
-//! |---------------------------------|-------------------------|
-//! | trailing 5%                     | +29.1 stakes            |
-//! | trailing 5% + hard exit at 2x   | +39.2 stakes            |
-//! | 50% at 2x, trail the rest       | +30.0                   |
-//! | 50% at +50%, trail the rest     | +22.7                   |
-//! | trailing 10%                    | +6.5                    |
+//! | rule                          | total over 296 launches |
+//! |-------------------------------|-------------------------|
+//! | trailing 5% + hard exit at 2x | +43.8 stakes            |
+//! | trailing 5% + hard exit at 1.5x | +34.1                 |
+//! | trailing 5% + hard exit at 3x | +33.3                   |
+//! | trailing 5%                   | +31.9                   |
+//! | trailing 3%                   | +26.8                   |
+//! | trailing 10%                  | +25.6                   |
+//!
+//! **One block, not none.** Selling into the very trade that broke the stop is
+//! not a fast reaction, it is an impossible one: the trade IS the price move,
+//! and seeing it means the block holding it is already made. That distinction
+//! is worth most of the result - the same measurement at zero blocks reports
+//! +76.5 against +31.9 - and the whole of it sits in that first block. Two
+//! blocks costs +27.4, three costs +27.7, five costs +24.1. So the rules here
+//! are chosen against a delay that can actually be achieved, and nothing is
+//! gained by pretending it could be smaller.
+//!
+//! **The target is why the position closes at all on the launches that run.**
+//! Half of them touch 1.5x and a third touch 2x, so a hard exit at twice cost
+//! is reached often enough to matter and is where the measurement peaks - 3x
+//! is reached by four percent, which is too rare to pay for the launches held
+//! past 2x waiting for it.
 //!
 //! **The ladder loses**, which was the surprise. Selling half on the way up
 //! cuts the launches that would have run and does nothing for the ones that
-//! fall, because a launch that dies never reaches the first rung: 48% of them
-//! touch +50% and 30% touch 2x. What reduces the loss is the stop, and only
-//! the stop - so there is one exit here and it is the whole position.
-//!
-//! The give-back that closes a position is narrow on purpose. Latency is what
-//! makes it narrow: allowing two blocks between the price and the sale turns
-//! a trailing 5% worth +29.1 into the best rule available, while the same
-//! measurement with no delay at all prefers wider stops and reports numbers
-//! three times larger. Those numbers are not reachable by anything that has to
-//! send a transaction.
+//! fall, because a launch that dies never reaches the first rung: of these,
+//! half touch 1.5x and a third touch 2x, so the first rung is missed by half
+//! the group and hit by every winner. What reduces the loss is the stop, and
+//! only the stop - so there is one exit here and it is the whole position.
+//! (The ladders were measured before the delay above was corrected, and have
+//! not been measured since; the reachability is what the rule rests on.)
 
 use crate::curve::Curve;
 use anyhow::Result;
