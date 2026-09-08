@@ -17,12 +17,6 @@
 # separate config for one.
 # With it, three things must all be true or the run refuses to start: the flag,
 # a contract below, and that contract answering that this wallet owns it.
-threshold_pct = 3
-
-[[pools]]
-name = "placeholder"
-version = "v3"
-address = "0x0000000000000000000000000000000000000001"
 
 [snipe]
 # The wrapper. A buy goes to it and the position is bought TO it, because the

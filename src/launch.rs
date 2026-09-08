@@ -1523,7 +1523,7 @@ fn short_tx(h: &H256) -> String {
 /// A launch quotes eighteen of them and the last twelve are never read: what
 /// matters at a glance is 0.086 rather than 0.086000000000000001.
 fn amount(v: U256, decimals: u8) -> String {
-    let full = crate::route::format_units(v, decimals);
+    let full = crate::units::format_units(v, decimals);
     match full.split_once('.') {
         Some((whole, frac)) => {
             let frac = frac.get(..6).unwrap_or(frac).trim_end_matches('0');
@@ -1540,7 +1540,7 @@ fn amount(v: U256, decimals: u8) -> String {
 /// A supply-sized number, short. These run to eight figures and eighteen
 /// decimals, and no decision is made on the tail of one.
 fn tokens(v: U256) -> String {
-    let x = crate::route::format_units(v, 18)
+    let x = crate::units::format_units(v, 18)
         .parse::<f64>()
         .unwrap_or(f64::NAN);
     match x.abs() {

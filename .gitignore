@@ -4,7 +4,7 @@ config.toml
 *.env
 .claude/settings.local.json
 inventory.json
-pools.json
+tokens.json
 contracts/out
 contracts/cache
 contracts/lib

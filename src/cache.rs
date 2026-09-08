@@ -22,7 +22,7 @@
 //! here. Delete the file and the only cost is a slow start.
 
 use anyhow::{Context, Result};
-use ethers::types::{Address, H256};
+use ethers::types::Address;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -88,57 +88,15 @@ fn with<T>(f: impl FnOnce(&mut Cache) -> T) -> Option<T> {
     c.lock().ok().map(|mut g| f(&mut g))
 }
 
-fn v4_key(pool_id: H256) -> String {
-    format!("v4:{pool_id:?}").to_lowercase()
-}
 
-fn v3_key(pool: Address) -> String {
-    format!("v3:{pool:?}").to_lowercase()
-}
 
 fn token_key(token: Address) -> String {
     format!("{token:?}").to_lowercase()
 }
 
-/// A v4 PoolKey, but only if it still hashes to the id it is filed under.
-///
-/// `derive` is the same hash the rest of the code checks against, passed in so
-/// this module does not have to know how a pool id is built.
-pub fn v4_pool(pool_id: H256, derive: impl Fn(&PoolKey) -> H256) -> Option<PoolKey> {
-    let key = with(|c| c.store.pools.get(&v4_key(pool_id)).cloned())??;
-    if derive(&key) == pool_id {
-        return Some(key);
-    }
-    tracing::warn!(
-        ?pool_id,
-        "cached PoolKey does not hash to its own id; ignoring it and reading the chain"
-    );
-    with(|c| {
-        c.store.pools.remove(&v4_key(pool_id));
-        c.dirty = true;
-    });
-    None
-}
 
-pub fn put_v4_pool(pool_id: H256, key: PoolKey) {
-    with(|c| {
-        if c.store.pools.insert(v4_key(pool_id), key).is_none() {
-            c.dirty = true;
-        }
-    });
-}
 
-pub fn v3_pool(pool: Address) -> Option<PoolKey> {
-    with(|c| c.store.pools.get(&v3_key(pool)).cloned())?
-}
 
-pub fn put_v3_pool(pool: Address, key: PoolKey) {
-    with(|c| {
-        if c.store.pools.insert(v3_key(pool), key).is_none() {
-            c.dirty = true;
-        }
-    });
-}
 
 pub fn token(token: Address) -> Option<TokenInfo> {
     with(|c| c.store.tokens.get(&token_key(token)).cloned())?

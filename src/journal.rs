@@ -137,8 +137,8 @@ pub fn trade_line(
     after: &crate::curve::Curve,
 ) -> Value {
     // The launched token is minted at eighteen decimals on this launchpad.
-    let q = |v: &U256| crate::route::format_units(*v, quote_decimals);
-    let t = |v: &U256| crate::route::format_units(*v, 18);
+    let q = |v: &U256| crate::units::format_units(*v, quote_decimals);
+    let t = |v: &U256| crate::units::format_units(*v, 18);
     let mut v = match trade {
         crate::curve::Trade::Buy {
             recipient,
@@ -242,10 +242,10 @@ pub fn decision_line(s: &crate::snipe::Signal, d: &crate::snipe::Decision) -> Va
         "opens_at": s.opens_at,
         "lead_ms": s.in_ms,
         "run_x100": crate::snipe::run_x100(s.facts, s.now),
-        "quote_reserve": crate::route::format_units(
+        "quote_reserve": crate::units::format_units(
             s.now.quote_reserve, s.facts.quote_decimals
         ),
-        "token_reserve": crate::route::format_units(s.now.token_reserve, 18),
+        "token_reserve": crate::units::format_units(s.now.token_reserve, 18),
         "exempt": s.facts.exempt,
         "creator_tax_bps": s.facts.creator_tax_bps,
     });
@@ -256,8 +256,8 @@ pub fn decision_line(s: &crate::snipe::Signal, d: &crate::snipe::Decision) -> Va
             why,
         } => {
             v["decision"] = json!("buy");
-            v["spend"] = json!(crate::route::format_units(*spend, s.facts.quote_decimals));
-            v["min_tokens_out"] = json!(crate::route::format_units(*min_tokens_out, 18));
+            v["spend"] = json!(crate::units::format_units(*spend, s.facts.quote_decimals));
+            v["min_tokens_out"] = json!(crate::units::format_units(*min_tokens_out, 18));
             v["why"] = json!(why);
         }
         crate::snipe::Decision::Wait { why } => {
@@ -289,9 +289,9 @@ pub fn exit_line(
         "block": block,
         "why": why,
         "held_blocks": block.saturating_sub(h.opened_at),
-        "cost": crate::route::format_units(h.cost, 18),
-        "worth": crate::route::format_units(worth, 18),
-        "high": crate::route::format_units(h.high, 18),
+        "cost": crate::units::format_units(h.cost, 18),
+        "worth": crate::units::format_units(worth, 18),
+        "high": crate::units::format_units(h.high, 18),
         "x100": h.x100(worth),
     })
 }
@@ -318,7 +318,7 @@ pub fn done_line(
         }
         format!(
             "{}",
-            crate::route::u256_to_f64(v) / crate::route::u256_to_f64(opening_quote)
+            crate::units::u256_to_f64(v) / crate::units::u256_to_f64(opening_quote)
         )
     };
     json!({
@@ -331,7 +331,7 @@ pub fn done_line(
         "outsiders": outsiders,
         "peak_run": run(peak_quote),
         "last_run": run(last_quote),
-        "quote_reserve": crate::route::format_units(last_quote, quote_decimals),
+        "quote_reserve": crate::units::format_units(last_quote, quote_decimals),
         "position": position,
     })
 }

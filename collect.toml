@@ -20,13 +20,6 @@
 # Every launch, every decision and every close is a record in the journal
 # already - add --verbose to print them as they happen as well.
 #
-# The pool below is a placeholder; --watch-launches never resolves one.
-threshold_pct = 3
-
-[[pools]]
-name = "placeholder"
-version = "v3"
-address = "0x0000000000000000000000000000000000000001"
 
 [snipe]
 # A share of each curve's phantom reserve, in hundredths of a percent. Any

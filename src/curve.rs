@@ -994,7 +994,7 @@ mod tests {
 
     /// Whole units of an eighteen-decimal quote, for readability above.
     fn eth(v: &str) -> U256 {
-        crate::route::parse_units(v, 18).unwrap()
+        crate::units::parse_units(v, 18).unwrap()
     }
 
     /// Worked by hand against the Solidity, digit for digit. 1000 in, 1% fee,
