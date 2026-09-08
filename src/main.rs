@@ -1071,6 +1071,51 @@ async fn watch_launches_cmd(
     // store is the one thing here that grows without an upper bound.
     const REMEMBER_BLOCKS: u64 = 5_927_040;
     let mut newest_block = 0u64;
+
+    // The requests a launch needs before anything can be decided about it,
+    // made off the loop that decides. ONE task working a queue, not one task
+    // per launch: a `TokenLaunched` and the `Launched` of the same transaction
+    // resolving out of order would print a dev buy with no launch in front of
+    // it, and pair the wrong two together. In order, and the loop never waits.
+    let (wanting, mut wanted) = tokio::sync::mpsc::channel::<launch::Wanted>(256);
+    let resolving = tokio::spawn({
+        let http = http.clone();
+        let tx = tx.clone();
+        async move {
+            while let Some(w) = wanted.recv().await {
+                let launch::Wanted {
+                    launch,
+                    mut call,
+                    lead,
+                    mut launched_at,
+                    want_quote,
+                } = w;
+                if call.is_none() {
+                    call = launch_call(&http, launch.tx).await;
+                }
+                if launched_at.is_none() {
+                    launched_at = block_second(&http, launch.block).await;
+                }
+                let quote = match want_quote {
+                    Some(t) => quote_of(&http, factory, t).await.map(|(q, e)| (t, q, e)),
+                    None => None,
+                };
+                if tx
+                    .send(launch::Heard::Ready(Box::new(launch::Resolved {
+                        launch,
+                        call,
+                        lead,
+                        launched_at,
+                        quote,
+                    })))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
     if size.is_some() {
         tracing::info!(
             max_tax_bps = policy.max_tax_bps,
@@ -1263,24 +1308,12 @@ async fn watch_launches_cmd(
                         "{}",
                         launch::render_incoming(&i, quotes.get(&i.call.pair_token))
                     );
-                    // Asked for AFTER the line is printed, so nothing waits on
-                    // it: the answer is for the launches after this one, and
-                    // for the entry this one will turn into.
-                    if !quotes.contains_key(&i.call.pair_token) {
-                        if let Some((q, e)) = quote_of(http, factory, i.call.pair_token).await {
-                            if let Some(e) = e {
-                                economics.insert(i.call.pair_token, e);
-                            }
-                            if order.len() >= REMEMBERED {
-                                if let Some(old) = order.pop_front() {
-                                    quotes.remove(&old);
-                                }
-                            }
-                            order.push_back(i.call.pair_token);
-                            quotes.insert(i.call.pair_token, q);
-                            cache::flush();
-                        }
-                    }
+                    // The pair token is NOT looked up here any more. It was
+                    // a prefetch - the feed sees a launch before its log, so
+                    // the answer would be warm by the time the launch needed
+                    // it - but it was a round trip inside the loop that has to
+                    // aim at a step of the tax window, and the resolver fetches
+                    // the same thing off it now.
                     if seen_order.len() >= REMEMBERED {
                         if let Some(old) = seen_order.pop_front() {
                             sightings.remove(&old);
@@ -1486,6 +1519,55 @@ async fn watch_launches_cmd(
                             w.insert(l.curve);
                         }
                     }
+                    // Everything the endpoint would have to be asked for,
+                    // asked for somewhere else. Made here, the three requests
+                    // behind a launch - its calldata, the second its block
+                    // carries, what its pair token is - spend this loop's
+                    // whole budget: it has a hundred milliseconds to aim at a
+                    // step of the tax window and one round trip is a third of
+                    // that. The paper runs showed steps decided after they had
+                    // already opened.
+                    let sighted = sightings.remove(&l.tx);
+                    let cached_at = sighted.as_ref().map(|(_, _, at)| *at).or_else(|| {
+                        block_seconds.read().ok().and_then(|s| s.get(&l.block).copied())
+                    });
+                    let want_quote = launch::pair_of(&l, sighted.as_ref().map(|(_, c, _)| c))
+                        .filter(|p| !quotes.contains_key(p) || !economics.contains_key(p));
+                    if wanting
+                        .send(launch::Wanted {
+                            launch: *l,
+                            call: sighted.as_ref().map(|(_, c, _)| c.clone()),
+                            lead: sighted.as_ref().map(|(seen, _, _)| seen.elapsed()),
+                            launched_at: cached_at,
+                            want_quote,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // The same launch, once nothing is left to ask about. In the
+                // order it arrived: the resolver is one task working through a
+                // queue rather than one task per launch, because a `Launched`
+                // and the `TokenLaunched` of the same transaction resolving
+                // out of order is a dev buy printed without its launch.
+                Some(launch::Heard::Ready(r)) => {
+                    let launch::Resolved { launch, call, lead, launched_at, quote } = *r;
+                    let l = Box::new(launch);
+                    if let Some((token, q, e)) = quote {
+                        if let Some(e) = e {
+                            economics.insert(token, e);
+                        }
+                        if order.len() >= REMEMBERED {
+                            if let Some(old) = order.pop_front() {
+                                quotes.remove(&old);
+                            }
+                        }
+                        order.push_back(token);
+                        quotes.insert(token, q);
+                        cache::flush();
+                    }
                     // Whatever this log turns into below, the launch behind it
                     // has now been said out loud.
                     if reported.insert(l.tx) {
@@ -1532,50 +1614,16 @@ async fn watch_launches_cmd(
                         }));
                     }
 
-                    // The feed already carried this transaction, so its calldata
-                    // is in hand and the request for it is not made at all.
-                    let (call, lead, launched_at) = match sightings.remove(&l.tx) {
-                        Some((seen, call, at)) => (Some(call), Some(seen.elapsed()), Some(at)),
-                        None => (launch_call(http, l.tx).await, None, None),
-                    };
-                    // The feed stamps every block it carries, not only the ones
-                    // whose launches it caught - so a launch it missed still
-                    // has a second, and without this one every trade on that
-                    // curve loses its place in the tax window.
-                    let launched_at = match launched_at.or_else(|| {
-                        block_seconds.read().ok().and_then(|s| s.get(&l.block).copied())
-                    }) {
-                        Some(at) => Some(at),
-                        // Neither source had it, which on a healthy feed does
-                        // not happen and without one happens every time.
-                        None => block_second(http, l.block).await,
-                    };
-
                     match l.what {
                         launch::What::Created { pair_token, .. } => {
                             let mut refused: Option<String> = None;
-                            // Both maps, not just the quote: the native pair
-                            // is seeded with its decimals at startup, so
-                            // gating on the quote alone meant its economics -
-                            // and with them every plan for a native launch,
-                            // which is most of them - were never read at all.
-                            if !quotes.contains_key(&pair_token)
-                                || !economics.contains_key(&pair_token)
-                            {
-                                if let Some((q, e)) = quote_of(http, factory, pair_token).await {
-                                    if let Some(e) = e {
-                                        economics.insert(pair_token, e);
-                                    }
-                                    if order.len() >= REMEMBERED {
-                                        if let Some(old) = order.pop_front() {
-                                            quotes.remove(&old);
-                                        }
-                                    }
-                                    order.push_back(pair_token);
-                                    quotes.insert(pair_token, q);
-                                    cache::flush();
-                                }
-                            }
+                            // The pair token was looked up by the resolver on
+                            // the way here, if it needed looking up: both maps
+                            // are checked there, not just the quote, because
+                            // the native pair is seeded with its decimals at
+                            // startup and gating on the quote alone left its
+                            // economics - and with them every native launch,
+                            // which is most of them - never read at all.
                             // Follow this curve from here, at the reserves it
                             // opens with. Every trade on it after this moves
                             // them exactly, out of its own logs, so what a buy
@@ -1720,7 +1768,7 @@ async fn watch_launches_cmd(
                                         let curve = l.curve;
                                         let from = l.block;
                                         tokio::spawn(async move {
-                                            launch::backfill(&http, curve, from, from + 5, tx).await
+                                            launch::backfill(&http, curve, from, tx).await
                                         });
                                     }
                                     let mut f = Followed {
@@ -1839,6 +1887,7 @@ async fn watch_launches_cmd(
     } else {
         tracing::info!(operators = ops.len(), wallets = ops.wallets(), "operator history saved");
     }
+    resolving.abort();
     watching.abort();
     if let Some(f) = feeding {
         f.abort();

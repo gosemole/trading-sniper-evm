@@ -219,6 +219,39 @@ pub struct TradeAt {
     pub trade: crate::curve::Trade,
 }
 
+/// A launch on its way to the resolver, with whatever was already cached.
+///
+/// The caches live in the loop that decides things, so it is the loop that
+/// says what is missing; the resolver only makes the requests.
+#[derive(Debug, Clone)]
+pub struct Wanted {
+    pub launch: Launch,
+    pub call: Option<LaunchCall>,
+    pub lead: Option<std::time::Duration>,
+    pub launched_at: Option<u64>,
+    /// The pair token nothing knows about yet, if there is one.
+    pub want_quote: Option<Address>,
+}
+
+/// A launch with everything the endpoint had to be asked for already in hand.
+///
+/// The launch arrives as a log; the calldata behind it, the second its block
+/// carries and what its pair token is are three more requests. Made in the
+/// loop that decides things they cost that loop its budget - it has a hundred
+/// milliseconds to aim at a step of the tax window, and one round trip is a
+/// third of that. So they are made somewhere else and the launch arrives here
+/// again, complete.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    pub launch: Launch,
+    pub call: Option<LaunchCall>,
+    /// How far ahead of the log the sequencer feed carried this, when it did.
+    pub lead: Option<std::time::Duration>,
+    pub launched_at: Option<u64>,
+    /// The pair token that had to be looked up, and what it turned out to be.
+    pub quote: Option<(Address, Quote, Option<PairEconomics>)>,
+}
+
 /// Boxed for the same reason as the rest of this enum: a trade is a couple of
 /// hundred bytes and a settings change is eight, and they share a channel.
 #[derive(Debug, Clone)]
@@ -229,6 +262,8 @@ pub enum Heard {
     /// Something happened on a curve. Every curve on the chain reports these,
     /// and the ones we are not following are dropped where they arrive.
     Trade(Box<TradeAt>),
+    /// A launch that has been through the resolver and needs nothing more.
+    Ready(Box<Resolved>),
     /// Boxed: a launch is two hundred bytes and a settings change is eight, and
     /// every one of these goes down a channel sized for the settings.
     Launch(Box<Launch>),
@@ -889,9 +924,33 @@ pub async fn backfill(
     http: &ethers::providers::Provider<ethers::providers::Http>,
     curve: Address,
     from: u64,
-    to: u64,
     out: mpsc::Sender<Heard>,
 ) {
+    // In two passes, because the launch block IS the head. Asking for blocks
+    // that do not exist yet is not an empty answer, it is
+    // `invalid block range params` and the whole request is lost - including
+    // the launch block, which is the one that matters and the one we already
+    // know exists, having just read a log out of it.
+    //
+    // So: that block on its own, at once. Then the few after it, once enough
+    // time has passed for them to be there. The bundle's own buys are split
+    // across exactly these two.
+    let mut sent = ask(http, curve, from, from, &out).await;
+    // Six blocks of this chain, and well inside the second before the first
+    // step of the tax window opens.
+    tokio::time::sleep(std::time::Duration::from_millis(620)).await;
+    sent += ask(http, curve, from + 1, from + 4, &out).await;
+    debug!(curve = ?curve, from, sent, "backfilled a curve's opening trades");
+}
+
+/// One range, or nothing and a reason.
+async fn ask(
+    http: &ethers::providers::Provider<ethers::providers::Http>,
+    curve: Address,
+    from: u64,
+    to: u64,
+    out: &mpsc::Sender<Heard>,
+) -> usize {
     use ethers::providers::Middleware;
     let filter = ethers::types::Filter::new()
         .address(curve)
@@ -911,7 +970,7 @@ pub async fn backfill(
                 curve = ?curve, from, to, err = %format!("{e:#}"),
                 "cannot read what this curve did before we were listening"
             );
-            return;
+            return 0;
         }
     };
     let mut sent = 0usize;
@@ -938,11 +997,11 @@ pub async fn backfill(
             .await
             .is_err()
         {
-            return;
+            return sent;
         }
         sent += 1;
     }
-    debug!(curve = ?curve, from, to, sent, "backfilled a curve's opening trades");
+    sent
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>> {
@@ -1148,6 +1207,7 @@ async fn call_u64(http: &Provider<Http>, to: Address, sig: &str) -> Result<u64> 
 /// Kept per curve, because only the factory's log names the pair token and the
 /// launcher's log in the same transaction has to be printed in its units. The
 /// factory's arrives first, so by the time a dev buy needs this it is here.
+#[derive(Debug, Clone)]
 pub struct Quote {
     pub decimals: u8,
     pub symbol: String,

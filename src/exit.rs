@@ -197,12 +197,12 @@ pub fn render(h: &Held, e: &Exit, decimals: u8, symbol: &str) -> String {
     };
     format!(
         "  {verb}  {} -> {} {}  {}.{:02}x  high {}  [{why}]",
-        crate::route::format_units(h.cost, decimals),
-        crate::route::format_units(worth, decimals),
+        crate::launch::amount_of(h.cost, decimals),
+        crate::launch::amount_of(worth, decimals),
         symbol,
         h.x100(worth) / 100,
         h.x100(worth) % 100,
-        crate::route::format_units(h.high, decimals),
+        crate::launch::amount_of(h.high, decimals),
     )
 }
 
