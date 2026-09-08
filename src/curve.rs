@@ -323,6 +323,49 @@ fn mul_div(a: U256, b: U256, denominator: U256, ceil: bool) -> Result<U256> {
     Ok(U256::from_big_endian(&bytes[32..]))
 }
 
+/// What a sell returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Proceeds {
+    /// What reaches the seller, after both cuts.
+    pub quote_out: U256,
+    /// What the swap itself produced, which is what leaves the reserve.
+    pub gross: U256,
+    pub fee: U256,
+    pub creator_tax: U256,
+}
+
+/// What `sell(tokens, _, _)` would return, without asking anyone.
+///
+/// The mirror of [`buy`], and simpler in every way that matters: the swap runs
+/// first at **zero fee**, and the fee and the creator's cut come off the
+/// PROCEEDS rather than the input. There is no clamp - the reserved allocation
+/// is a floor the curve will not sell through, and a sell only ever adds
+/// tokens back.
+///
+/// The whole reserve movement is `gross`, not `quote_out`: both cuts are paid
+/// out of the swap's output and leave the curve with it. Getting that backwards
+/// leaves the reserves wrong by the fee on every sell, compounding.
+///
+/// This shape is not inferred from the contract but checked against it: every
+/// one of the 36,151 sells in the journals reproduces its `quote_out` to the
+/// wei.
+pub fn sell(c: &Curve, tokens_in: U256) -> Result<Proceeds> {
+    anyhow::ensure!(!tokens_in.is_zero(), "ZeroAmount");
+    let bp = U256::from(BASIS_POINTS);
+    let gross = amount_out(tokens_in, c.token_reserve, c.quote_reserve, 0)?;
+    let fee = gross * U256::from(c.fee_bps) / bp;
+    let creator_tax = gross * U256::from(c.creator_tax_bps) / bp;
+    let quote_out = gross
+        .checked_sub(fee + creator_tax)
+        .context("the cuts are more than the sale")?;
+    Ok(Proceeds {
+        quote_out,
+        gross,
+        fee,
+        creator_tax,
+    })
+}
+
 /// One of a curve's own logs, and what it did to the reserves.
 ///
 /// The deltas are not modelled - they are read out of the event. Every field

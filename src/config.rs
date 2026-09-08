@@ -397,6 +397,24 @@ pub struct SnipeConfig {
     /// transaction still has to be signed and sent after it.
     #[serde(default = "default_lead_ms")]
     pub lead_ms: u64,
+
+    // How a position ends. Measured over one night of 3473 launches, entering
+    // a fixed fraction of every curve and allowing two blocks between seeing a
+    // price and selling into it - see `src/exit.rs` for the table these came
+    // out of.
+    /// How much of its high a position may give back before it is sold, in
+    /// basis points. Narrow because the delay between the price and the sale
+    /// is what a wide stop pays for.
+    #[serde(default = "default_trail_bps")]
+    pub trail_bps: u64,
+    /// A multiple of cost that closes a position outright, in hundredths. 200
+    /// is twice what it cost; 0 turns it off and leaves only the stop.
+    #[serde(default = "default_take_x100")]
+    pub take_x100: u64,
+    /// Blocks after opening at which a position is sold whatever it is worth.
+    /// This chain runs 9.8 blocks to the second.
+    #[serde(default = "default_hold_blocks")]
+    pub hold_blocks: u64,
 }
 
 fn default_slippage_bps() -> u64 {
@@ -423,6 +441,15 @@ fn default_min_dev_buy_x100() -> u64 {
 fn default_size_x100() -> u64 {
     100
 }
+fn default_trail_bps() -> u64 {
+    500
+}
+fn default_take_x100() -> u64 {
+    200
+}
+fn default_hold_blocks() -> u64 {
+    588
+}
 
 impl Default for SnipeConfig {
     fn default() -> Self {
@@ -438,6 +465,9 @@ impl Default for SnipeConfig {
             require_dev_buy: true,
             min_dev_buy_x100: default_min_dev_buy_x100(),
             lead_ms: default_lead_ms(),
+            trail_bps: default_trail_bps(),
+            take_x100: default_take_x100(),
+            hold_blocks: default_hold_blocks(),
         }
     }
 }

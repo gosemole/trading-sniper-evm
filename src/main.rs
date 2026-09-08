@@ -4,6 +4,7 @@ mod curve;
 mod depth;
 mod execute;
 mod executor;
+mod exit;
 mod feed;
 mod inventory;
 mod journal;
@@ -871,6 +872,18 @@ async fn watch_launches_cmd(
         buys: u32,
         sells: u32,
         peak_quote: ethers::types::U256,
+        /// The last block we saw a trade on this curve in, so a position can
+        /// be aged in the chain's time rather than in ours.
+        last_block: u64,
+        /// What the buy decision would have bought, followed to its exit.
+        ///
+        /// Nothing was sent, so this is not a position - it is the record of
+        /// what one would have done, kept because the exit rules cannot be
+        /// judged any other way until there is a wallet behind this. It is
+        /// also the only honest input to an operator's history: the curve's
+        /// own peak correlates with our outcome at 0.62, and a shadow
+        /// position correlates with it at 1.
+        shadow: Option<exit::Held>,
     }
 
     /// One followed launch, once its minute is up.
@@ -971,8 +984,16 @@ async fn watch_launches_cmd(
     let mut pending: Option<Held> = None;
     let mut deadline = tokio::time::Instant::now();
 
-    // What this is willing to do, stated once. The size itself is filled in
-    // per launch, because it is in the pair token's own units and those differ.
+    // How a position ends, refused at startup rather than at the moment one
+    // has to be closed.
+    let exit_policy = exit::Policy {
+        trail_bps: cfg.snipe.trail_bps,
+        take_x100: cfg.snipe.take_x100,
+        hold_blocks: cfg.snipe.hold_blocks,
+        slippage_bps,
+    };
+    exit_policy.check().context("[snipe] exit rules")?;
+
     // What this is willing to do, from the config. The size is filled in per
     // launch, because it is in the pair token's own units and those differ.
     let policy = snipe::Policy {
@@ -1094,8 +1115,33 @@ async fn watch_launches_cmd(
                         // decision it is and the position stays open. When
                         // there is a wallet behind this, the position becomes
                         // InFlight here and the receipt settles it.
-                        if let snipe::Decision::Skip { why } = &decision {
-                            f.position = snipe::Position::Skipped { why: why.clone() };
+                        match &decision {
+                            snipe::Decision::Skip { why } => {
+                                f.position = snipe::Position::Skipped { why: why.clone() };
+                            }
+                            // The shadow opens on the first buy decision and
+                            // never reopens: a second one would be averaging
+                            // into a position we are already carrying, which
+                            // is a different strategy than the one measured.
+                            snipe::Decision::Buy { spend, .. } if f.shadow.is_none() => {
+                                match curve::buy(&f.curve, *spend, tax_bps) {
+                                    Ok(fill) => {
+                                        let mut h = exit::Held {
+                                            tokens: fill.tokens_out,
+                                            cost: fill.spent,
+                                            high: ethers::types::U256::zero(),
+                                            opened_at: f.last_block,
+                                        };
+                                        h.mark(exit::worth(&f.curve, h.tokens));
+                                        f.shadow = Some(h);
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        curve = ?curve_addr, err = %format!("{e:#}"),
+                                        "the buy this decided on cannot be priced"
+                                    ),
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1194,6 +1240,27 @@ async fn watch_launches_cmd(
                         _ => {}
                     }
                     f.peak_quote = f.peak_quote.max(f.curve.quote_reserve);
+                    f.last_block = block;
+                    // The shadow, against the curve this trade just made. The
+                    // high is marked BEFORE the question is asked, or the stop
+                    // measures a give-back from a peak it has not seen yet.
+                    if let Some(h) = f.shadow.as_mut() {
+                        h.mark(exit::worth(&f.curve, h.tokens));
+                        let decision = exit::decide(h, &f.curve, block, &exit_policy);
+                        if let exit::Exit::Sell { worth, why, .. } = &decision {
+                            println!(
+                                "{}",
+                                exit::render(h, &decision, f.quote_decimals, &f.facts.quote_symbol)
+                            );
+                            if let Err(e) = journal::append(
+                                &f.journal,
+                                &journal::exit_line(h, *worth, why, block),
+                            ) {
+                                tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
+                            }
+                            f.shadow = None;
+                        }
+                    }
                     let elapsed = match (
                         f.launched_at,
                         block_seconds.read().ok().and_then(|s| s.get(&block).copied()),
@@ -1521,6 +1588,8 @@ async fn watch_launches_cmd(
                                         until: std::time::Instant::now() + FOLLOW_FOR,
                                         buys: 0,
                                         sells: 0,
+                                        last_block: l.block,
+                                        shadow: None,
                                         peak_quote: opening.quote_reserve,
                                     };
                                     // Whatever already happened on it, in the

@@ -254,6 +254,30 @@ pub fn decision_line(s: &crate::snipe::Signal, d: &crate::snipe::Decision) -> Va
     v
 }
 
+/// How a position ended, and what it was worth when it did.
+///
+/// Written whether or not anything was sent. Until there is a wallet behind
+/// this the whole record of an exit rule is these lines, and an operator's
+/// history is built out of them rather than out of the curve's own peak -
+/// which is a different number and a worse one.
+pub fn exit_line(
+    h: &crate::exit::Held,
+    worth: U256,
+    why: &str,
+    block: u64,
+) -> Value {
+    json!({
+        "kind": "exit",
+        "block": block,
+        "why": why,
+        "held_blocks": block.saturating_sub(h.opened_at),
+        "cost": crate::route::format_units(h.cost, 18),
+        "worth": crate::route::format_units(worth, 18),
+        "high": crate::route::format_units(h.high, 18),
+        "x100": h.x100(worth),
+    })
+}
+
 /// Append one line. Opened and closed per line on purpose: a launch writes a
 /// few dozen lines over a minute, and a handle held open across that is a
 /// handle that loses them if the process ends badly.
