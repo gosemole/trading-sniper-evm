@@ -61,6 +61,12 @@ def trail(pct, take=None, lag=1):
     price move, and seeing it means its block is already made. On the launches
     the live filter keeps, zero reports +76.5 stakes and one reports +31.9.
     Everything past the first block is nearly flat: two is +27.4, five +24.1.
+
+    **Two, not one, by measurement.** Trading live, a sale broadcast at
+    22:42:49.279 was included at 22:42:49.459 and a retry broadcast at
+    22:44:03.840 landed three blocks after the revert it replaced - so
+    broadcast to inclusion is two blocks at best and three often enough. One
+    was a guess and it was the optimistic end of the range.
     """
     def rule(r):
         p = r["path"]
@@ -179,9 +185,10 @@ def noise_floor(rows, after_blocks, seed=7):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("rows", help="the jsonl replay.py wrote")
-    ap.add_argument("--lag", type=int, default=1,
+    ap.add_argument("--lag", type=int, default=2,
                     help="blocks between seeing a price and selling into it "
-                         "(default 1; zero is not achievable, see trail())")
+                         "(default 2, measured on chain; zero is not achievable, "
+                         "see trail())")
     ap.add_argument("--exit", default="live",
                     help="live | trail5 | trail10 | trail20 | hold10 | hold20 | hold30")
     args = ap.parse_args()
