@@ -32,17 +32,24 @@ import statistics as st
 from collections import defaultdict
 
 
-def value_at(path, sec):
-    """What the position is worth at `sec`, from the last trade at or before."""
+# This chain runs 9.8 blocks to the second, measured off the launches where the
+# feed gave both. The paths are indexed by block offset, because a block number
+# is on every trade and the launch second often is not.
+BLOCKS_PER_SECOND = 9.8
+
+
+def value_at(path, block):
+    """What the position is worth at `block`, from the last trade at or before."""
     v = path[0][1]
     for e, x in path:
-        if e is not None and e <= sec:
+        if e is not None and e <= block:
             v = x
     return v
 
 
 def hold(sec):
-    return lambda r: value_at(r["path"], sec)
+    """Hold for `sec` seconds after entry, in blocks."""
+    return lambda r: value_at(r["path"], r["enter_block"] + sec * BLOCKS_PER_SECOND)
 
 
 def trail(pct, since=None):
@@ -104,12 +111,12 @@ def halves(rows, seed=7):
             [r for r in rows if r["deployer"] not in left])
 
 
-def noise_floor(rows, sec, seed=7):
+def noise_floor(rows, after_blocks, seed=7):
     """What 'upside still ahead' is worth when there is no structure at all."""
     rng = random.Random(seed)
     out = []
     for r in rows:
-        fut = [v for e, v in r["path"] if e is not None and e > sec]
+        fut = [v for e, v in r["path"] if e is not None and e > after_blocks]
         if len(fut) < 3:
             continue
         steps = [fut[i + 1] / fut[i] for i in range(len(fut) - 1) if fut[i] > 0]
@@ -131,13 +138,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("rows", help="the jsonl replay.py wrote")
     ap.add_argument("--exit", default="trail10",
-                    help="trail10 | trail20 | hold20 | hold30 | hold60")
+                    help="trail10 | trail20 | hold10 | hold20 | hold30")
     args = ap.parse_args()
 
     global ROWS
     ROWS = [json.loads(l) for l in open(args.rows)]
     rules = {"trail10": trail(10), "trail20": trail(20),
-             "hold20": hold(20), "hold30": hold(30), "hold60": hold(60)}
+             "hold10": hold(10), "hold20": hold(20), "hold30": hold(30)}
     rule = rules[args.exit]
 
     who = {r["deployer"] for r in ROWS}
@@ -147,10 +154,9 @@ def main():
     print("  самые частые: " + ", ".join(f"{d[:10]}… x{n}" for n, d in serial))
     peak = by_deployer(ROWS, lambda r: max(v for _, v in r["path"]))
     print(f"  средний пик {st.mean(peak):.3f}x     "
-          f"шум на +5s {noise_floor(ROWS, 5):.3f}x  (всё ниже этого — не сигнал)")
+          f"шум {noise_floor(ROWS, 30):.3f}x  (всё ниже этого — не сигнал)")
 
-    report("выход, без всякого отбора", [
-        ("трейлинг 10%", lambda r: True)], rule)
+    report("выход, без всякого отбора", [(args.exit, lambda r: True)], rule)
     report("dev buy, % фантома", [
         ("< 2%", lambda r: r["dev_pct"] < 2),
         ("2 - 5%", lambda r: 2 <= r["dev_pct"] < 5),

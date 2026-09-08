@@ -22,8 +22,24 @@ Everything is integer arithmetic in the token's own smallest unit, the way the
 chain does it. Floats appear only in the value path, where they are ratios and
 the last bit does not decide anything.
 
+Time is measured in blocks after the launch block, not in seconds. The launch
+second comes from the sequencer feed and the feed is not always up - it caught
+three percent of one overnight run - and a journal without it has no `elapsed`
+on any trade at all. Block numbers are on every trade unconditionally. This
+chain runs 9.8 blocks to the second, measured off the launches where both are
+known, and the seconds overlap at their edges: second 1 spans offsets 1 to 18
+and second 2 spans 11 to 23, so an offset cannot say which of those two a trade
+fell in. It can say a trade is past the tax window, which is what matters: the
+window is three seconds, second 3 starts by offset 23, and everything from
+offset 30 on pays no snipe tax whatever the feed did.
+
+So the entry is "the first trade at least `--enter-block` blocks after the
+launch", at zero tax. One definition that holds whether or not the feed was up,
+which is also the only way a night and a day are comparable.
+
 The output is one JSON object per launch with the launch's traits and the full
-value path, so exit rules can be tried in `stats.py` without replaying again.
+value path indexed by block offset, so exit rules can be tried in `stats.py`
+without replaying again.
 
     python3 analysis/replay.py launches/ > rows.jsonl
 """
@@ -74,7 +90,7 @@ class Bad(Exception):
     """This file cannot be trusted, and the reason a person can act on."""
 
 
-def replay(path, size_x100, enter_at):
+def replay(path, size_x100, enter_block):
     lines = []
     for n, raw in enumerate(open(path), 1):
         raw = raw.strip()
@@ -106,6 +122,9 @@ def replay(path, size_x100, enter_at):
 
     # Every trade, with the deltas it applied and what it should have paid out.
     trades = []
+    launch_block = head.get("block")
+    if not launch_block:
+        raise Bad("launch line has no block")
     qr, tr = qr0, tr0
     graduated = False
     last_block = 0
@@ -173,7 +192,7 @@ def replay(path, size_x100, enter_at):
                     f"{name} reserve off by {abs(got - want)} after a {kind} "
                     f"at +{e}s"
                 )
-        trades.append((row, e))
+        trades.append((row, e, block - launch_block))
 
     # Now the counterfactual: buy in at `enter_at`, then let the same trades
     # run against a curve that carries our position.
@@ -182,25 +201,27 @@ def replay(path, size_x100, enter_at):
         raise Bad("a size that rounds to nothing")
     qr, tr = qr0, tr0
     i = 0
-    while i < len(trades) and (trades[i][1] is None or trades[i][1] < enter_at):
-        row, _ = trades[i]
-        qr, tr = _apply(row, qr, tr, qd)
+    while i < len(trades) and trades[i][2] < enter_block:
+        qr, tr = _apply(trades[i][0], qr, tr, qd)
         i += 1
     run_at_entry = qr / qr0
-    tax_bps = {0: 9900, 1: 618, 2: 19}.get(enter_at, 0)
-    held, qr, tr = buy(qr, tr, reserved, fee_bps, creator_bps, tax_bps, spend)
+    # Zero tax: `enter_block` is past the window by construction. Anything
+    # earlier would need the launch second, which is exactly what is missing.
+    held, qr, tr = buy(qr, tr, reserved, fee_bps, creator_bps, 0, spend)
     if held == 0:
         raise Bad("our own buy fills nothing")
-    path = [(enter_at, sell(qr, tr, fee_bps, creator_bps, held)[0] / spend)]
-    for row, e in trades[i:]:
+    path = [(enter_block, sell(qr, tr, fee_bps, creator_bps, held)[0] / spend)]
+    for row, _, off in trades[i:]:
         qr, tr = _apply(row, qr, tr, qd)
-        path.append((e, sell(qr, tr, fee_bps, creator_bps, held)[0] / spend))
+        path.append((off, sell(qr, tr, fee_bps, creator_bps, held)[0] / spend))
 
     # What the launch itself was, all of it knowable before the buy.
+    # The tax window, in blocks: three seconds is 30 blocks, and the last of
+    # them is the first offset that is certainly past it.
     window_taxed = window_bundled = 0
     dev = 0
-    for row, e in trades:
-        if row["kind"] != "buy" or e is None or e > 3:
+    for row, _, off in trades:
+        if row["kind"] != "buy" or off > 30:
             continue
         dev = max(dev, units(row["quote_in"], qd))
         if row.get("exempt"):
@@ -213,6 +234,7 @@ def replay(path, size_x100, enter_at):
         "pair": head.get("pair_symbol", ""),
         "block": head.get("block"),
         "launched_at": head.get("launched_at"),
+        "enter_block": enter_block,
         "via": head.get("via", ""),
         "creator_tax_bps": creator_bps,
         "curve_fee_bps": fee_bps,
@@ -248,8 +270,10 @@ def main():
     ap.add_argument("--size-x100", type=int, default=100,
                     help="our size, in hundredths of a percent of the opening "
                          "quote reserve (default 100 = 1%%)")
-    ap.add_argument("--enter-at", type=int, default=2,
-                    help="the second of the tax window we buy in (default 2)")
+    ap.add_argument("--enter-block", type=int, default=30,
+                    help="blocks after the launch block that we buy at "
+                         "(default 30, the first offset certainly past the "
+                         "three-second tax window)")
     ap.add_argument("-o", "--out", default="-", help="where to write the rows")
     args = ap.parse_args()
 
@@ -261,11 +285,12 @@ def main():
     thrown = {}
     for f in files:
         try:
-            row = replay(f, args.size_x100, args.enter_at)
+            row = replay(f, args.size_x100, args.enter_block)
         except Bad as e:
             # Grouped by the shape of the reason, not the numbers in it, so a
             # hundred truncated files read as one line rather than a hundred.
-            key = str(e).split("(")[0].split(" at +")[0][:60]
+            key = str(e).split("(")[0].split(" at +")[0]
+            key = " ".join(w for w in key.split() if not w.lstrip("-").isdigit())[:60]
             thrown.setdefault(key, []).append(f.name)
             continue
         row["file"] = f.name
