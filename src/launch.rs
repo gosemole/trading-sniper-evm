@@ -608,12 +608,17 @@ fn launch_in_tx(
         }
     };
     seen.decoded += 1;
+    // The hash of exactly these bytes rather than the decoder's own. It is
+    // the key the log for this launch is matched on, and these bytes are the
+    // canonical encoding as the sequencer carried them - `raw_txs` strips only
+    // the feed's own kind byte - so this is the hash the chain will report,
+    // whatever the decoder makes of the envelope. The two agree today for
+    // every type tested; this does not depend on their continuing to.
+    tx.hash = ethers::types::H256::from(ethers::utils::keccak256(raw));
     Some(Incoming {
         seen: std::time::Instant::now(),
         seq,
         chain_time,
-        // Keccak of exactly these bytes, which is the hash the RPC will report
-        // for it - and so the key the log for it can be matched on.
         tx: tx.hash,
         to,
         from: tx.recover_from_mut().ok(),
@@ -2211,7 +2216,8 @@ mod tests {
         let signature = wallet.sign_transaction_sync(&req).unwrap();
         let raw = req.rlp_signed(&signature);
 
-        let found = launch_in_tx(&raw, 57_136_763, 1_788_814_627, &[pad]).expect("a launch");
+        let found = launch_in_tx(&raw, 57_136_763, 1_788_814_627, &[pad], &mut Funnel::default())
+            .expect("a launch");
         assert_eq!(found.seq, 57_136_763);
         assert_eq!(found.chain_time, 1_788_814_627);
         assert_eq!(found.to, pad);
@@ -2224,7 +2230,14 @@ mod tests {
         assert_eq!(found.tx, req.hash(&signature));
 
         // A launch sent somewhere we do not trust is not our launch.
-        assert!(launch_in_tx(&raw, 1, 0, &[PONS_V2_FACTORY.parse().unwrap()]).is_none());
+        assert!(launch_in_tx(
+            &raw,
+            1,
+            0,
+            &[PONS_V2_FACTORY.parse().unwrap()],
+            &mut Funnel::default()
+        )
+        .is_none());
         // And somebody else\'s transaction to the same contract is not a launch.
         let other: TypedTransaction = TransactionRequest::new()
             .to(pad)
@@ -2235,7 +2248,9 @@ mod tests {
             .chain_id(4663u64)
             .into();
         let s2 = wallet.sign_transaction_sync(&other).unwrap();
-        assert!(launch_in_tx(&other.rlp_signed(&s2), 1, 0, &[pad]).is_none());
+        assert!(
+            launch_in_tx(&other.rlp_signed(&s2), 1, 0, &[pad], &mut Funnel::default()).is_none()
+        );
     }
 
     /// The launchpad\'s own numbers, against the curve\'s own arithmetic.
@@ -2903,6 +2918,56 @@ mod tests {
         });
         assert!(!plain.contains("unknown entry point"), "{plain}");
         assert!(!plain.contains("terms read off the curve"), "{plain}");
+    }
+
+    /// The same, for a typed transaction.
+    ///
+    /// The test above builds a legacy one, and on those the decoder's own
+    /// `hash` is right - which is why the feed matched about one launch in
+    /// thirty and nothing said so. A typed transaction hashes over its type
+    /// byte and its body together; the decoder fills `hash` in from the body
+    /// alone, so a sighting was filed under a key no log would ever carry.
+    #[test]
+    fn a_typed_launch_is_filed_under_the_hash_the_chain_will_report() {
+        use ethers::signers::{LocalWallet, Signer};
+        use ethers::types::transaction::eip1559::Eip1559TransactionRequest;
+        use ethers::types::transaction::eip2718::TypedTransaction;
+
+        let wallet: LocalWallet =
+            "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+                .parse()
+                .unwrap();
+        let pad: Address = PONS_V2.parse().unwrap();
+        let (_, sig, _) = entry_points().into_iter().next().unwrap();
+        let data = calldata(
+            &sig,
+            &[
+                params_token("Foo Coin", "FOO", 250, false),
+                Token::Uint(0.into()),
+                Token::Address(Address::zero()),
+                Token::Uint(U256::exp10(17)),
+                Token::Uint(U256::zero()),
+                Token::Address(wallet.address()),
+                Token::Array(vec![]),
+            ],
+        );
+
+        let req: TypedTransaction = Eip1559TransactionRequest::new()
+            .to(pad)
+            .data(data)
+            .nonce(0)
+            .gas(3_000_000)
+            .max_fee_per_gas(1)
+            .max_priority_fee_per_gas(1)
+            .chain_id(4663u64)
+            .into();
+        let signature = wallet.sign_transaction_sync(&req).unwrap();
+        let raw = req.rlp_signed(&signature);
+
+        let found = launch_in_tx(&raw, 1, 1, &[pad], &mut Funnel::default())
+            .expect("a typed launch is still a launch");
+        assert_eq!(found.call.name, "Foo Coin");
+        assert_eq!(found.tx, req.hash(&signature), "filed under the wrong hash");
     }
 
 }

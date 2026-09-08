@@ -1114,6 +1114,10 @@ async fn watch_launches_cmd(
     // store is the one thing here that grows without an upper bound.
     const REMEMBER_BLOCKS: u64 = 5_927_040;
     let mut newest_block = 0u64;
+    // How the feed is actually doing, against the logs it is supposed to beat.
+    let mut heard_from_feed: u64 = 0;
+    let mut feed_was_late: u64 = 0;
+    let mut feed_told = std::time::Instant::now();
 
     // The requests a launch needs before anything can be decided about it,
     // made off the loop that decides. ONE task working a queue, not one task
@@ -1223,6 +1227,18 @@ async fn watch_launches_cmd(
                 // Written on a timer rather than on every change: a busy
                 // minute changes it hundreds of times, and the file is only
                 // ever read at startup.
+                if feed_told.elapsed() >= std::time::Duration::from_secs(60) {
+                    feed_told = std::time::Instant::now();
+                    if heard_from_feed > 0 {
+                        tracing::info!(
+                            heard = heard_from_feed,
+                            too_late = feed_was_late,
+                            "the feed against the logs"
+                        );
+                    }
+                    heard_from_feed = 0;
+                    feed_was_late = 0;
+                }
                 if ops_dirty && ops_saved.elapsed() >= std::time::Duration::from_secs(30) {
                     let gone = ops.forget_before(newest_block.saturating_sub(REMEMBER_BLOCKS));
                     if gone > 0 {
@@ -1351,7 +1367,14 @@ async fn watch_launches_cmd(
                 // The sequencer took a launch: everything the calldata says,
                 // before the block that will carry it exists.
                 Some(launch::Heard::Incoming(i)) => {
+                    heard_from_feed += 1;
                     if reported.contains(&i.tx) {
+                        // The feed found it, and found it too late to be worth
+                        // anything: the log for the same launch had already
+                        // arrived. Counted, because "the feed sees nothing" and
+                        // "the feed is behind the logs" need entirely different
+                        // fixes and look identical from the entries.
+                        feed_was_late += 1;
                         tracing::debug!(tx = ?i.tx, "the feed caught up with a launch already printed");
                         continue;
                     }
