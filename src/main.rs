@@ -1123,12 +1123,16 @@ async fn watch_launches_cmd(
     /// the sale is sent with - which until now rested on a number the chain had
     /// never confirmed. On a sale it is the realised result, the first figure
     /// in this program that is not a model of anything.
+    #[allow(clippy::too_many_arguments)]
     fn ours(
         f: &mut Followed,
         trade: &curve::Trade,
         wrapper: ethers::types::Address,
         block: u64,
         realized: &mut (ethers::types::U256, ethers::types::U256),
+        tally: &mut Tally,
+        ops: &mut operators::Operators,
+        ops_dirty: &mut bool,
     ) {
         match trade {
             curve::Trade::Buy {
@@ -1215,6 +1219,10 @@ async fn watch_launches_cmd(
                     symbol = %f.facts.quote_symbol,
                     "position closed on chain"
                 );
+                // The outcome, at last, and from the chain rather than from
+                // the model that ordered the sale. The rule fired on a price
+                // two or three blocks ago; this is the price it got.
+                close_shadow(f, *quote_out, "sold", block, tally, ops, ops_dirty);
             }
             _ => {}
         }
@@ -1238,7 +1246,10 @@ async fn watch_launches_cmd(
         ops: &mut operators::Operators,
         ops_dirty: &mut bool,
     ) {
-        if f.lost {
+        // Decided once. With a real position the shadow stays open until the
+        // sale lands, so without this the rules would fire again on every
+        // block and journal an exit that already happened.
+        if f.lost || f.leaving {
             return;
         }
         let Some(h) = f.shadow.as_mut() else { return };
@@ -1255,8 +1266,19 @@ async fn watch_launches_cmd(
                 exit::render(h, &decision, f.quote_decimals, &f.facts.quote_symbol)
             );
         }
-        close_shadow(f, *worth, why, block, tally, ops, ops_dirty);
         f.leaving = true;
+        // With money in it, the outcome is not this number. This is what the
+        // model thought the position was worth when the rule fired; what the
+        // position RETURNS is what the curve pays when the sale lands, two or
+        // three blocks later, and on a launch being dumped into those blocks
+        // are most of the move. Recorded when `ours` sees our own sale.
+        //
+        // Closing here reported 0.9x on five consecutive positions that
+        // returned 0.36x, which is not a small error in a statistic - it is
+        // the console describing a different run from the one happening.
+        if !f.holding() {
+            close_shadow(f, *worth, why, block, tally, ops, ops_dirty);
+        }
     }
 
     /// One position closed: recorded, counted, and filed under its operator.
@@ -1422,6 +1444,7 @@ async fn watch_launches_cmd(
     fn sweep(
         followed: &mut std::collections::HashMap<ethers::types::Address, Followed>,
         watched: &std::sync::RwLock<std::collections::HashSet<ethers::types::Address>>,
+        tally: &mut Tally,
         ops: &mut operators::Operators,
         ops_dirty: &mut bool,
         now: std::time::Instant,
@@ -1430,7 +1453,7 @@ async fn watch_launches_cmd(
             if f.until > now || f.holding() {
                 return true;
             }
-            finish(f);
+            finish(f, tally, ops, ops_dirty);
             // Nobody outside the bundle ever bought this one. Only worth
             // saying when the exemption list is known - an empty one makes
             // every buyer look like an outsider and none of them like one.
@@ -1449,11 +1472,27 @@ async fn watch_launches_cmd(
     /// the console. Everything else the console used to say about a launch is
     /// already a record - the entry is `launch`, a step is `decision`, a close
     /// is `exit` - and this was the one line that was not.
-    fn finish(f: &mut Followed) {
+    fn finish(
+        f: &mut Followed,
+        tally: &mut Tally,
+        ops: &mut operators::Operators,
+        ops_dirty: &mut bool,
+    ) {
         if f.finished {
             return;
         }
         f.finished = true;
+        // A position whose sale never landed still had an outcome, and it is
+        // whatever the curve was last worth. Left open it would simply vanish
+        // from the counts - and the ones that vanish are the ones that went
+        // wrong, which is the worst possible bias to have.
+        if f.shadow.is_some() {
+            let worth = f
+                .shadow
+                .map(|h| exit::worth(&f.curve, h.tokens))
+                .unwrap_or_default();
+            close_shadow(f, worth, "never sold", f.last_block, tally, ops, ops_dirty);
+        }
         let opened = f.opening.map(|o| o.quote_reserve).unwrap_or_default();
         let position = match &f.position {
             snipe::Position::Watching => "never bought".to_string(),
@@ -1920,7 +1959,7 @@ async fn watch_launches_cmd(
                 // goes. `hold_blocks` above is what ends it; if the chain
                 // refuses the sale twelve times over, `send_exit` says so and
                 // the tokens want a person.
-                sweep(&mut followed, &watched_curves, &mut ops, &mut ops_dirty, now);
+                sweep(&mut followed, &watched_curves, &mut tally, &mut ops, &mut ops_dirty, now);
                 // Written on a timer rather than on every change: a busy
                 // minute changes it hundreds of times, and the file is only
                 // ever read at startup.
@@ -2267,6 +2306,7 @@ async fn watch_launches_cmd(
                         sweep(
                             &mut followed,
                             &watched_curves,
+                            &mut tally,
                             &mut ops,
                             &mut ops_dirty,
                             std::time::Instant::now(),
@@ -2359,7 +2399,7 @@ async fn watch_launches_cmd(
                         // on: this was the one exit that left an address in it
                         // with nothing on the other side, so the filter only
                         // ever grew.
-                        finish(f);
+                        finish(f, &mut tally, &mut ops, &mut ops_dirty);
                         followed.remove(&at);
                         if let Ok(mut w) = watched_curves.write() {
                             w.remove(&at);
@@ -2385,7 +2425,10 @@ async fn watch_launches_cmd(
                     // request, on a path that has none to spare. This is the
                     // only place the real fill is ever learnt.
                     if let Some(mine) = trader.as_ref().map(|t| t.wrapper) {
-                        ours(f, &trade, mine, block, &mut realized);
+                        ours(
+                            f, &trade, mine, block, &mut realized, &mut tally, &mut ops,
+                            &mut ops_dirty,
+                        );
                     }
                     f.peak_quote = f.peak_quote.max(f.curve.quote_reserve);
                     f.last_block = block;
@@ -2478,7 +2521,7 @@ async fn watch_launches_cmd(
                                 f, worth, "graduated", block, &mut tally, &mut ops,
                                 &mut ops_dirty,
                             );
-                            finish(f);
+                            finish(f, &mut tally, &mut ops, &mut ops_dirty);
                             // And a position of ours cannot leave through a
                             // curve that has closed - `sell` on it reverts,
                             // and no retry changes that. The record is kept so
@@ -2837,6 +2880,7 @@ async fn watch_launches_cmd(
                                     sweep(
                                         &mut followed,
                                         &watched_curves,
+                                        &mut tally,
                                         &mut ops,
                                         &mut ops_dirty,
                                         std::time::Instant::now(),
