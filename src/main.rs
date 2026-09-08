@@ -1253,20 +1253,13 @@ async fn watch_launches_cmd(
     const REMEMBER_BLOCKS: u64 = 5_927_040;
     let mut newest_block = 0u64;
 
-    // Nothing sends unless all three are true: asked for, configured, and the
-    // contract agrees this wallet owns it.
+    // The wrapper is checked whenever one is configured, whether or not this
+    // run may spend anything. A dry run that does not verify the contract is a
+    // dry run that proves nothing about the live one, and both answers cost
+    // two calls at startup rather than one reverted trade at a time.
     let mut trader: Option<Trader> = None;
-    if sending {
-        let Some(addr) = cfg.snipe.contract.as_ref() else {
-            anyhow::bail!("--execute needs [snipe] contract, the wrapper to trade through");
-        };
+    if let Some(addr) = cfg.snipe.contract.as_ref() {
         let wrapper: ethers::types::Address = addr.parse().context("[snipe] contract")?;
-        let chain = http.get_chainid().await.context("chain id")?.as_u64();
-        let wallet = swap::load_wallet(cfg, chain)?;
-        let me = ethers::signers::Signer::address(&wallet);
-        // Asked of the contract rather than assumed. Every call below is
-        // `onlyOwner`, so getting this wrong is a run where every single
-        // transaction reverts, discovered one launch at a time.
         let owner = pool::call_address(
             http,
             wrapper,
@@ -1274,15 +1267,9 @@ async fn watch_launches_cmd(
         )
         .await
         .context("reading the wrapper\'s owner")?;
-        anyhow::ensure!(
-            owner == me,
-            "the wrapper at {wrapper:?} is owned by {owner:?}, not by this wallet ({me:?})"
-        );
-        // And that it is the wrapper at all. An address that answers `owner()`
-        // with ours could be anything we deployed; this one has to be pointed
-        // at the launchpad these launches come from, or every buy through it
-        // is refused by its own factory check - one launch at a time, in the
-        // second it was aimed at.
+        // That it is the wrapper at all. An address that answers `owner()`
+        // could be anything we ever deployed; only one pointed at this
+        // launchpad will let a buy through its own factory check.
         let its_factory = pool::call_address(
             http,
             wrapper,
@@ -1295,55 +1282,68 @@ async fn watch_launches_cmd(
             its_factory == ours,
             "the wrapper at {wrapper:?} trades against factory {its_factory:?}, not {ours:?}"
         );
-        let balance = http.get_balance(me, None).await.context("wallet balance")?;
-        let urls = if cfg.submit_urls.is_empty() {
-            vec![cfg.http_url.clone()]
-        } else {
-            cfg.submit_urls.clone()
-        };
-        let fees = std::sync::Arc::new(std::sync::RwLock::new(swap::fee_params(http).await?));
-        {
-            // Refreshed on a timer, never on the path of a trade: reading the
-            // base fee costs a round trip and the loop has none to spend.
-            let fees = fees.clone();
-            let http = http.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                    if let Ok(f) = swap::fee_params(&http).await {
-                        if let Ok(mut w) = fees.write() {
-                            *w = f;
+        tracing::info!(?wrapper, ?owner, "wrapper checked");
+
+        if sending {
+            let chain = http.get_chainid().await.context("chain id")?.as_u64();
+            let wallet = swap::load_wallet(cfg, chain)?;
+            let me = ethers::signers::Signer::address(&wallet);
+            anyhow::ensure!(
+                owner == me,
+                "the wrapper at {wrapper:?} is owned by {owner:?}, not by this wallet ({me:?})"
+            );
+            let balance = http.get_balance(me, None).await.context("wallet balance")?;
+            let urls = if cfg.submit_urls.is_empty() {
+                vec![cfg.http_url.clone()]
+            } else {
+                cfg.submit_urls.clone()
+            };
+            let fees = std::sync::Arc::new(std::sync::RwLock::new(swap::fee_params(http).await?));
+            {
+                // Refreshed on a timer, never on the path of a trade: reading
+                // the base fee costs a round trip and the loop has none.
+                let fees = fees.clone();
+                let http = http.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                        if let Ok(f) = swap::fee_params(&http).await {
+                            if let Ok(mut w) = fees.write() {
+                                *w = f;
+                            }
                         }
                     }
-                }
+                });
+            }
+            let max_spend = match cfg.snipe.max_spend.trim() {
+                "" => None,
+                v => Some(route::parse_units(v, 18).context("[snipe] max_spend")?),
+            };
+            tracing::warn!(
+                wallet = ?me,
+                balance = %route::format_units(balance, 18),
+                max_open = cfg.snipe.max_open,
+                max_spend = %cfg.snipe.max_spend,
+                gas_limit = cfg.snipe.gas_limit,
+                "EXECUTING: this run sends transactions and spends real money"
+            );
+            trader = Some(Trader {
+                nonce: swap::pending_nonce(http, me).await?,
+                wallet,
+                to: std::sync::Arc::new(swap::Broadcaster::new(&urls)?),
+                wrapper,
+                fees,
+                gas: ethers::types::U256::from(cfg.snipe.gas_limit),
+                open: 0,
+                max_open: cfg.snipe.max_open,
+                spent: ethers::types::U256::zero(),
+                max_spend,
             });
         }
-        let max_spend = match cfg.snipe.max_spend.trim() {
-            "" => None,
-            v => Some(route::parse_units(v, 18).context("[snipe] max_spend")?),
-        };
-        tracing::warn!(
-            wallet = ?me,
-            wrapper = ?wrapper,
-            balance = %route::format_units(balance, 18),
-            max_open = cfg.snipe.max_open,
-            max_spend = %cfg.snipe.max_spend,
-            gas_limit = cfg.snipe.gas_limit,
-            "EXECUTING: this run sends transactions and spends real money"
-        );
-        trader = Some(Trader {
-            nonce: swap::pending_nonce(http, me).await?,
-            wallet,
-            to: std::sync::Arc::new(swap::Broadcaster::new(&urls)?),
-            wrapper,
-            fees,
-            gas: ethers::types::U256::from(cfg.snipe.gas_limit),
-            open: 0,
-            max_open: cfg.snipe.max_open,
-            spent: ethers::types::U256::zero(),
-            max_spend,
-        });
+    } else if sending {
+        anyhow::bail!("--execute needs [snipe] contract, the wrapper to trade through");
     }
+
     // How the feed is actually doing, against the logs it is supposed to beat.
     // What is happening, in numbers, because the entries themselves are all in
     // the journals and reading them go past says nothing about the whole. Set
