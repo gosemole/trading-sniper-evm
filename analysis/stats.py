@@ -304,6 +304,32 @@ def main():
             o = [trail(pct, take=take, lag=1)(r) - 1 for r in live]
             print(f"    {name:<30}{sum(o):>+9.1f}{sum(o)/len(o):>+9.3f}"
                   f"{st.median(o):>+10.3f}{100*sum(1 for x in o if x>0)/len(o):>5.0f}%")
+        # The two questions a portfolio of 69 launches cannot answer by
+        # standing there being positive: how much of it is luck, and how much
+        # of it is a handful of launches.
+        #
+        # The interval resamples the launches themselves rather than the
+        # deployers, because this group is small enough that most deployers in
+        # it appear once - and a portfolio is a sum, so it is the sum that has
+        # to be resampled. Read the low end: that is the run this could have
+        # been.
+        o = [trail(5, take=2.0, lag=1)(r) - 1 for r in live]
+        rng = random.Random(7)
+        draws = sorted(sum(rng.choices(o, k=len(o))) for _ in range(4000))
+        lo, hi = draws[200], draws[3800]
+        above = 100 * sum(1 for x in draws if x > 0) / len(draws)
+        print(f"\n    портфель {sum(o):+.1f} ставок, 90% между {lo:+.1f} и {hi:+.1f}, "
+              f"выше нуля в {above:.0f}% пересборок")
+        # Positive skew is the shape of this whole strategy, so the question is
+        # not whether the best launches carry it - they do - but whether
+        # anything is left when they do not arrive.
+        drop = sorted(o, reverse=True)
+        for k in (5, 10, 20):
+            if k < len(drop):
+                rest = drop[k:]
+                print(f"    без {k:>2} лучших: {sum(rest):+.1f} ставок "
+                      f"на {len(rest)} запусках ({sum(rest)/len(rest):+.3f} на зап)")
+
         # And in money, because a stake is a share of each curve and they
         # differ - the sum of multiples is not what a wallet would show.
         staked = sum(float(r.get("stake", 0)) for r in live)
