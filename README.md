@@ -20,7 +20,18 @@ Secrets come from the environment, never from a file in the repo:
 export WS_URL="wss://..."
 export HTTP_URL="https://..."
 export PRIVATE_KEY="0x..."   # only for --execute
+export SUBMIT_URLS="https://a,https://b"   # optional, see below
 ```
+
+Submission is the only round trip a buy waits on and the one that decides
+whether the trade exists at all. `SUBMIT_URLS` is a comma-separated list, and
+every endpoint on it is handed the identical signed transaction at once - the
+first to take it wins and the rest keep going, because being in more than one
+mempool is the point. Unset, everything goes through `HTTP_URL` alone, which
+is a single node's queue and a single node's uptime; the journals already show
+that node refusing reads with "fullnode unavailable" several times an hour.
+
+Reads and receipts always go to `HTTP_URL`.
 
 ## Running
 

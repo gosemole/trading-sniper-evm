@@ -9,8 +9,13 @@
 # almost nothing, which is the correct behaviour and is also why it may sit
 # idle for an hour at a time.
 #
-#   WS_URL=... HTTP_URL=... PRIVATE_KEY=... \
+#   WS_URL=... HTTP_URL=... PRIVATE_KEY=... SUBMIT_URLS=... \
 #     ./target/release/trading-sniper --watch-launches --config live.toml --execute
+#
+# SUBMIT_URLS is optional and comma-separated: every endpoint on it gets the
+# identical signed transaction at once, and the first to take it wins. Unset,
+# a buy waits on one node's queue - and that node has been answering reads with
+# "fullnode unavailable" several times an hour.
 #
 # Without --execute nothing is sent: the same watching, the same journals, the
 # same shadow, and no wallet is even loaded. That is the dry run - there is no
