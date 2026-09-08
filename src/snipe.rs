@@ -344,7 +344,7 @@ pub fn render(s: &Signal, d: &Decision, curve: Address, _took: std::time::Durati
             why,
         } => format!(
             "{head}  BUY {} {} min {}  [{why}]",
-            crate::route::format_units(*spend, s.facts.quote_decimals),
+            crate::launch::amount_of(*spend, s.facts.quote_decimals),
             s.facts.quote_symbol,
             crate::launch::tokens_of(*min_tokens_out),
         ),

@@ -207,6 +207,20 @@ pub fn snipe_tax_line(tax: &SnipeTax) -> String {
 
 /// Anything the launchpad said. Launches, and the settings a launch is judged
 /// against.
+/// One trade on one curve, and where in the chain it sat.
+#[derive(Debug, Clone)]
+pub struct TradeAt {
+    pub curve: Address,
+    pub block: u64,
+    /// Where in the block this log sat. With `block` it names the trade
+    /// uniquely, which is what lets the same one arrive twice - once from the
+    /// subscription and once from the backfill - without being applied twice.
+    pub index: u64,
+    pub trade: crate::curve::Trade,
+}
+
+/// Boxed for the same reason as the rest of this enum: a trade is a couple of
+/// hundred bytes and a settings change is eight, and they share a channel.
 #[derive(Debug, Clone)]
 pub enum Heard {
     /// From the sequencer feed: a launch that has been accepted but not yet
@@ -214,11 +228,7 @@ pub enum Heard {
     Incoming(Box<Incoming>),
     /// Something happened on a curve. Every curve on the chain reports these,
     /// and the ones we are not following are dropped where they arrive.
-    Trade {
-        curve: Address,
-        block: u64,
-        trade: crate::curve::Trade,
-    },
+    Trade(Box<TradeAt>),
     /// Boxed: a launch is two hundred bytes and a settings change is eight, and
     /// every one of these goes down a channel sized for the settings.
     Launch(Box<Launch>),
@@ -656,7 +666,10 @@ pub async fn watch_feed(
                     );
                     if phase.len() >= PHASE_SAMPLES {
                         let (at, late) = middle_of(&phase);
-                        info!(
+                        // Every twenty boundaries, which on this chain is
+                        // every twenty seconds. Worth a spot check and not
+                        // worth a line each time.
+                        debug!(
                             at_ms = at,
                             seen_up_to_ms_late = late,
                             samples = phase.len(),
@@ -761,6 +774,7 @@ pub async fn watch_curves(
         std::time::Instant,
         Address,
         u64,
+        u64,
         crate::curve::Trade,
     )> = std::collections::VecDeque::new();
 
@@ -778,6 +792,9 @@ pub async fn watch_curves(
         let Some(block) = log.block_number.map(|b| b.as_u64()) else {
             continue;
         };
+        let Some(index) = log.log_index.map(|i| i.as_u64()) else {
+            continue;
+        };
 
         // Whatever is held for a curve that has since been identified, in the
         // order it happened - checked on EVERY log rather than only when
@@ -793,28 +810,29 @@ pub async fn watch_curves(
                 Ok(f) => held
                     .iter()
                     .enumerate()
-                    .filter(|(_, (_, c, _, _))| f.contains(c))
+                    .filter(|(_, (_, c, _, _, _))| f.contains(c))
                     .map(|(i, _)| i)
                     .collect(),
                 Err(_) => Vec::new(),
             };
             for i in known.into_iter().rev() {
-                let Some((_, c, b, t)) = held.remove(i) else {
+                let Some((_, c, b, ix, t)) = held.remove(i) else {
                     continue;
                 };
                 if out
-                    .send(Heard::Trade {
+                    .send(Heard::Trade(Box::new(TradeAt {
                         curve: c,
                         block: b,
+                        index: ix,
                         trade: t,
-                    })
+                    })))
                     .await
                     .is_err()
                 {
                     return Ok(());
                 }
             }
-            held.retain(|(at, _, _, _)| at.elapsed() < HOLD_FOR);
+            held.retain(|(at, _, _, _, _)| at.elapsed() < HOLD_FOR);
         }
 
         // A curve nobody asked for is dropped here rather than in the loop
@@ -825,16 +843,17 @@ pub async fn watch_curves(
             if held.len() >= HOLD_AT_MOST {
                 held.pop_front();
             }
-            held.push_back((std::time::Instant::now(), log.address, block, trade));
+            held.push_back((std::time::Instant::now(), log.address, block, index, trade));
             continue;
         }
 
         if out
-            .send(Heard::Trade {
+            .send(Heard::Trade(Box::new(TradeAt {
                 curve: log.address,
                 block,
+                index,
                 trade,
-            })
+            })))
             .await
             .is_err()
         {
@@ -845,6 +864,86 @@ pub async fn watch_curves(
     Ok(())
 }
 
+
+/// The trades a curve made before anything was listening to it.
+///
+/// A curve's address does not exist until its launch, so it cannot be in a log
+/// filter until the launch log arrives - and by then the launch block, and
+/// often the one after it, have already been dispatched to whoever was
+/// subscribed at the time. Nothing can deliver them late. On an ordinary
+/// launch that costs nothing, because the first trade after it is seconds
+/// away. On a bundled one it costs everything: the bundle buys in the launch
+/// transaction and the block after, and 61 of 3540 journals from one night
+/// show the chain pricing a fill off a reserve between 8% and 200% above the
+/// one the bot was carrying - every one of them a bundle, and bundles are the
+/// only group that has ever measured profitable.
+///
+/// So they are asked for once, by number. Sent down the same channel as the
+/// live ones and told apart by `(block, index)`, because the subscription may
+/// well have caught some of them and applying a trade twice is worse than
+/// missing it.
+///
+/// Runs in its own task: this is an RPC round trip, and the loop it reports to
+/// is deciding things on a hundred-millisecond budget.
+pub async fn backfill(
+    http: &ethers::providers::Provider<ethers::providers::Http>,
+    curve: Address,
+    from: u64,
+    to: u64,
+    out: mpsc::Sender<Heard>,
+) {
+    use ethers::providers::Middleware;
+    let filter = ethers::types::Filter::new()
+        .address(curve)
+        .topic0(crate::curve::trade_topics())
+        .from_block(from)
+        .to_block(to);
+    let logs = match crate::rpc::retrying("eth_getLogs", || async {
+        http.get_logs(&filter).await.map_err(anyhow::Error::from)
+    })
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            // Not fatal, and not silent: what is lost is the opening state of
+            // exactly the launches worth having.
+            warn!(
+                curve = ?curve, from, to, err = %format!("{e:#}"),
+                "cannot read what this curve did before we were listening"
+            );
+            return;
+        }
+    };
+    let mut sent = 0usize;
+    for log in logs {
+        if log.removed.unwrap_or(false) {
+            continue;
+        }
+        let (Some(block), Some(index)) = (
+            log.block_number.map(|b| b.as_u64()),
+            log.log_index.map(|i| i.as_u64()),
+        ) else {
+            continue;
+        };
+        let Ok(trade) = crate::curve::decode_trade(&log) else {
+            continue;
+        };
+        if out
+            .send(Heard::Trade(Box::new(TradeAt {
+                curve,
+                block,
+                index,
+                trade,
+            })))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        sent += 1;
+    }
+    debug!(curve = ?curve, from, to, sent, "backfilled a curve's opening trades");
+}
 
 fn base64_decode(s: &str) -> Result<Vec<u8>> {
     use base64::Engine;
@@ -1158,6 +1257,12 @@ fn tokens(v: U256) -> String {
         n if n >= 1e3 => format!("{:.1}K", x / 1e3),
         _ => amount(v, 18),
     }
+}
+
+/// An amount in its own units, cut to six decimals. Public so the loop that
+/// decides things can print one without eighteen digits of tail.
+pub fn amount_of(v: U256, decimals: u8) -> String {
+    amount(v, decimals)
 }
 
 /// An address, shortened. Public so the loop that decides things can name a

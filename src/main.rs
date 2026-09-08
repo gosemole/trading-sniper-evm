@@ -537,6 +537,22 @@ async fn launch_call(
             // this does not know - a wrapper, a router, a new entry point - and
             // the selector below is what says which. Silence here is the tool
             // quietly reporting less than it saw.
+            //
+            // Once per selector, though. The unknown entry point is the news;
+            // the hundredth launch through it is not, and on a busy chain that
+            // one line becomes most of the log.
+            static SAID: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashSet<[u8; 4]>>,
+            > = std::sync::OnceLock::new();
+            let selector: [u8; 4] = input.get(..4).unwrap_or_default().try_into().unwrap_or([0; 4]);
+            let first = SAID
+                .get_or_init(Default::default)
+                .lock()
+                .map(|mut s| s.insert(selector))
+                .unwrap_or(true);
+            if !first {
+                return None;
+            }
             tracing::warn!(
                 ?tx, ?to,
                 selector = %format!("0x{}", hex::encode(input.get(..4).unwrap_or_default())),
@@ -876,6 +892,14 @@ async fn watch_launches_cmd(
         /// The last block we saw a trade on this curve in, so a position can
         /// be aged in the chain's time rather than in ours.
         last_block: u64,
+        /// Which trades have been applied, by their place in the chain. The
+        /// backfill asks for logs the subscription may already have carried,
+        /// and applying a trade twice moves the reserves twice.
+        seen: std::collections::HashSet<(u64, u64)>,
+        /// Whether the model has already been caught disagreeing here. Once
+        /// the reserves have parted from the chain's they stay parted, so
+        /// every later fill disagrees too and saying so again says nothing.
+        model_off: bool,
         /// Whoever is behind this launch, for filing its outcome under.
         operator: operators::OpId,
         /// Distinct wallets that bought and were NOT exempt. A launch that
@@ -925,8 +949,12 @@ async fn watch_launches_cmd(
     // whichever wins, the reserves have to end up counting it. Missing it left
     // every later quote on that curve one buy stale, which is exactly the
     // MODEL OFF BY it produced.
-    let mut early: std::collections::VecDeque<(ethers::types::Address, u64, curve::Trade)> =
-        std::collections::VecDeque::new();
+    let mut early: std::collections::VecDeque<(
+        ethers::types::Address,
+        u64,
+        u64,
+        curve::Trade,
+    )> = std::collections::VecDeque::new();
 
     // Pair token -> what it is, so the amounts in a launch can be printed in the
     // units the chain meant. Bounded, because this process is meant to be left
@@ -1081,7 +1109,11 @@ async fn watch_launches_cmd(
                 followed.retain(|curve, f| {
                     let keep = f.until > now;
                     if !keep {
-                        println!("{}", done_line(*curve, f));
+                        // A curve nobody traded has nothing to report, and
+                        // half of them are that.
+                        if f.buys + f.sells > 0 {
+                            println!("{}", done_line(*curve, f));
+                        }
                         if f.exempt_known && f.outsiders.is_empty() {
                             ops.note_dead(f.operator);
                             ops_dirty = true;
@@ -1156,10 +1188,17 @@ async fn watch_launches_cmd(
                         let mut p = policy.clone();
                         p.spend = spend;
                         let decision = snipe::decide(&signal, &p);
-                        println!(
-                            "{}",
-                            snipe::render(&signal, &decision, *curve_addr, now.elapsed())
-                        );
+                        // Only the answers that are answers. `wait` at 618 bps
+                        // is the policy's own ceiling restated, identical on
+                        // every launch and on every step of every launch - two
+                        // lines of it per launch buried the ones that decide
+                        // something. The journal keeps them all.
+                        if !matches!(decision, snipe::Decision::Wait { .. }) {
+                            println!(
+                                "{}",
+                                snipe::render(&signal, &decision, *curve_addr, now.elapsed())
+                            );
+                        }
                         if let Err(e) = journal::append(
                             &f.journal,
                             &journal::decision_line(&signal, &decision),
@@ -1250,7 +1289,8 @@ async fn watch_launches_cmd(
                     seen_order.push_back(i.tx);
                     sightings.insert(i.tx, (i.seen, i.call, i.chain_time));
                 }
-                Some(launch::Heard::Trade { curve: at, block, trade }) => {
+                Some(launch::Heard::Trade(t)) => {
+                    let launch::TradeAt { curve: at, block, index, trade } = *t;
                     // A launch is followed for a minute and then let go. The
                     // sweep below only ran when the map filled up, so a quiet
                     // hour left curves being written to long after anything
@@ -1270,9 +1310,13 @@ async fn watch_launches_cmd(
                         if early.len() >= 256 {
                             early.pop_front();
                         }
-                        early.push_back((at, block, trade));
+                        early.push_back((at, block, index, trade));
                         continue;
                     };
+                    // Already applied, from whichever source got here first.
+                    if !f.seen.insert((block, index)) {
+                        continue;
+                    }
                     // Predicted BEFORE applying, which is the order a live
                     // quote would run in.
                     // The model against the chain, on a trade nobody
@@ -1281,11 +1325,14 @@ async fn watch_launches_cmd(
                     if let (Some(p), curve::Trade::Buy { tokens_out, .. }) =
                         (curve::predicted_tokens_out(&f.curve, &trade), &trade)
                     {
-                        if p != *tokens_out {
+                        if p != *tokens_out && !f.model_off {
+                            f.model_off = true;
                             tracing::warn!(
                                 curve = ?at,
+                                block,
                                 off_by = %launch::tokens_of(p.abs_diff(*tokens_out)),
-                                "the model and the chain disagree on a fill"
+                                "the model and the chain disagree on a fill; \
+                                 everything priced from this curve is now a guess"
                             );
                         }
                     }
@@ -1641,7 +1688,7 @@ async fn watch_launches_cmd(
                                     if let Ok(mut w) = watched_curves.write() {
                                         w.remove(&l.curve);
                                     }
-                                    early.retain(|(c, _, _)| *c != l.curve);
+                                    early.retain(|(c, _, _, _)| *c != l.curve);
                                 } else {
                                     let journal =
                                         journal::path_for(&journal_dir, l.block, l.curve);
@@ -1661,6 +1708,20 @@ async fn watch_launches_cmd(
                                             err = %format!("{e:#}"),
                                             "cannot write the launch journal"
                                         );
+                                    }
+                                    // The blocks the subscription could not
+                                    // have covered: the address only entered
+                                    // its filter a moment ago, and the launch
+                                    // block is already gone. Five is well past
+                                    // where a bundle finishes buying.
+                                    {
+                                        let http = http.clone();
+                                        let tx = tx.clone();
+                                        let curve = l.curve;
+                                        let from = l.block;
+                                        tokio::spawn(async move {
+                                            launch::backfill(&http, curve, from, from + 5, tx).await
+                                        });
                                     }
                                     let mut f = Followed {
                                         curve: opening,
@@ -1684,14 +1745,19 @@ async fn watch_launches_cmd(
                                         shadow: None,
                                         operator,
                                         outsiders: Default::default(),
+                                        seen: Default::default(),
+                                        model_off: false,
                                         peak_quote: opening.quote_reserve,
                                     };
                                     // Whatever already happened on it, in the
                                     // order it happened.
                                     while let Some(i) =
-                                        early.iter().position(|(c, _, _)| *c == l.curve)
+                                        early.iter().position(|(c, _, _, _)| *c == l.curve)
                                     {
-                                        let (_, _, t) = early.remove(i).expect("just found");
+                                        let (_, b, ix, t) = early.remove(i).expect("just found");
+                                        if !f.seen.insert((b, ix)) {
+                                            continue;
+                                        }
                                         if let Err(e) = f.curve.apply(&t) {
                                             tracing::warn!(
                                                 curve = ?l.curve, err = %format!("{e:#}"),
