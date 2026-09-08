@@ -34,12 +34,14 @@ contract = "0x75C1243Da9AF8Bd6b01193de40A8dc4Af75C6cb2"
 # The size everything below was measured at. On ETH pairs, 16.8 mETH a launch.
 #
 # It ran at a tenth of this first, deliberately, because a simulation knows
-# nothing about gas or reverts. That tenth answered its question and the answer
-# was that it cannot work: gas is a fixed number of units a round trip - 125k
-# in and 103k out, measured on chain - while the edge is a fraction of the
-# stake. At a tenth the edge is about 200 microETH a launch and the round trip
-# is 228k gas, so gas wins whatever it costs. The ratio only improves with
-# size, and it improves linearly.
+# nothing about gas or reverts. That tenth answered its question. Gas is a
+# fixed cost a round trip and the edge is a fraction of the stake, so the ratio
+# between them is set by the size alone - and both halves are now measured on
+# chain rather than guessed at: 125,508 gas in and 102,756 out at 0.232 gwei,
+# which is 53 microETH a round trip.
+#
+# At a tenth of this the stake is 1680 microETH and the edge about 207, so gas
+# takes 26% of it. Here the edge is about 2066 and gas takes 3%.
 #
 # A hundred rather than more because a hundred is what was measured, impact
 # included: the replay priced our own buy into the curve at exactly this share.

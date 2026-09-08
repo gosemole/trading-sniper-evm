@@ -599,11 +599,7 @@ struct Tally {
     all_failed: u64,
     x100: u64,
     wins: u64,
-    /// The same, for the launches the filters would actually have bought. Two
-    /// numbers rather than one, because the whole flow and the traded subset
-    /// are different questions and one process answers both.
-    kept_closed: u64,
-    kept_x100: u64,
+
     /// The same, never reset. Thirty seconds holds a handful of closes and a
     /// handful says nothing; the run as a whole is the number worth reading,
     /// and it is the one that cannot be recovered from a window that scrolled
@@ -624,17 +620,20 @@ impl Tally {
         self.all_failed += 1;
     }
 
-    /// One position closed at `x100` hundredths of what it cost. `kept` says
-    /// the entry filters would have bought this one.
-    fn close(&mut self, x100: u64, kept: bool) {
+    /// One position closed at `x100` hundredths of what it cost.
+    ///
+    /// There is no second figure here for "the ones the filters would have
+    /// bought", and there was: it could never differ. A position only exists
+    /// because `snipe::decide` said buy, and it says buy only when the same
+    /// filters that set `refused` have passed the launch - so the two counts
+    /// were the same count under two names, in a line meant to be read at a
+    /// glance. What the whole flow does is a question for `replay.py`, which
+    /// has every launch rather than only the traded ones.
+    fn close(&mut self, x100: u64) {
         self.closed += 1;
         self.x100 += x100;
         self.all_closed += 1;
         self.all_x100 += x100;
-        if kept {
-            self.kept_closed += 1;
-            self.kept_x100 += x100;
-        }
         if x100 > 100 {
             self.wins += 1;
             self.all_wins += 1;
@@ -648,8 +647,6 @@ impl Tally {
         self.failed = 0;
         self.x100 = 0;
         self.wins = 0;
-        self.kept_closed = 0;
-        self.kept_x100 = 0;
     }
 
     /// The average close of `n` of them, as a multiple, for a log line.
@@ -1282,7 +1279,7 @@ async fn watch_launches_cmd(
         if let Err(e) = journal::append(&f.journal, &journal::exit_line(&h, worth, why, block)) {
             tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
         }
-        tally.close(h.x100(worth), f.refused.is_none());
+        tally.close(h.x100(worth));
         ops.record(f.operator, h.x100(worth));
         *ops_dirty = true;
     }
@@ -1950,10 +1947,6 @@ async fn watch_launches_cmd(
                         win_pct = %match tally.closed {
                             0 => "-".to_string(),
                             n => (100 * tally.wins / n).to_string(),
-                        },
-                        kept = %match tally.kept_closed {
-                            0 => "-".to_string(),
-                            n => format!("{} on {n}", Tally::average(tally.kept_x100, n)),
                         },
                         feed_heard = heard_from_feed,
                         feed_late = feed_was_late,
@@ -3275,15 +3268,15 @@ mod tests {
     fn a_new_window_keeps_the_run_and_forgets_the_window() {
         let mut t = Tally::default();
         t.opened();
-        t.close(250, true);
-        t.close(50, false);
+        t.close(250);
+        t.close(50);
         t.refused();
-        assert_eq!((t.closed, t.wins, t.kept_closed), (2, 1, 1));
+        assert_eq!((t.closed, t.wins), (2, 1));
         // A refused buy is not an outcome and must never reach the average.
         assert_eq!((t.failed, t.all_failed, t.closed), (1, 1, 2));
         assert_eq!((t.all_closed, t.all_wins, t.all_x100), (2, 1, 300));
         t.window();
-        assert_eq!((t.open, t.closed, t.wins, t.kept_closed, t.x100), (0, 0, 0, 0, 0));
+        assert_eq!((t.open, t.closed, t.wins, t.x100), (0, 0, 0, 0));
         assert_eq!((t.failed, t.all_failed), (0, 1), "the run forgot a refused buy");
         assert_eq!((t.all_closed, t.all_wins, t.all_x100), (2, 1, 300));
     }
@@ -3293,9 +3286,9 @@ mod tests {
     #[test]
     fn breaking_even_is_not_counted_as_a_win() {
         let mut t = Tally::default();
-        t.close(100, true);
+        t.close(100);
         assert_eq!(t.wins, 0);
-        t.close(101, true);
+        t.close(101);
         assert_eq!(t.wins, 1);
     }
 
