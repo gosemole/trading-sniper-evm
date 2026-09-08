@@ -1012,6 +1012,11 @@ async fn watch_launches_cmd(
         model_off: bool,
         /// What was actually sent for this position, when something was.
         sent: ethers::types::U256,
+        /// Its closing line is already in the journal. A launch can now leave
+        /// by more than one door - its minute, graduation, or a position that
+        /// finally sold - and two of them writing `done` is a file that says
+        /// the launch ended twice.
+        finished: bool,
         /// The reserves stopped being the curve's and nothing may be priced
         /// from them. Set only for a launch that is still holding: anything
         /// else is dropped outright, which is what this used to do to both.
@@ -1220,14 +1225,33 @@ async fn watch_launches_cmd(
                 exit::render(h, &decision, f.quote_decimals, &f.facts.quote_symbol)
             );
         }
-        if let Err(e) = journal::append(&f.journal, &journal::exit_line(h, *worth, why, block)) {
+        close_shadow(f, *worth, why, block, tally, ops, ops_dirty);
+        f.leaving = true;
+    }
+
+    /// One position closed: recorded, counted, and filed under its operator.
+    ///
+    /// Shared because a position now stops being one for two reasons - a rule
+    /// fired, or the curve graduated out from under it - and a launch counted
+    /// in one place and not the other is a statistic that quietly excludes its
+    /// own best outcomes.
+    #[allow(clippy::too_many_arguments)]
+    fn close_shadow(
+        f: &mut Followed,
+        worth: ethers::types::U256,
+        why: &str,
+        block: u64,
+        tally: &mut Tally,
+        ops: &mut operators::Operators,
+        ops_dirty: &mut bool,
+    ) {
+        let Some(h) = f.shadow.take() else { return };
+        if let Err(e) = journal::append(&f.journal, &journal::exit_line(&h, worth, why, block)) {
             tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
         }
-        tally.close(h.x100(*worth), f.refused.is_none());
-        ops.record(f.operator, h.x100(*worth));
+        tally.close(h.x100(worth), f.refused.is_none());
+        ops.record(f.operator, h.x100(worth));
         *ops_dirty = true;
-        f.shadow = None;
-        f.leaving = true;
     }
 
     /// How many reverted sales are chased at once before the gap applies.
@@ -1354,11 +1378,52 @@ async fn watch_launches_cmd(
         ));
     }
 
+    /// Let go of every launch whose minute is up and whose money is back.
+    ///
+    /// One place, because there were three - the tick, a trade arriving on an
+    /// expired launch, and a bulk sweep when the map filled up - and they did
+    /// not agree. The bulk one dropped a launch still holding a position,
+    /// wrote no closing line, and left its address in the set the subscription
+    /// filters on, which nothing ever removed it from again.
+    ///
+    /// A launch still holding is kept whatever its age: the record is all that
+    /// knows the position exists, and the only address a receipt still in
+    /// flight can land on.
+    fn sweep(
+        followed: &mut std::collections::HashMap<ethers::types::Address, Followed>,
+        watched: &std::sync::RwLock<std::collections::HashSet<ethers::types::Address>>,
+        ops: &mut operators::Operators,
+        ops_dirty: &mut bool,
+        now: std::time::Instant,
+    ) {
+        followed.retain(|curve, f| {
+            if f.until > now || f.holding() {
+                return true;
+            }
+            finish(f);
+            // Nobody outside the bundle ever bought this one. Only worth
+            // saying when the exemption list is known - an empty one makes
+            // every buyer look like an outsider and none of them like one.
+            if f.exempt_known && f.outsiders.is_empty() {
+                ops.note_dead(f.operator);
+                *ops_dirty = true;
+            }
+            if let Ok(mut w) = watched.write() {
+                w.remove(curve);
+            }
+            false
+        });
+    }
+
     /// One followed launch, once its minute is up: into the file, not onto
     /// the console. Everything else the console used to say about a launch is
     /// already a record - the entry is `launch`, a step is `decision`, a close
     /// is `exit` - and this was the one line that was not.
-    fn finish(f: &Followed) {
+    fn finish(f: &mut Followed) {
+        if f.finished {
+            return;
+        }
+        f.finished = true;
         let opened = f.opening.map(|o| o.quote_reserve).unwrap_or_default();
         let position = match &f.position {
             snipe::Position::Watching => "never bought".to_string(),
@@ -1793,20 +1858,7 @@ async fn watch_launches_cmd(
                 // goes. `hold_blocks` above is what ends it; if the chain
                 // refuses the sale twelve times over, `send_exit` says so and
                 // the tokens want a person.
-                followed.retain(|curve, f| {
-                    let keep = f.until > now || f.holding();
-                    if !keep {
-                        finish(f);
-                        if f.exempt_known && f.outsiders.is_empty() {
-                            ops.note_dead(f.operator);
-                            ops_dirty = true;
-                        }
-                        if let Ok(mut w) = watched_curves.write() {
-                            w.remove(curve);
-                        }
-                    }
-                    keep
-                });
+                sweep(&mut followed, &watched_curves, &mut ops, &mut ops_dirty, now);
                 // Written on a timer rather than on every change: a busy
                 // minute changes it hundreds of times, and the file is only
                 // ever read at startup.
@@ -2126,13 +2178,22 @@ async fn watch_launches_cmd(
                     // sweep below only ran when the map filled up, so a quiet
                     // hour left curves being written to long after anything
                     // about them was still being decided.
-                    if followed.get(&at).is_some_and(|f| f.until <= std::time::Instant::now()) {
-                        if let Some(f) = followed.remove(&at) {
-                            finish(&f);
-                        }
-                        if let Ok(mut w) = watched_curves.write() {
-                            w.remove(&at);
-                        }
+                    //
+                    // Except one still holding, exactly as the sweep does: the
+                    // same rule through a different door, and a door that
+                    // opens on a TRADE - which is the one moment the position
+                    // might be about to sell itself.
+                    if followed
+                        .get(&at)
+                        .is_some_and(|f| f.until <= std::time::Instant::now() && !f.holding())
+                    {
+                        sweep(
+                            &mut followed,
+                            &watched_curves,
+                            &mut ops,
+                            &mut ops_dirty,
+                            std::time::Instant::now(),
+                        );
                         continue;
                     }
                     let Some(f) = followed.get_mut(&at) else {
@@ -2215,7 +2276,17 @@ async fn watch_launches_cmd(
                             curve = ?at, err = %format!("{e:#}"),
                             "lost track of a curve; no longer following it"
                         );
+                        // The file has to say why it stops, or a journal that
+                        // ends mid-launch is indistinguishable from a bot that
+                        // died. And out of the set the subscription filters
+                        // on: this was the one exit that left an address in it
+                        // with nothing on the other side, so the filter only
+                        // ever grew.
+                        finish(f);
                         followed.remove(&at);
+                        if let Ok(mut w) = watched_curves.write() {
+                            w.remove(&at);
+                        }
                         continue;
                     }
                     match &trade {
@@ -2314,11 +2385,46 @@ async fn watch_launches_cmd(
                     // decide about it. It gets the same closing line as a
                     // launch whose minute simply ran out.
                     if matches!(trade, curve::Trade::Completed) {
-                        if let Some(f) = followed.remove(&at) {
-                            finish(&f);
+                        if let Some(f) = followed.get_mut(&at) {
+                            // Valued at the last price the curve ever had.
+                            // Doing nothing dropped it uncounted, and the
+                            // launches that graduate are the ones that ran -
+                            // so the statistics lost precisely their best
+                            // outcomes. It is also what the measurement does:
+                            // `stats.py` walks the value path and takes its
+                            // last point when no rule fired.
+                            let worth = f
+                                .shadow
+                                .map(|h| exit::worth(&f.curve, h.tokens))
+                                .unwrap_or_default();
+                            close_shadow(
+                                f, worth, "graduated", block, &mut tally, &mut ops,
+                                &mut ops_dirty,
+                            );
+                            finish(f);
+                            // And a position of ours cannot leave through a
+                            // curve that has closed - `sell` on it reverts,
+                            // and no retry changes that. The record is kept so
+                            // the count still shows it and so a receipt still
+                            // in flight has somewhere to land; the tokens need
+                            // `rescue` and then the graduated pool.
+                            if f.holding() {
+                                f.lost = true;
+                                f.leaving = false;
+                                tracing::error!(
+                                    curve = ?at,
+                                    "the curve graduated holding a position of ours; it \
+                                     cannot be sold through the curve - rescue(token, owner) \
+                                     on the wrapper, then the graduated pool"
+                                );
+                            }
                         }
-                        if let Ok(mut w) = watched_curves.write() {
-                            w.remove(&at);
+                        let holding = followed.get(&at).is_some_and(|f| f.holding());
+                        if !holding {
+                            followed.remove(&at);
+                            if let Ok(mut w) = watched_curves.write() {
+                                w.remove(&at);
+                            }
                         }
                     }
                 }
@@ -2636,8 +2742,13 @@ async fn watch_launches_cmd(
                                 launch::threshold_of(&l).unwrap_or_default(),
                             ) {
                                 if followed.len() >= 64 {
-                                    let now = std::time::Instant::now();
-                                    followed.retain(|_, f| f.until > now);
+                                    sweep(
+                                        &mut followed,
+                                        &watched_curves,
+                                        &mut ops,
+                                        &mut ops_dirty,
+                                        std::time::Instant::now(),
+                                    );
                                 }
                                 let mut exempt: std::collections::HashSet<_> = call
                                     .as_ref()
@@ -2810,6 +2921,7 @@ async fn watch_launches_cmd(
                                         refused: refused.clone(),
                                         selling: false,
                                         leaving: false,
+                                        finished: false,
                                         lost: false,
                                         filled: None,
                                         expected_tokens: Default::default(),
