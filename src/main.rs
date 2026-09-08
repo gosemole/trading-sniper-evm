@@ -1663,16 +1663,23 @@ async fn watch_launches_cmd(
             };
             let fees = std::sync::Arc::new(std::sync::RwLock::new(swap::fee_params(http).await?));
             {
-                // Refreshed on a timer, never on the path of a trade: reading
-                // the base fee costs a round trip and the loop has none.
+                // The tip only, and on a timer. The base fee comes from the
+                // header subscription, one block old rather than up to twenty
+                // seconds - see `fees_now` - so asking for the latest block
+                // again here was a round trip for a number already in hand,
+                // and the heavier of the two this used to make. The pair below
+                // is what stands until the first header arrives.
                 let fees = fees.clone();
                 let http = http.clone();
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                        if let Ok(f) = swap::fee_params(&http).await {
+                        if let Ok(tip) = swap::tip_now(&http).await {
                             if let Ok(mut w) = fees.write() {
-                                *w = f;
+                                // The stale max_fee is kept as the fallback it
+                                // is: `fees_now` rebuilds it from the live base
+                                // whenever there is one.
+                                w.1 = tip;
                             }
                         }
                     }
@@ -1745,6 +1752,7 @@ async fn watch_launches_cmd(
     let resolving = tokio::spawn({
         let http = http.clone();
         let tx = tx.clone();
+        let seconds = block_seconds.clone();
         async move {
             while let Some(w) = wanted.recv().await {
                 let launch::Wanted {
@@ -1764,6 +1772,28 @@ async fn watch_launches_cmd(
                     Some(curve) => launch::read_curve_terms(&http, curve).await,
                     None => None,
                 };
+                if launched_at.is_none() {
+                    // The header carrying this block's timestamp is on its way
+                    // through a subscription of its own, racing the log that
+                    // brought the launch - so the answer is usually moments
+                    // away and asking for it is a request per launch, two
+                    // thousand an hour, against an endpoint the journals show
+                    // refusing reads several times an hour already.
+                    //
+                    // Waited for here rather than in the loop: this task is
+                    // where everything slow already lives, and half a second
+                    // is nothing against the three-second window it feeds.
+                    for _ in 0..10 {
+                        launched_at = seconds
+                            .read()
+                            .ok()
+                            .and_then(|s| s.get(&launch.block).copied());
+                        if launched_at.is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
                 if launched_at.is_none() {
                     launched_at = block_second(&http, launch.block).await;
                 }

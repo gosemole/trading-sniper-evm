@@ -79,6 +79,20 @@ pub struct PendingTx {
 /// The base fee can climb 12.5% per block, so paying twice the current one
 /// covers roughly six blocks of continuous growth. The tip is whatever the node
 /// suggests, with a small floor for chains that report zero.
+/// The tip alone, for a caller that already knows the base fee.
+///
+/// Which is everyone with a block-header subscription, and that is the only
+/// caller here: the base fee arrives in every header for nothing, so asking
+/// for the latest block again on a timer was a round trip for a number already
+/// in hand - and the heavier of the two requests below.
+pub async fn tip_now(http: &Provider<Http>) -> Result<U256> {
+    let tip = http
+        .request::<_, U256>("eth_maxPriorityFeePerGas", ())
+        .await
+        .unwrap_or_else(|_| U256::from(TIP_FLOOR));
+    Ok(tip.max(U256::from(TIP_FLOOR)))
+}
+
 pub async fn fee_params(http: &Provider<Http>) -> Result<(U256, U256)> {
     // Two independent questions, so one round trip rather than two.
     let (block, tip) = tokio::join!(
