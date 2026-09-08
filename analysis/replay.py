@@ -86,6 +86,13 @@ def sell(qr, tr, fee_bps, creator_bps, tokens_in):
     return out, qr - gross, tr + tokens_in
 
 
+def crate_units(v, decimals):
+    """An integer amount as a decimal string, exactly - the way the journal
+    writes one, so what the report adds up is in the pair token's own units."""
+    q = Decimal(v).scaleb(-decimals)
+    return format(q.normalize(), "f")
+
+
 class Bad(Exception):
     """This file cannot be trusted, and the reason a person can act on."""
 
@@ -245,6 +252,7 @@ def replay(path, size_x100, enter_block):
         "block": head.get("block"),
         "launched_at": head.get("launched_at"),
         "enter_block": enter_block,
+        "stake": crate_units(spend, qd),
         "wallets": who,
         "outsiders": len(outsiders),
         "via": head.get("via", ""),

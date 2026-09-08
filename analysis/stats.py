@@ -52,18 +52,27 @@ def hold(sec):
     return lambda r: value_at(r["path"], r["enter_block"] + sec * BLOCKS_PER_SECOND)
 
 
-def trail(pct, since=None):
-    """Sell when the position gives back `pct` from its high."""
+def trail(pct, take=None, lag=1):
+    """Sell on a give-back from the high, or at a multiple of cost.
+
+    `lag` is blocks between seeing a price and selling into it, and it is not
+    a detail: zero means selling into the very trade that broke the stop,
+    which is not a fast reaction but an impossible one - that trade IS the
+    price move, and seeing it means its block is already made. On the launches
+    the live filter keeps, zero reports +76.5 stakes and one reports +31.9.
+    Everything past the first block is nearly flat: two is +27.4, five +24.1.
+    """
     def rule(r):
-        p = [v for e, v in r["path"] if since is None or e is None or e >= since]
-        if not p:
-            return value_at(r["path"], since or 0)
-        hi = p[0]
-        for v in p:
-            hi = max(hi, v)
-            if v < hi * (1 - pct / 100):
+        p = r["path"]
+        hi = p[0][1]
+        armed = None
+        for b, v in p:
+            if armed is not None and b >= armed + lag:
                 return v
-        return p[-1]
+            hi = max(hi, v)
+            if armed is None and ((take and v >= take) or v < hi * (1 - pct / 100)):
+                armed = b
+        return p[-1][1]
     return rule
 
 
@@ -168,14 +177,24 @@ def noise_floor(rows, after_blocks, seed=7):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("rows", help="the jsonl replay.py wrote")
-    ap.add_argument("--exit", default="trail10",
-                    help="trail10 | trail20 | hold10 | hold20 | hold30")
+    ap.add_argument("--lag", type=int, default=1,
+                    help="blocks between seeing a price and selling into it "
+                         "(default 1; zero is not achievable, see trail())")
+    ap.add_argument("--exit", default="live",
+                    help="live | trail5 | trail10 | trail20 | hold10 | hold20 | hold30")
     args = ap.parse_args()
 
     global ROWS
     ROWS = [json.loads(l) for l in open(args.rows)]
-    rules = {"trail10": trail(10), "trail20": trail(20),
-             "hold10": hold(10), "hold20": hold(20), "hold30": hold(30)}
+    rules = {
+        "live": trail(5, take=2.0, lag=args.lag),
+        "trail5": trail(5, lag=args.lag),
+        "trail10": trail(10, lag=args.lag),
+        "trail20": trail(20, lag=args.lag),
+        "hold10": hold(10),
+        "hold20": hold(20),
+        "hold30": hold(30),
+    }
     rule = rules[args.exit]
 
     who = {r["deployer"] for r in ROWS}
@@ -239,6 +258,41 @@ def main():
          and r["creator_tax_bps"] == 0
          and 2 <= r["dev_pct"] <= 15
          and r["pair"] == "ETH")], rule)
+
+    # The live filter, against the delay it will actually run at and the
+    # widths it might run at. Two tables, because the answer to "is this worth
+    # doing" and the answer to "at what settings" are different questions and
+    # reading one for the other is how a number gets quoted that nobody
+    # measured.
+    live = [r for r in ROWS if r["exempt"] >= 6 and r["creator_tax_bps"] == 0
+            and 2 <= r["dev_pct"] <= 15 and r["pair"] == "ETH"]
+    if live:
+        print(f"\n  live.toml: {len(live)} запусков из {len(ROWS)}")
+        print(f"    {'задержка':<24}" + "".join(f"{'стоп '+str(p)+'%':>14}" for p in (3, 5, 10)))
+        for lag in (0, 1, 2, 3):
+            row = f"    +{lag} блок{'а' if lag in (2, 3) else 'ов' if lag != 1 else ''}".ljust(28)
+            for pct in (3, 5, 10):
+                o = [trail(pct, take=2.0, lag=lag)(r) - 1 for r in live]
+                row += f"{sum(o):>+9.1f} ({100*sum(1 for x in o if x>0)/len(o):>2.0f}%)"
+            print(row)
+        print(f"\n    {'выход при задержке 1':<30}{'итого':>9}{'на зап':>9}{'медиана':>10}{'win':>6}")
+        for name, pct, take in (("трейлинг 5%", 5, None), ("трейлинг 3%", 3, None),
+                                ("трейлинг 10%", 10, None),
+                                ("трейлинг 5% + тейк 1.5x", 5, 1.5),
+                                ("трейлинг 5% + тейк 2x", 5, 2.0),
+                                ("трейлинг 5% + тейк 3x", 5, 3.0)):
+            o = [trail(pct, take=take, lag=1)(r) - 1 for r in live]
+            print(f"    {name:<30}{sum(o):>+9.1f}{sum(o)/len(o):>+9.3f}"
+                  f"{st.median(o):>+10.3f}{100*sum(1 for x in o if x>0)/len(o):>5.0f}%")
+        # And in money, because a stake is a share of each curve and they
+        # differ - the sum of multiples is not what a wallet would show.
+        staked = sum(float(r.get("stake", 0)) for r in live)
+        if staked > 0:
+            got = sum(float(r["stake"]) * trail(5, take=2.0, lag=1)(r) for r in live)
+            print(f"\n    в ETH: поставлено {staked:.3f}, вернулось {got:.3f}, "
+                  f"итого {got - staked:+.3f} ETH ({100*(got-staked)/staked:+.1f}%)")
+        else:
+            print("\n    в ETH: пересоберите rows.jsonl - в этих строках нет ставки")
 
     a, b = halves(ROWS)
     print(f"\n  выборка пополам по деплойеру: {len(a)} / {len(b)} запусков")
