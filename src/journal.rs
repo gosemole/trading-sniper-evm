@@ -143,9 +143,7 @@ pub fn trade_line(
                 "kind": "buy",
                 "who": format!("{recipient:?}"),
                 "quote_in": q(quote_in),
-                "quote_in_wei": quote_in.to_string(),
                 "tokens_out": t(tokens_out),
-                "tokens_out_wei": tokens_out.to_string(),
                 "fee": q(fee),
                 "creator_tax": q(creator_tax),
                 "snipe_tax": q(&snipe),
@@ -165,9 +163,7 @@ pub fn trade_line(
                 "who": format!("{seller:?}"),
                 "to": format!("{recipient:?}"),
                 "tokens_in": t(tokens_in),
-                "tokens_in_wei": tokens_in.to_string(),
                 "quote_out": q(quote_out),
-                "quote_out_wei": quote_out.to_string(),
                 "fee": q(fee),
                 "creator_tax": q(creator_tax),
             })
@@ -194,7 +190,6 @@ pub fn trade_line(
         v["exempt"] = json!(e);
     }
     v["quote_reserve"] = json!(q(&after.quote_reserve));
-    v["quote_reserve_wei"] = json!(after.quote_reserve.to_string());
     v["token_reserve"] = json!(t(&after.token_reserve));
     v
 }
@@ -214,51 +209,6 @@ pub fn window_line(step: u64, tax_bps: u64, second: u64, from_block: u64) -> Val
         "second": second,
         "from_block": from_block,
     })
-}
-
-/// What a spend buys on the curve **as it stands now**, at the moment a step
-/// of the tax window opens.
-///
-/// The plan written at launch prices the curve nobody can buy: by the time a
-/// step opens, the wallets exempted from the tax have already traded, and on a
-/// bundled launch they have moved the price several times over. This is the
-/// same question asked against the reserves the curve actually has - which is
-/// the only version of it a buy can be sized on.
-///
-/// `at_launch` is kept beside it so the file records the gap rather than
-/// quietly replacing one number with the other.
-#[allow(clippy::too_many_arguments)]
-pub fn quote_line(
-    step: u64,
-    tax_bps: u64,
-    spend: U256,
-    tokens_now: U256,
-    min_tokens_out: U256,
-    at_launch: Option<U256>,
-    quote_decimals: u8,
-    c: &crate::curve::Curve,
-) -> Value {
-    let mut v = json!({
-        "kind": "quote",
-        "step": step,
-        "tax_bps": tax_bps,
-        "spend": crate::route::format_units(spend, quote_decimals),
-        "tokens_out": crate::route::format_units(tokens_now, 18),
-        "tokens_out_wei": tokens_now.to_string(),
-        "min_tokens_out": crate::route::format_units(min_tokens_out, 18),
-        "min_tokens_out_wei": min_tokens_out.to_string(),
-        "quote_reserve": crate::route::format_units(c.quote_reserve, quote_decimals),
-        "token_reserve": crate::route::format_units(c.token_reserve, 18),
-    });
-    if let Some(a) = at_launch {
-        v["tokens_out_at_launch"] = json!(crate::route::format_units(a, 18));
-        // How far the plan written at launch had already drifted by the time
-        // this step opened. On a bundled launch this has been a factor of four.
-        if !tokens_now.is_zero() {
-            v["optimism_x100"] = json!((a * U256::from(100u64) / tokens_now).to_string());
-        }
-    }
-    v
 }
 
 /// The decision taken about one step, and what it was taken on.
@@ -290,7 +240,6 @@ pub fn decision_line(s: &crate::snipe::Signal, d: &crate::snipe::Decision) -> Va
             v["decision"] = json!("buy");
             v["spend"] = json!(crate::route::format_units(*spend, s.facts.quote_decimals));
             v["min_tokens_out"] = json!(crate::route::format_units(*min_tokens_out, 18));
-            v["min_tokens_out_wei"] = json!(min_tokens_out.to_string());
             v["why"] = json!(why);
         }
         crate::snipe::Decision::Wait { why } => {
@@ -356,10 +305,12 @@ mod tests {
         );
         // Both halves, and both exact: the readable one is the same integer
         // with a point put in, not a rounding of it.
-        assert_eq!(l["tokens_out_wei"], "30760000000000000000000000");
+        // Written once, in the token's own units, and to the last digit.
+        // Twice - a decimal string beside its wei - was two numbers that
+        // could disagree, and the decimal one already loses nothing.
         assert_eq!(l["tokens_out"], "30760000");
-        assert_eq!(l["quote_in_wei"], "54965456296796696");
         assert_eq!(l["quote_in"], "0.054965456296796696");
+        assert!(l.get("quote_in_wei").is_none());
         assert_eq!(l["elapsed"], 1);
         assert_eq!(l["exempt"], false);
         assert_eq!(l["kind"], "buy");

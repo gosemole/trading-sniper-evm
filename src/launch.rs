@@ -823,98 +823,6 @@ pub async fn watch_curves(
     Ok(())
 }
 
-/// One trade on a curve being followed, under the launch it belongs to.
-///
-/// `paid` is the snipe tax this buy actually handed over, backed out of the
-/// log: the curve reports the base fee and the snipe tax in one field, and the
-/// base fee is a known rate on the spend. It is the schedule observed rather
-/// than assumed - and the only place the two can be compared.
-pub fn render_trade(
-    trade: &crate::curve::Trade,
-    // Seconds into the tax window, when the chain's own clock is known for
-    // this block. `None` prints `+?` rather than a guess: an estimate from
-    // block numbers is not merely imprecise here, it is wrong in one direction
-    // - nine blocks share the launch second, so a trade a second late still
-    // reads as `+0s`, beside a tax that only exists at `+1s`.
-    elapsed: Option<i64>,
-    fee_bps: u64,
-    quote: Option<&Quote>,
-    c: &crate::curve::Curve,
-    predicted: Option<U256>,
-) -> String {
-    let in_quote = |v: U256| match quote {
-        Some(q) => format!("{} {}", amount(v, q.decimals), q.symbol),
-        None => format!("{v} raw"),
-    };
-    let mut out = match elapsed {
-        Some(s) => format!("    {s:>+3}s "),
-        None => "     +?s ".to_string(),
-    };
-    match trade {
-        crate::curve::Trade::Buy {
-            quote_in,
-            tokens_out,
-            fee,
-            recipient,
-            ..
-        } => {
-            let base = *quote_in * U256::from(fee_bps) / U256::from(10_000u64);
-            let snipe = fee.saturating_sub(base);
-            // Rounded to nearest, not down. Both legs are floored on chain,
-            // so a tax of 19 bps on a small spend backs out a hair under 19 -
-            // and printing 18 would make the schedule look wrong when it is
-            // the arithmetic that is.
-            let bps = if quote_in.is_zero() {
-                U256::zero()
-            } else {
-                (snipe * U256::from(10_000u64) + *quote_in / 2) / *quote_in
-            };
-            out += &format!(
-                "buy  {} -> {}  snipe {} bps  {}",
-                in_quote(*quote_in),
-                tokens(*tokens_out),
-                bps,
-                short(recipient),
-            );
-            // The model against the chain, on a trade nobody arranged.
-            if let Some(p) = predicted {
-                if p != *tokens_out {
-                    out += &format!("  MODEL OFF BY {}", tokens(p.abs_diff(*tokens_out)));
-                }
-            }
-        }
-        crate::curve::Trade::Sell {
-            tokens_in,
-            quote_out,
-            seller,
-            ..
-        } => {
-            out += &format!(
-                "sell {} -> {}  {}",
-                tokens(*tokens_in),
-                in_quote(*quote_out),
-                short(seller)
-            );
-        }
-        crate::curve::Trade::Buyback {
-            quote_spent,
-            tokens_locked,
-        } => {
-            out += &format!(
-                "sweep buyback {} -> {} locked",
-                in_quote(*quote_spent),
-                tokens(*tokens_locked)
-            );
-        }
-        crate::curve::Trade::Completed => out += "graduated",
-    }
-    out += &format!(
-        "   reserves {} / {}",
-        in_quote(c.quote_reserve),
-        tokens(c.token_reserve)
-    );
-    out
-}
 
 fn base64_decode(s: &str) -> Result<Vec<u8>> {
     use base64::Engine;
@@ -1152,9 +1060,6 @@ pub struct Report<'a> {
     /// transaction. The whole of what a feed-driven signal would buy, measured
     /// rather than assumed.
     pub lead: Option<std::time::Duration>,
-    /// What a spend would buy at each second of the tax window, when there is
-    /// a size to plan for and enough is known to price it.
-    pub plan: Option<&'a crate::curve::Plan>,
     /// Why this launch is not being followed, when it is not.
     pub refused: Option<&'a str>,
 }
@@ -1231,6 +1136,12 @@ fn tokens(v: U256) -> String {
         n if n >= 1e3 => format!("{:.1}K", x / 1e3),
         _ => amount(v, 18),
     }
+}
+
+/// An address, shortened. Public so the loop that decides things can name a
+/// curve without a formatter of its own.
+pub fn short_addr(a: &Address) -> String {
+    short(a)
 }
 
 /// A supply-sized number, short. Public so the loop that decides things can
@@ -1432,42 +1343,9 @@ pub fn render(r: &Report) -> String {
             out += &format!("\n  launcher   {}", short(launcher));
         }
     }
-    // The staircase, priced. The launch second is left out: nothing is going
-    // to buy in it, and a line for a price nobody will pay is a line in the
-    // way of the ones they will.
-    if let Some(p) = r.plan {
-        out += &format!(
-            "\n  plan       {} at {}% slippage",
-            in_quote(p.spend),
-            p.slippage_bps as f64 / 100.0
-        );
-        for step in p.steps.iter().filter(|s| s.elapsed > 0) {
-            out += &format!(
-                "\n    +{}s {}  {:>4} bps -> {} min {}{}",
-                step.elapsed,
-                step.from,
-                step.tax_bps,
-                tokens(step.tokens_out),
-                tokens(step.min_tokens_out),
-                // Whether that minimum also refuses the step before it, which
-                // is what makes it protection against landing a second early
-                // rather than only against a moving price.
-                if step.guards_the_step {
-                    "  guards the step"
-                } else {
-                    ""
-                },
-            );
-        }
-    }
-    // Why it is not being followed, if it is not - and then nothing about
-    // when to buy it, because there is no buying it.
-    if let Some(why) = r.refused {
-        out += &format!("\n  passed     {why}");
-    }
     // The tax schedule in absolute seconds: what to aim at, rather than an
     // offset from a moment nobody wrote down.
-    if let (Some(t), Some(at), None, None) = (r.tax, r.launched_at, r.plan, r.refused) {
+    if let (Some(t), Some(at), None) = (r.tax, r.launched_at, r.refused) {
         let steps: Vec<String> = snipe_tax_schedule(&t)
             .into_iter()
             .skip(1)
@@ -2591,65 +2469,6 @@ mod tests {
             ..Default::default()
         });
         assert!(!out.contains("window"), "{out}");
-    }
-
-    /// The staircase, under the entry it belongs to: the launch second left
-    /// out, absolute seconds to aim at, and which minimums also refuse the
-    /// step before them.
-    #[test]
-    fn the_entry_carries_the_priced_staircase() {
-        let created = launch_of(&log(
-            PONS_V2_FACTORY,
-            token_launched_topic(),
-            "0000000000000000000000000000000000000000",
-            0,
-            4_200_000_000_000_000_000,
-        ));
-        let threshold = U256::from(42u64) * U256::exp10(17);
-        let opening = crate::curve::at_launch(
-            U256::exp10(9) * U256::exp10(18),
-            threshold * U256::from(2u64) / U256::from(5u64),
-            threshold,
-            100,
-            0,
-        )
-        .unwrap();
-        let tax = SnipeTax {
-            start_bps: 9900,
-            seconds: 3,
-        };
-        let plan = crate::curve::plan(
-            &opening,
-            U256::exp10(17), // 0.1
-            &tax,
-            1_788_817_246,
-            100,
-        )
-        .unwrap();
-
-        let eth = Quote {
-            decimals: 18,
-            symbol: "ETH".to_string(),
-        };
-        let out = render(&Report {
-            created: Some(&created),
-            quote: Some(&eth),
-            tax: Some(tax),
-            launched_at: Some(1_788_817_246),
-            plan: Some(&plan),
-            ..Default::default()
-        });
-
-        assert!(out.contains("plan       0.1 ETH at 1% slippage"), "{out}");
-        assert!(out.contains("+1s 1788817247"), "{out}");
-        assert!(out.contains("618 bps"), "{out}");
-        assert!(out.contains("+3s 1788817249"), "{out}");
-        // The launch second is not offered at all.
-        assert!(!out.contains("+0s"), "{out}");
-        // And the plan replaces the bare window line rather than repeating it.
-        assert!(!out.contains("window "), "{out}");
-        assert!(out.contains("guards the step"), "{out}");
-        println!("\n{out}\n");
     }
 
     /// A dev buy whose launch happened before this process was listening still

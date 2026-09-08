@@ -466,30 +466,6 @@ fn opening_curve(
     .ok()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn plan_for(
-    size: Option<&str>,
-    slippage_bps: u64,
-    quote: Option<&launch::Quote>,
-    economics: Option<&launch::PairEconomics>,
-    config: Option<&launch::LaunchConfig>,
-    call: Option<&launch::LaunchCall>,
-    tax: Option<launch::SnipeTax>,
-    launched_at: Option<u64>,
-    threshold: Option<ethers::types::U256>,
-) -> Option<curve::Plan> {
-    let (size, q, tax, at) = (size?, quote?, tax?, launched_at?);
-    let spend = route::parse_units(size, q.decimals).ok()?;
-    let opening = opening_curve(config, economics, call, threshold?)?;
-    match curve::plan(&opening, spend, &tax, at, slippage_bps) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::debug!(err = %format!("{e:#}"), "cannot plan this launch");
-            None
-        }
-    }
-}
-
 /// What the launch transaction asked for, or nothing.
 ///
 /// One request per launch, and never on anything's critical path: this is a
@@ -847,8 +823,39 @@ async fn watch_launches_cmd(
         /// it - no feed, or a launch heard only from its log - a trade's
         /// place in the tax window is not known and is not guessed at.
         launched_at: Option<u64>,
-        pair_token: ethers::types::Address,
         until: std::time::Instant,
+        /// What happened while it was followed, for the one line that stands
+        /// in for the trades themselves. The high water mark and not the last
+        /// reserve, because what a position was worth at its best is the half
+        /// of the minute an exit rule is judged against.
+        buys: u32,
+        sells: u32,
+        peak_quote: ethers::types::U256,
+    }
+
+    /// One followed launch, once its minute is up.
+    ///
+    /// The trades are in the file. What is worth a line here is where the
+    /// curve ended up and how far it got on the way, because that is the
+    /// question an entry made at +1s is answered by.
+    fn done_line(curve: ethers::types::Address, f: &Followed) -> String {
+        let opened = f.opening.map(|o| o.quote_reserve).unwrap_or_default();
+        let run = |v: ethers::types::U256| match route::u256_to_f64(opened) {
+            o if o > 0.0 => format!("x{:.2}", route::u256_to_f64(v) / o),
+            _ => "x?".to_string(),
+        };
+        format!(
+            "    done   {}  {} buys {} sells  peak {}  last {}  {}",
+            launch::short_addr(&curve),
+            f.buys,
+            f.sells,
+            run(f.peak_quote),
+            run(f.curve.quote_reserve),
+            match &f.position {
+                snipe::Position::Skipped { why } => format!("skipped: {why}"),
+                p => format!("{p:?}"),
+            },
+        )
     }
     let mut followed: std::collections::HashMap<ethers::types::Address, Followed> =
         std::collections::HashMap::new();
@@ -976,6 +983,7 @@ async fn watch_launches_cmd(
                 followed.retain(|curve, f| {
                     let keep = f.until > now;
                     if !keep {
+                        println!("{}", done_line(*curve, f));
                         if let Ok(mut w) = watched_curves.write() {
                             w.remove(curve);
                         }
@@ -1060,7 +1068,7 @@ async fn watch_launches_cmd(
                         tracing::debug!(tx = ?i.tx, "the feed caught up with a launch already printed");
                         continue;
                     }
-                    println!(
+                    tracing::debug!(
                         "{}",
                         launch::render_incoming(&i, quotes.get(&i.call.pair_token))
                     );
@@ -1096,7 +1104,9 @@ async fn watch_launches_cmd(
                     // hour left curves being written to long after anything
                     // about them was still being decided.
                     if followed.get(&at).is_some_and(|f| f.until <= std::time::Instant::now()) {
-                        followed.remove(&at);
+                        if let Some(f) = followed.remove(&at) {
+                            println!("{}", done_line(at, &f));
+                        }
                         if let Ok(mut w) = watched_curves.write() {
                             w.remove(&at);
                         }
@@ -1113,7 +1123,20 @@ async fn watch_launches_cmd(
                     };
                     // Predicted BEFORE applying, which is the order a live
                     // quote would run in.
-                    let predicted = curve::predicted_tokens_out(&f.curve, &trade);
+                    // The model against the chain, on a trade nobody
+                    // arranged. Not a log line but an alarm: a buy priced off
+                    // reserves that have drifted is a buy sized wrong.
+                    if let (Some(p), curve::Trade::Buy { tokens_out, .. }) =
+                        (curve::predicted_tokens_out(&f.curve, &trade), &trade)
+                    {
+                        if p != *tokens_out {
+                            tracing::warn!(
+                                curve = ?at,
+                                off_by = %launch::tokens_of(p.abs_diff(*tokens_out)),
+                                "the model and the chain disagree on a fill"
+                            );
+                        }
+                    }
                     if let Err(e) = f.curve.apply(&trade) {
                         // The reserves being followed are not the curve\'s any
                         // more. Nothing priced from them is worth anything, so
@@ -1125,6 +1148,12 @@ async fn watch_launches_cmd(
                         followed.remove(&at);
                         continue;
                     }
+                    match &trade {
+                        curve::Trade::Buy { .. } => f.buys += 1,
+                        curve::Trade::Sell { .. } => f.sells += 1,
+                        _ => {}
+                    }
+                    f.peak_quote = f.peak_quote.max(f.curve.quote_reserve);
                     let elapsed = match (
                         f.launched_at,
                         block_seconds.read().ok().and_then(|s| s.get(&block).copied()),
@@ -1157,50 +1186,6 @@ async fn watch_launches_cmd(
                                     );
                                 }
                             }
-                            // And what the size would buy on the curve AS IT
-                            // STANDS, which is the only version of the
-                            // question a buy can be sized on: the plan written
-                            // at launch prices a curve nobody can still buy.
-                            {
-                                let spend = spend_for(
-                                    size_x100,
-                                    cap,
-                                    f.quote_decimals,
-                                    f.opening.as_ref().unwrap_or(&f.curve),
-                                );
-                                if let Ok(fill) = curve::buy(&f.curve, spend, tax_bps) {
-                                    let min = fill.tokens_out
-                                        * ethers::types::U256::from(10_000 - slippage_bps)
-                                        / ethers::types::U256::from(10_000u64);
-                                    let at_launch = f
-                                        .opening
-                                        .and_then(|o| curve::buy(&o, spend, tax_bps).ok())
-                                        .map(|f| f.tokens_out);
-                                    println!(
-                                        "    now  +{step}s {tax_bps:>4} bps -> {} min {}{}",
-                                        launch::tokens_of(fill.tokens_out),
-                                        launch::tokens_of(min),
-                                        match at_launch {
-                                            Some(a) if a > fill.tokens_out => format!(
-                                                "   (plan said {}, x{:.1} too high)",
-                                                launch::tokens_of(a),
-                                                route::u256_to_f64(a)
-                                                    / route::u256_to_f64(fill.tokens_out).max(1.0)
-                                            ),
-                                            _ => String::new(),
-                                        }
-                                    );
-                                    let line = journal::quote_line(
-                                        step, tax_bps, spend, fill.tokens_out, min, at_launch,
-                                        f.quote_decimals, &f.curve,
-                                    );
-                                    if let Err(e) = journal::append(&f.journal, &line) {
-                                        tracing::warn!(
-                                            err = %format!("{e:#}"), "cannot write the quote line"
-                                        );
-                                    }
-                                }
-                            }
                         }
                     }
                     if let Err(e) = journal::append(
@@ -1225,8 +1210,16 @@ async fn watch_launches_cmd(
                     // console. A busy launch makes hundreds of them in its
                     // minute, and a hundred lines nobody reads buries the
                     // handful that ask for a decision.
+                    // Graduated: the curve is done and there is nothing left to
+                    // decide about it. It gets the same closing line as a
+                    // launch whose minute simply ran out.
                     if matches!(trade, curve::Trade::Completed) {
-                        followed.remove(&at);
+                        if let Some(f) = followed.remove(&at) {
+                            println!("{}  graduated", done_line(at, &f));
+                        }
+                        if let Ok(mut w) = watched_curves.write() {
+                            w.remove(&at);
+                        }
                     }
                 }
                 Some(launch::Heard::SnipeTaxStartBps(bps)) => {
@@ -1280,13 +1273,6 @@ async fn watch_launches_cmd(
                         let Held { launch: p, call, lead, launched_at, refused } =
                             pending.take().expect("just checked");
                         let pair = launch::pair_of(&p, call.as_ref());
-                        let plan = plan_for(
-                            size, slippage_bps,
-                            pair.and_then(|t| quotes.get(&t)),
-                            pair.and_then(|t| economics.get(&t)),
-                            config.as_ref(), call.as_ref(), tax, launched_at,
-                            launch::threshold_of(&p),
-                        );
                         println!("{}", launch::render(&launch::Report {
                             created: Some(&p),
                             dev: Some(&l),
@@ -1295,7 +1281,6 @@ async fn watch_launches_cmd(
                             call: call.as_ref(),
                             tax,
                             lead,
-                            plan: plan.as_ref(),
                             refused: refused.as_deref(),
                         }));
                         continue;
@@ -1305,13 +1290,6 @@ async fn watch_launches_cmd(
                         pending.take()
                     {
                         let pair = launch::pair_of(&p, call.as_ref());
-                        let plan = plan_for(
-                            size, slippage_bps,
-                            pair.and_then(|t| quotes.get(&t)),
-                            pair.and_then(|t| economics.get(&t)),
-                            config.as_ref(), call.as_ref(), tax, launched_at,
-                            launch::threshold_of(&p),
-                        );
                         println!("{}", launch::render(&launch::Report {
                             created: Some(&p),
                             quote: pair.and_then(|t| quotes.get(&t)),
@@ -1319,7 +1297,6 @@ async fn watch_launches_cmd(
                             tax,
                             lead,
                             launched_at,
-                            plan: plan.as_ref(),
                             refused: refused.as_deref(),
                             ..Default::default()
                         }));
@@ -1496,8 +1473,10 @@ async fn watch_launches_cmd(
                                             .map(|q| q.decimals)
                                             .unwrap_or(18),
                                         launched_at,
-                                        pair_token,
                                         until: std::time::Instant::now() + FOLLOW_FOR,
+                                        buys: 0,
+                                        sells: 0,
+                                        peak_quote: opening.quote_reserve,
                                     };
                                     // Whatever already happened on it, in the
                                     // order it happened.
@@ -1527,13 +1506,6 @@ async fn watch_launches_cmd(
                             } else {
                                 // Nothing else is coming in that transaction,
                                 // so nothing is waited for.
-                                let plan = plan_for(
-                                    size, slippage_bps,
-                                    quotes.get(&pair_token),
-                                    economics.get(&pair_token),
-                                    config.as_ref(), call.as_ref(), tax, launched_at,
-                                    launch::threshold_of(&l),
-                                );
                                 println!("{}", launch::render(&launch::Report {
                                     created: Some(&l),
                                     quote: quotes.get(&pair_token),
@@ -1541,7 +1513,6 @@ async fn watch_launches_cmd(
                                     tax,
                                     lead,
                                     launched_at,
-                                    plan: plan.as_ref(),
                                     refused: refused.as_deref(),
                                     ..Default::default()
                                 }));
@@ -1570,13 +1541,6 @@ async fn watch_launches_cmd(
                 let Held { launch: p, call, lead, launched_at, refused } =
                     pending.take().expect("just checked");
                 let pair = launch::pair_of(&p, call.as_ref());
-                let plan = plan_for(
-                    size, slippage_bps,
-                    pair.and_then(|t| quotes.get(&t)),
-                    pair.and_then(|t| economics.get(&t)),
-                    config.as_ref(), call.as_ref(), tax, launched_at,
-                    launch::threshold_of(&p),
-                );
                 println!("{}", launch::render(&launch::Report {
                     created: Some(&p),
                     quote: pair.and_then(|t| quotes.get(&t)),
@@ -1584,7 +1548,6 @@ async fn watch_launches_cmd(
                     tax,
                     lead,
                     launched_at,
-                    plan: plan.as_ref(),
                     refused: refused.as_deref(),
                     ..Default::default()
                 }));
