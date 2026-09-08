@@ -256,19 +256,30 @@ struct Trader {
     /// and the exit rules were measured one position at a time.
     open: usize,
     max_open: usize,
-    spent: ethers::types::U256,
-    /// TODO(money): counts what is sent to the curve and not what the run
-    /// costs. Gas is not in it, and neither is a reverted buy, which spends
-    /// gas and buys nothing. On a chain this cheap the difference is small,
-    /// but the cap is there for the case where something is wrong - and the
-    /// case where something is wrong is exactly the one where every buy
-    /// reverts and this counter does not move at all.
+    /// The most this run may LOSE, in the pair token: everything sent, plus
+    /// gas, less everything that came back.
+    ///
+    /// It used to cap gross sends, and that measured the wrong thing twice
+    /// over. The same 1.68 mETH going out and coming back thirty times an hour
+    /// is not thirty times the risk, so the cap fired on a run that was
+    /// working; and the case it exists for - something is wrong, every buy
+    /// reverts - moves gas and returns nothing, which the old counter did not
+    /// see at all. Now a cap of 0.05 means what a person means by it: stop
+    /// after losing that much.
     max_spend: Option<ethers::types::U256>,
 }
 
 impl Trader {
     /// Why this buy must not be sent, if it must not.
-    fn refuses(&self, spend: ethers::types::U256, native: bool) -> Option<String> {
+    /// Whether to refuse this buy. `lost` is what the run is down so far -
+    /// sent plus gas, less what came back - which only the caller can know,
+    /// because it is the curves' own logs that say what came back.
+    fn refuses(
+        &self,
+        spend: ethers::types::U256,
+        native: bool,
+        lost: ethers::types::U256,
+    ) -> Option<String> {
         if !native {
             return Some("not a native pair, and only native is traded".to_string());
         }
@@ -276,9 +287,14 @@ impl Trader {
             return Some(format!("{} positions already open", self.open));
         }
         if let Some(cap) = self.max_spend {
-            if self.spent + spend > cap {
+            // Not "already past it" but "could be past it after this": the
+            // worst a buy can do is lose all of it, and a cap that only stops
+            // once it has been broken is not a cap.
+            if lost.saturating_add(spend) > cap {
                 return Some(format!(
-                    "would spend past this run's cap of {}",
+                    "this run is down {} and this would risk {}, against a cap of {}",
+                    units::format_units(lost, 18),
+                    units::format_units(spend, 18),
                     units::format_units(cap, 18)
                 ));
             }
@@ -1725,7 +1741,7 @@ async fn watch_launches_cmd(
                 gas: ethers::types::U256::from(cfg.snipe.gas_limit),
                 open: 0,
                 max_open: cfg.snipe.max_open,
-                spent: ethers::types::U256::zero(),
+
                 max_spend,
             });
         }
@@ -2118,7 +2134,18 @@ async fn watch_launches_cmd(
                                             .clone()
                                             .or_else(|| {
                                                 trader.as_ref().and_then(|t| {
-                                                    t.refuses(*spend, f.pair_token.is_zero())
+                                                    // Sent plus gas, less what
+                                                    // came back. Saturating,
+                                                    // because a run in profit
+                                                    // is not a run that has
+                                                    // lost a negative amount.
+                                                    let lost = (realized.0 + gas_paid)
+                                                        .saturating_sub(realized.1);
+                                                    t.refuses(
+                                                        *spend,
+                                                        f.pair_token.is_zero(),
+                                                        lost,
+                                                    )
                                                 })
                                             });
                                         if let Some(t) = trader.as_mut() {
@@ -2153,7 +2180,6 @@ async fn watch_launches_cmd(
                                                         opens_at + 2,
                                                     );
                                                     t.open += 1;
-                                                    t.spent += *spend;
                                                     f.sent = *spend;
                                                     f.expected_tokens = fill.tokens_out;
                                                     f.position =
@@ -2634,7 +2660,6 @@ async fn watch_launches_cmd(
                                 // holding that is not there.
                                 if let Some(t) = trader.as_mut() {
                                     t.open = t.open.saturating_sub(1);
-                                    t.spent = t.spent.saturating_sub(f.sent);
                                 }
                                 // The shadow is dropped with it: a later step
                                 // may still buy this launch, and the arm that

@@ -31,12 +31,21 @@
 # within a block.
 contract = "0x75C1243Da9AF8Bd6b01193de40A8dc4Af75C6cb2"
 
-# A tenth of what the journals were measured at, on purpose. On ETH pairs this
-# is 1.68 mETH a launch. Everything below it was measured in simulation, and a
-# simulation does not know about gas, reverts, or being ordered behind somebody
-# aiming at the same block. Raise it to 100 - the measured size - once real
-# fills have said the same thing the journals do.
-size_x100 = 10
+# The size everything below was measured at. On ETH pairs, 16.8 mETH a launch.
+#
+# It ran at a tenth of this first, deliberately, because a simulation knows
+# nothing about gas or reverts. That tenth answered its question and the answer
+# was that it cannot work: gas is a fixed number of units a round trip - 125k
+# in and 103k out, measured on chain - while the edge is a fraction of the
+# stake. At a tenth the edge is about 200 microETH a launch and the round trip
+# is 228k gas, so gas wins whatever it costs. The ratio only improves with
+# size, and it improves linearly.
+#
+# A hundred rather than more because a hundred is what was measured, impact
+# included: the replay priced our own buy into the curve at exactly this share.
+# Above it nothing has been measured and the returns would be an extrapolation
+# through our own market impact.
+size_x100 = 100
 
 # The filters. Each was measured on the journals; the reasoning for each is in
 # the commit that added it and in src/snipe.rs beside the field it sets.
@@ -74,11 +83,24 @@ operators    = "operators.json"
 #
 # max_open   positions at once. Every one is money sitting in the contract, and
 #            the exit rules were measured one position at a time.
-# max_spend  the most this RUN may spend in total, in the pair token. Reached,
-#            it stops buying and says so - it does not stop selling.
+# max_spend  the most this RUN may LOSE, in the pair token: everything sent,
+#            plus gas, less everything that came back. Reached, it stops buying
+#            and says so - it does not stop selling.
+#
+#            It used to cap gross sends, which measured the wrong thing twice:
+#            the same stake going out and back thirty times an hour is not
+#            thirty times the risk, and the case the cap exists for - every buy
+#            reverting - spends gas and returns nothing, which a gross counter
+#            never sees. At 16.8 mETH a stake the old reading would also have
+#            stopped this run after three buys.
+#
+#            Sixty is a little over the worst drawdown the journals show, 3.1
+#            stakes: a bad patch does not halt the run, and something actually
+#            broken does. It is also about half the wallet, which leaves the
+#            other half for gas and the open position.
 # gas_limit  not estimated per trade: an estimate is a round trip inside the
 #            window the whole thing is aimed at. Unused gas comes back; a limit
 #            reached is a trade lost.
 max_open  = 1
-max_spend = "0.05"
+max_spend = "0.06"
 gas_limit = 2000000
