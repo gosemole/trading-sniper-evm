@@ -969,9 +969,18 @@ async fn watch_launches_cmd(
             f.sells,
             run(f.peak_quote),
             run(f.curve.quote_reserve),
+            // In words. The derived form prints a spend in raw wei and a
+            // token count in eighteen digits, on a line whose whole job is to
+            // be read at a glance.
             match &f.position {
+                snipe::Position::Watching => "never bought".to_string(),
                 snipe::Position::Skipped { why } => format!("skipped: {why}"),
-                p => format!("{p:?}"),
+                snipe::Position::InFlight { step } => format!("in flight from +{step}s"),
+                snipe::Position::Failed { step, why } => format!("failed at +{step}s: {why}"),
+                snipe::Position::Bought { step, spend, .. } => format!(
+                    "bought at +{step}s for {}",
+                    launch::amount_of(*spend, f.quote_decimals)
+                ),
             },
         )
     }
