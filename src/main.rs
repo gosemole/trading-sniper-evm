@@ -571,6 +571,13 @@ struct Tally {
     /// Positions opened and closed in the last window.
     open: u64,
     closed: u64,
+    /// Buys the chain refused. Not counted as outcomes - no trade happened,
+    /// and calling that break-even would dilute the average with a number
+    /// nobody earned - but counted somewhere, because the shadow beside them
+    /// goes on reporting what the rules WOULD have made. A run where every buy
+    /// reverts otherwise looks exactly like a healthy one.
+    failed: u64,
+    all_failed: u64,
     x100: u64,
     wins: u64,
     /// The same, for the launches the filters would actually have bought. Two
@@ -590,6 +597,12 @@ struct Tally {
 impl Tally {
     fn opened(&mut self) {
         self.open += 1;
+    }
+
+    /// The chain refused a buy we sent.
+    fn refused(&mut self) {
+        self.failed += 1;
+        self.all_failed += 1;
     }
 
     /// One position closed at `x100` hundredths of what it cost. `kept` says
@@ -613,6 +626,7 @@ impl Tally {
     fn window(&mut self) {
         self.open = 0;
         self.closed = 0;
+        self.failed = 0;
         self.x100 = 0;
         self.wins = 0;
         self.kept_closed = 0;
@@ -1874,6 +1888,9 @@ async fn watch_launches_cmd(
                         holding = followed.values().filter(|f| f.holding()).count(),
                         bought = tally.open,
                         closed = tally.closed,
+                        // Anything but zero here and the shadow beside it is
+                        // describing a run that did not happen.
+                        buys_refused = tally.failed,
                         // The shadow so far, as a multiple of what it cost.
                         // Without `--execute` nothing was sent: this is what
                         // the rules would have returned, and the only running
@@ -1902,6 +1919,7 @@ async fn watch_launches_cmd(
                         minutes = started.elapsed().as_secs() / 60,
                         launches = all_launches,
                         closed = tally.all_closed,
+                        buys_refused = tally.all_failed,
                         shadow = %Tally::average(tally.all_x100, tally.all_closed),
                         win_pct = %match tally.all_closed {
                             0 => "-".to_string(),
@@ -2571,6 +2589,15 @@ async fn watch_launches_cmd(
                                     t.open = t.open.saturating_sub(1);
                                     t.spent = t.spent.saturating_sub(f.sent);
                                 }
+                                // The shadow is dropped with it: a later step
+                                // may still buy this launch, and the arm that
+                                // opens one refuses to while another stands.
+                                // What must not go with it is the fact that
+                                // the chain refused - the statistics carry on
+                                // reporting what the rules would have made,
+                                // and nothing else would say they did not get
+                                // the chance.
+                                tally.refused();
                                 f.shadow = None;
                                 // The step it failed at, not zero. Zero is the
                                 // launch second, which is structurally
@@ -3178,10 +3205,14 @@ mod tests {
         t.opened();
         t.close(250, true);
         t.close(50, false);
+        t.refused();
         assert_eq!((t.closed, t.wins, t.kept_closed), (2, 1, 1));
+        // A refused buy is not an outcome and must never reach the average.
+        assert_eq!((t.failed, t.all_failed, t.closed), (1, 1, 2));
         assert_eq!((t.all_closed, t.all_wins, t.all_x100), (2, 1, 300));
         t.window();
         assert_eq!((t.open, t.closed, t.wins, t.kept_closed, t.x100), (0, 0, 0, 0, 0));
+        assert_eq!((t.failed, t.all_failed), (0, 1), "the run forgot a refused buy");
         assert_eq!((t.all_closed, t.all_wins, t.all_x100), (2, 1, 300));
     }
 
