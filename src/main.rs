@@ -1278,6 +1278,23 @@ async fn watch_launches_cmd(
             owner == me,
             "the wrapper at {wrapper:?} is owned by {owner:?}, not by this wallet ({me:?})"
         );
+        // And that it is the wrapper at all. An address that answers `owner()`
+        // with ours could be anything we deployed; this one has to be pointed
+        // at the launchpad these launches come from, or every buy through it
+        // is refused by its own factory check - one launch at a time, in the
+        // second it was aimed at.
+        let its_factory = pool::call_address(
+            http,
+            wrapper,
+            &ethers::types::Bytes::from(pool::selector("factory()").to_vec()),
+        )
+        .await
+        .context("reading the wrapper\'s factory - is this a PonsSniper?")?;
+        let ours: ethers::types::Address = launch::PONS_V2_FACTORY.parse()?;
+        anyhow::ensure!(
+            its_factory == ours,
+            "the wrapper at {wrapper:?} trades against factory {its_factory:?}, not {ours:?}"
+        );
         let balance = http.get_balance(me, None).await.context("wallet balance")?;
         let urls = if cfg.submit_urls.is_empty() {
             vec![cfg.http_url.clone()]

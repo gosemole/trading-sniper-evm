@@ -18,6 +18,6 @@ max_creator_tax_bps = 300
 max_run_x100        = 300
 max_exempt          = 50
 lead_ms             = 100
-contract = "0x1D8F08f47b60349925fB45064e80C3e4E8AD0184"
+contract = "0x75C1243Da9AF8Bd6b01193de40A8dc4Af75C6cb2"
 require_dev_buy     = true
 min_dev_buy_x100    = 50

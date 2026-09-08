@@ -19,7 +19,7 @@ address = "0x0000000000000000000000000000000000000001"
 # exist until the launch - so a position held anywhere else takes two
 # transactions to leave, and the exit is worth what it is because it lands
 # within a block.
-contract = "0x0000000000000000000000000000000000000000"   # ← deploy first
+contract = "0x75C1243Da9AF8Bd6b01193de40A8dc4Af75C6cb2"
 
 # A hundredth of a percent of each curve's phantom reserve. On ETH pairs that
 # is 0.0168 ETH a launch. Start smaller than this and raise it once the numbers
