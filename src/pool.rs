@@ -950,7 +950,7 @@ async fn call_uint(provider: &Provider<Http>, to: Address, data: &Bytes) -> Resu
     Ok(U256::from_big_endian(&res[0..32]).low_u32())
 }
 
-async fn call_address(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<Address> {
+pub async fn call_address(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<Address> {
     let res: Bytes = crate::rpc::retrying("eth_call address", || {
         let tx = TransactionRequest::new().to(to).data(data.clone());
         async move {

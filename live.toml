@@ -1,0 +1,61 @@
+# Trading. Everything here is filtered.toml plus the parts that spend money.
+#
+#   WS_URL=... HTTP_URL=... PRIVATE_KEY=... \
+#     ./target/release/trading-mm-fall --watch-launches --config live.toml --execute
+#
+# Without --execute nothing is sent and this behaves exactly like filtered.toml.
+# With it, three things must all be true or the run refuses to start: the flag,
+# a contract below, and that contract answering that this wallet owns it.
+threshold_pct = 3
+
+[[pools]]
+name = "placeholder"
+version = "v3"
+address = "0x0000000000000000000000000000000000000001"
+
+[snipe]
+# The wrapper. A buy goes to it and the position is bought TO it, because the
+# curve pulls the launched token with transferFrom and that token does not
+# exist until the launch - so a position held anywhere else takes two
+# transactions to leave, and the exit is worth what it is because it lands
+# within a block.
+contract = "0x0000000000000000000000000000000000000000"   # ← deploy first
+
+# A hundredth of a percent of each curve's phantom reserve. On ETH pairs that
+# is 0.0168 ETH a launch. Start smaller than this and raise it once the numbers
+# on real fills say the same thing the journals do.
+size_x100 = 100
+
+# Every filter, and why, is in filtered.toml - these are the same values.
+pairs               = ["ETH"]
+min_exempt          = 6
+max_creator_tax_bps = 0
+max_dev_buy_x100    = 1500
+min_dev_buy_x100    = 200
+operator_needs      = 5
+max_run_x100        = 1000000
+max_exempt          = 100000
+require_dev_buy     = false
+
+# The exit, measured with one block between seeing a price and selling into it.
+slippage_bps = 100
+max_tax_bps  = 19
+lead_ms      = 100
+trail_bps    = 500
+take_x100    = 200
+hold_blocks  = 588
+operators    = "operators.json"
+
+# The rails. None of these is a strategy: they are what keeps a bad hour from
+# becoming a bad day.
+#
+# max_open   positions at once. Every one is money sitting in the contract, and
+#            the exit rules were measured one position at a time.
+# max_spend  the most this RUN may spend in total, in the pair token. Reached,
+#            it stops buying and says so - it does not stop selling.
+# gas_limit  not estimated per trade: an estimate is a round trip inside the
+#            window the whole thing is aimed at. Unused gas comes back; a limit
+#            reached is a trade lost.
+max_open  = 2
+max_spend = "0.2"
+gas_limit = 2000000

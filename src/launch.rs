@@ -207,6 +207,30 @@ pub fn snipe_tax_line(tax: &SnipeTax) -> String {
 
 /// Anything the launchpad said. Launches, and the settings a launch is judged
 /// against.
+/// Which leg of a trade a transaction was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leg {
+    Buy,
+    Sell,
+}
+
+/// A transaction of ours, and what became of it.
+#[derive(Debug, Clone)]
+pub struct Settled {
+    pub curve: Address,
+    pub leg: Leg,
+    pub hash: ethers::types::H256,
+    /// True only for a receipt that says the call succeeded. Anything else -
+    /// reverted, dropped, or no longer knowable - is false, because acting on
+    /// a trade that may not exist is worse than missing one that does.
+    pub ok: bool,
+    pub why: String,
+    pub nonce: u64,
+    /// The sender's next nonce, re-read whenever a transaction did not land,
+    /// so a gap left by a dropped one does not stall everything after it.
+    pub resync_nonce: Option<u64>,
+}
+
 /// One trade on one curve, and where in the chain it sat.
 #[derive(Debug, Clone)]
 pub struct TradeAt {
@@ -271,6 +295,10 @@ pub enum Heard {
     Trade(Box<TradeAt>),
     /// A launch that has been through the resolver and needs nothing more.
     Ready(Box<Resolved>),
+    /// How a transaction we sent ended. Reported back rather than waited on:
+    /// the loop that sent it has a step of somebody else's tax window to aim
+    /// at while this one is confirming.
+    Landed(Box<Settled>),
     /// Boxed: a launch is two hundred bytes and a settings change is eight, and
     /// every one of these goes down a channel sized for the settings.
     Launch(Box<Launch>),

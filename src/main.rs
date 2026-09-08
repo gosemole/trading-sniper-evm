@@ -17,6 +17,7 @@ mod rpc;
 mod snipe;
 mod strategy;
 mod swap;
+mod wrapper;
 
 use anyhow::Context;
 use ethers::providers::Middleware;
@@ -160,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
             slippage_bps.as_deref(),
             lead_ms.as_deref(),
             verbose,
+            execute,
         )
         .await;
     }
@@ -475,6 +477,109 @@ fn opening_curve(
     .ok()
 }
 
+/// What sends transactions, and everything that stops it.
+///
+/// Built only when `--execute` is given AND a contract is configured AND that
+/// contract answers that this wallet owns it. Absent, nothing below sends
+/// anything and the run is what it has been all along: a shadow.
+struct Trader {
+    wallet: ethers::signers::LocalWallet,
+    to: std::sync::Arc<swap::Broadcaster>,
+    wrapper: ethers::types::Address,
+    /// Ours, not the node's. A buy is sent from a task, so the loop cannot ask
+    /// what the next one is without waiting - and two buys in the same second
+    /// asking the same node get the same answer and collide.
+    nonce: u64,
+    fees: std::sync::Arc<std::sync::RwLock<(ethers::types::U256, ethers::types::U256)>>,
+    gas: ethers::types::U256,
+    /// Positions sent and not yet closed. Every one is money in a contract,
+    /// and the exit rules were measured one position at a time.
+    open: usize,
+    max_open: usize,
+    spent: ethers::types::U256,
+    max_spend: Option<ethers::types::U256>,
+}
+
+impl Trader {
+    /// Why this buy must not be sent, if it must not.
+    fn refuses(&self, spend: ethers::types::U256, native: bool) -> Option<String> {
+        if !native {
+            return Some("not a native pair, and only native is traded".to_string());
+        }
+        if self.open >= self.max_open {
+            return Some(format!("{} positions already open", self.open));
+        }
+        if let Some(cap) = self.max_spend {
+            if self.spent + spend > cap {
+                return Some(format!(
+                    "would spend past this run\'s cap of {}",
+                    route::format_units(cap, 18)
+                ));
+            }
+        }
+        None
+    }
+
+    fn take_nonce(&mut self) -> u64 {
+        let n = self.nonce;
+        self.nonce += 1;
+        n
+    }
+}
+
+/// Sign, broadcast, wait for the receipt, and say what happened.
+///
+/// All of it in its own task. The loop that decided this has a step of
+/// somebody else's tax window to aim at within the next hundred milliseconds,
+/// and a signature plus a round trip plus a receipt is none of its business.
+#[allow(clippy::too_many_arguments)]
+async fn fire(
+    http: ethers::providers::Provider<ethers::providers::Http>,
+    to: std::sync::Arc<swap::Broadcaster>,
+    wallet: ethers::signers::LocalWallet,
+    tx: swap::PendingTx,
+    nonce: u64,
+    fees: (ethers::types::U256, ethers::types::U256),
+    gas: ethers::types::U256,
+    curve: ethers::types::Address,
+    leg: launch::Leg,
+    out: tokio::sync::mpsc::Sender<launch::Heard>,
+) {
+    let owner = ethers::signers::Signer::address(&wallet);
+    let (ok, hash, why) = match swap::send_nowait(&to, &wallet, &tx, nonce.into(), fees, gas).await {
+        Ok(hash) => {
+            tracing::info!(?leg, ?curve, ?hash, nonce, "sent");
+            let landed = swap::await_receipt(&http, hash, &tx.label).await;
+            let ok = landed.outcome == swap::Outcome::Confirmed;
+            (ok, Some(hash), format!("{:?}", landed.outcome))
+        }
+        // Never broadcast, so the nonce it was given was never used - which
+        // the re-read below picks up.
+        Err(e) => (false, None, format!("{e:#}")),
+    };
+    // Only when something went wrong. A confirmed transaction consumed exactly
+    // the nonce it was given and the count we keep is already right.
+    let resync_nonce = if ok {
+        None
+    } else {
+        swap::pending_nonce(&http, owner).await.ok()
+    };
+    if !ok {
+        tracing::warn!(?leg, ?curve, ?hash, why = %why, "did not land");
+    }
+    let _ = out
+        .send(launch::Heard::Landed(Box::new(launch::Settled {
+            curve,
+            leg,
+            hash: hash.unwrap_or_default(),
+            ok,
+            why,
+            nonce,
+            resync_nonce,
+        })))
+        .await;
+}
+
 /// One launch entry, for a person watching. Off unless asked for: it is the
 /// same thing the journal's `launch` line already holds, and forty of them a
 /// minute is how the one line that needed reading got lost.
@@ -602,6 +707,7 @@ async fn launch_call(
 /// * the launch transaction, once per launch, for what the calldata says and
 ///   no log does - the name, the creator's tax, and who was exempted from the
 ///   snipe tax.
+#[allow(clippy::too_many_arguments)]
 async fn watch_launches_cmd(
     http: &ethers::providers::Provider<ethers::providers::Http>,
     cfg: &config::Config,
@@ -613,6 +719,8 @@ async fn watch_launches_cmd(
     // default: all three are already records in the journal, and forty of them
     // a minute is how the one line that needed reading got lost.
     verbose: bool,
+    // Actually send. Everything works the same without it, minus the money.
+    sending: bool,
 ) -> anyhow::Result<()> {
     // How long before a step opens a decision is wanted.
     //
@@ -953,6 +1061,17 @@ async fn watch_launches_cmd(
         /// the reserves have parted from the chain's they stay parted, so
         /// every later fill disagrees too and saying so again says nothing.
         model_off: bool,
+        /// What was actually sent for this position, when something was.
+        sent: ethers::types::U256,
+        /// A sale is in flight, so the exit rules do not send another.
+        selling: bool,
+        /// The exit fired and we mean to be out. Kept because a sale that does
+        /// not land has to be tried again: the reason for leaving does not
+        /// stop being true because a transaction was dropped.
+        leaving: bool,
+        /// The pair token. Execution refuses anything but the native one, and
+        /// a symbol is not proof: this is the address the curve named.
+        pair_token: ethers::types::Address,
         /// Whoever is behind this launch, for filing its outcome under.
         operator: operators::OpId,
         /// Distinct wallets that bought and were NOT exempt. A launch that
@@ -1133,6 +1252,81 @@ async fn watch_launches_cmd(
     // store is the one thing here that grows without an upper bound.
     const REMEMBER_BLOCKS: u64 = 5_927_040;
     let mut newest_block = 0u64;
+
+    // Nothing sends unless all three are true: asked for, configured, and the
+    // contract agrees this wallet owns it.
+    let mut trader: Option<Trader> = None;
+    if sending {
+        let Some(addr) = cfg.snipe.contract.as_ref() else {
+            anyhow::bail!("--execute needs [snipe] contract, the wrapper to trade through");
+        };
+        let wrapper: ethers::types::Address = addr.parse().context("[snipe] contract")?;
+        let chain = http.get_chainid().await.context("chain id")?.as_u64();
+        let wallet = swap::load_wallet(cfg, chain)?;
+        let me = ethers::signers::Signer::address(&wallet);
+        // Asked of the contract rather than assumed. Every call below is
+        // `onlyOwner`, so getting this wrong is a run where every single
+        // transaction reverts, discovered one launch at a time.
+        let owner = pool::call_address(
+            http,
+            wrapper,
+            &ethers::types::Bytes::from(pool::selector("owner()").to_vec()),
+        )
+        .await
+        .context("reading the wrapper\'s owner")?;
+        anyhow::ensure!(
+            owner == me,
+            "the wrapper at {wrapper:?} is owned by {owner:?}, not by this wallet ({me:?})"
+        );
+        let balance = http.get_balance(me, None).await.context("wallet balance")?;
+        let urls = if cfg.submit_urls.is_empty() {
+            vec![cfg.http_url.clone()]
+        } else {
+            cfg.submit_urls.clone()
+        };
+        let fees = std::sync::Arc::new(std::sync::RwLock::new(swap::fee_params(http).await?));
+        {
+            // Refreshed on a timer, never on the path of a trade: reading the
+            // base fee costs a round trip and the loop has none to spend.
+            let fees = fees.clone();
+            let http = http.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    if let Ok(f) = swap::fee_params(&http).await {
+                        if let Ok(mut w) = fees.write() {
+                            *w = f;
+                        }
+                    }
+                }
+            });
+        }
+        let max_spend = match cfg.snipe.max_spend.trim() {
+            "" => None,
+            v => Some(route::parse_units(v, 18).context("[snipe] max_spend")?),
+        };
+        tracing::warn!(
+            wallet = ?me,
+            wrapper = ?wrapper,
+            balance = %route::format_units(balance, 18),
+            max_open = cfg.snipe.max_open,
+            max_spend = %cfg.snipe.max_spend,
+            gas_limit = cfg.snipe.gas_limit,
+            "EXECUTING: this run sends transactions and spends real money"
+        );
+        trader = Some(Trader {
+            nonce: swap::pending_nonce(http, me).await?,
+            wallet,
+            to: std::sync::Arc::new(swap::Broadcaster::new(&urls)?),
+            wrapper,
+            fees,
+            gas: ethers::types::U256::from(cfg.snipe.gas_limit),
+            open: 0,
+            max_open: cfg.snipe.max_open,
+            spent: ethers::types::U256::zero(),
+            max_spend,
+        });
+    }
     // How the feed is actually doing, against the logs it is supposed to beat.
     // What is happening, in numbers, because the entries themselves are all in
     // the journals and reading them go past says nothing about the whole. Set
@@ -1407,7 +1601,9 @@ async fn watch_launches_cmd(
                             // never reopens: a second one would be averaging
                             // into a position we are already carrying, which
                             // is a different strategy than the one measured.
-                            snipe::Decision::Buy { spend, .. } if f.shadow.is_none() => {
+                            snipe::Decision::Buy { spend, min_tokens_out, .. }
+                                if f.shadow.is_none() =>
+                            {
                                 match curve::buy(&f.curve, *spend, tax_bps) {
                                     Ok(fill) => {
                                         let mut h = exit::Held {
@@ -1430,6 +1626,57 @@ async fn watch_launches_cmd(
                                             spend: fill.spent,
                                             tokens: fill.tokens_out,
                                         };
+                                        // And with a wallet behind it, this is
+                                        // where the money leaves.
+                                        if let Some(t) = trader.as_mut() {
+                                            match t.refuses(*spend, f.pair_token.is_zero()) {
+                                                Some(why) => tracing::info!(
+                                                    curve = ?curve_addr, why,
+                                                    "decided to buy and did not send"
+                                                ),
+                                                None => {
+                                                    let nonce = t.take_nonce();
+                                                    let fees = t
+                                                        .fees
+                                                        .read()
+                                                        .map(|f| *f)
+                                                        .unwrap_or_default();
+                                                    let call = wrapper::snipe(
+                                                        t.wrapper,
+                                                        *curve_addr,
+                                                        *spend,
+                                                        *min_tokens_out,
+                                                        tax_bps,
+                                                        // Two seconds past the
+                                                        // step it aims at. A
+                                                        // buy that arrives
+                                                        // later is aimed at a
+                                                        // launch that has moved
+                                                        // on, and the tax it
+                                                        // would pay is not the
+                                                        // one this decided on.
+                                                        opens_at + 2,
+                                                    );
+                                                    t.open += 1;
+                                                    t.spent += *spend;
+                                                    f.sent = *spend;
+                                                    f.position =
+                                                        snipe::Position::InFlight { step };
+                                                    tokio::spawn(fire(
+                                                        http.clone(),
+                                                        t.to.clone(),
+                                                        t.wallet.clone(),
+                                                        call,
+                                                        nonce,
+                                                        fees,
+                                                        t.gas,
+                                                        *curve_addr,
+                                                        launch::Leg::Buy,
+                                                        tx.clone(),
+                                                    ));
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(e) => tracing::warn!(
                                         curve = ?curve_addr, err = %format!("{e:#}"),
@@ -1608,6 +1855,60 @@ async fn watch_launches_cmd(
                             ops.record(f.operator, x100);
                             ops_dirty = true;
                             f.shadow = None;
+                            f.leaving = true;
+                        }
+                    }
+                    // Out, and keep trying until we are. The reason for
+                    // leaving does not stop being true because a transaction
+                    // was dropped, and the shadow that raised it has closed -
+                    // so the retry hangs on this rather than on another
+                    // decision.
+                    if f.leaving && !f.selling {
+                        let held = match &f.position {
+                            snipe::Position::Bought { tokens, .. } => *tokens,
+                            _ => ethers::types::U256::zero(),
+                        };
+                        if let Some(t) = trader.as_mut() {
+                            let tokens = held;
+                            if !tokens.is_zero() {
+                                let worth = exit::worth(&f.curve, tokens);
+                                let min_out = worth
+                                    * ethers::types::U256::from(10_000 - slippage_bps)
+                                    / ethers::types::U256::from(10_000u64);
+                                let nonce = t.take_nonce();
+                                let fees = t.fees.read().map(|f| *f).unwrap_or_default();
+                                let now = second_anchor
+                                    .read()
+                                    .ok()
+                                    .and_then(|a| *a)
+                                    .map(|(s, at)| s + at.elapsed().as_secs())
+                                    .unwrap_or(0);
+                                let call = wrapper::unwind(
+                                    t.wrapper,
+                                    at,
+                                    // The whole balance, whatever it turned
+                                    // out to be. An exact figure a wei off
+                                    // reverts, and a revert here keeps a
+                                    // position while the price it is leaving
+                                    // falls.
+                                    ethers::types::U256::zero(),
+                                    min_out,
+                                    now + 12,
+                                );
+                                f.selling = true;
+                                tokio::spawn(fire(
+                                    http.clone(),
+                                    t.to.clone(),
+                                    t.wallet.clone(),
+                                    call,
+                                    nonce,
+                                    fees,
+                                    t.gas,
+                                    at,
+                                    launch::Leg::Sell,
+                                    tx.clone(),
+                                ));
+                            }
                         }
                     }
                     let elapsed = match (
@@ -1752,6 +2053,73 @@ async fn watch_launches_cmd(
                 // queue rather than one task per launch, because a `Launched`
                 // and the `TokenLaunched` of the same transaction resolving
                 // out of order is a dev buy printed without its launch.
+                // A transaction of ours ended. Nothing here waited for it.
+                Some(launch::Heard::Landed(l)) => {
+                    let launch::Settled { curve, leg, ok, why, hash, nonce, resync_nonce } = *l;
+                    if let (Some(t), Some(n)) = (trader.as_mut(), resync_nonce) {
+                        // A dropped transaction leaves a gap that stalls every
+                        // one after it, so the count is re-read rather than
+                        // assumed - but only forward, because a stale read
+                        // would replay a nonce that is already in flight.
+                        if n > t.nonce {
+                            tracing::warn!(from = t.nonce, to = n, "nonce re-read after a miss");
+                            t.nonce = n;
+                        }
+                    }
+                    if let Some(f) = followed.get_mut(&curve) {
+                        if let Err(e) = journal::append(
+                            &f.journal,
+                            &journal::sent_line(
+                                match leg {
+                                    launch::Leg::Buy => "buy",
+                                    launch::Leg::Sell => "sell",
+                                },
+                                &format!("{hash:?}"),
+                                ok,
+                                &why,
+                                nonce,
+                            ),
+                        ) {
+                            tracing::warn!(err = %format!("{e:#}"), "cannot write what was sent");
+                        }
+                        match (leg, ok) {
+                            (launch::Leg::Buy, true) => {
+                                if let snipe::Position::InFlight { step } = f.position {
+                                    f.position = snipe::Position::Bought {
+                                        step,
+                                        spend: f.sent,
+                                        tokens: f.shadow.map(|h| h.tokens).unwrap_or_default(),
+                                    };
+                                }
+                            }
+                            (launch::Leg::Buy, false) => {
+                                // The position never existed. Drop the shadow
+                                // with it, or the exit rules would sell a
+                                // holding that is not there.
+                                if let Some(t) = trader.as_mut() {
+                                    t.open = t.open.saturating_sub(1);
+                                    t.spent = t.spent.saturating_sub(f.sent);
+                                }
+                                f.shadow = None;
+                                f.position = snipe::Position::Failed {
+                                    step: 0,
+                                    why: why.clone(),
+                                };
+                            }
+                            (launch::Leg::Sell, true) => {
+                                if let Some(t) = trader.as_mut() {
+                                    t.open = t.open.saturating_sub(1);
+                                }
+                            }
+                            (launch::Leg::Sell, false) => {
+                                // Still held. The exit rules will ask again on
+                                // the next trade, and the stop has already
+                                // fired, so the next answer is the same one.
+                                f.selling = false;
+                            }
+                        }
+                    }
+                }
                 Some(launch::Heard::Ready(r)) => {
                     let launch::Resolved { launch, call, lead, launched_at, quote, terms } = *r;
                     // Followed and priced like any other, and said so on the
@@ -2018,6 +2386,10 @@ async fn watch_launches_cmd(
                                         last_block: l.block,
                                         shadow: None,
                                         operator,
+                                        pair_token,
+                                        sent: ethers::types::U256::zero(),
+                                        selling: false,
+                                        leaving: false,
                                         outsiders: Default::default(),
                                         seen: Default::default(),
                                         model_off: false,

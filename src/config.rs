@@ -433,6 +433,21 @@ pub struct SnipeConfig {
     /// hundredths of a percent. 1500 is fifteen percent.
     #[serde(default = "default_max_dev_buy_x100")]
     pub max_dev_buy_x100: u64,
+    /// Gas limit for a call to the wrapper. Not estimated per trade: an
+    /// estimate is a round trip inside the window the whole thing is aimed at,
+    /// and the call shape never changes. Generous on purpose - unused gas is
+    /// refunded, a limit reached is a trade lost.
+    #[serde(default = "default_gas_limit")]
+    pub gas_limit: u64,
+    /// How many positions may be open at once. Every one of them is money at
+    /// risk in a contract, and the exit rules were measured one position at a
+    /// time.
+    #[serde(default = "default_max_open")]
+    pub max_open: usize,
+    /// The most this run may spend in total, in the pair token's own units.
+    /// Reached, it stops buying and says so; it does not stop selling.
+    #[serde(default)]
+    pub max_spend: String,
     /// Where the operator history lives. It is the only thing this bot keeps
     /// between runs that cannot be rebuilt from the journals.
     #[serde(default = "default_operators_path")]
@@ -475,6 +490,12 @@ fn default_hold_blocks() -> u64 {
 fn default_operator_needs() -> usize {
     5
 }
+fn default_gas_limit() -> u64 {
+    2_000_000
+}
+fn default_max_open() -> usize {
+    3
+}
 fn default_max_dev_buy_x100() -> u64 {
     // No cap. A launch is not refused for a large dev buy unless somebody
     // says so, because the field only means anything beside the others.
@@ -502,6 +523,9 @@ impl Default for SnipeConfig {
             take_x100: default_take_x100(),
             hold_blocks: default_hold_blocks(),
             operator_needs: default_operator_needs(),
+            gas_limit: default_gas_limit(),
+            max_open: default_max_open(),
+            max_spend: String::new(),
             min_exempt: 0,
             pairs: Vec::new(),
             max_dev_buy_x100: default_max_dev_buy_x100(),

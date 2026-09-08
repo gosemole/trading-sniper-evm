@@ -327,6 +327,22 @@ pub fn done_line(
     })
 }
 
+/// A transaction of ours, and what became of it.
+///
+/// The only record that a decision turned into money. Everything else in a
+/// journal is what the chain did; this is what we did, and without it a file
+/// says a buy was decided on and never says whether it happened.
+pub fn sent_line(leg: &str, hash: &str, ok: bool, why: &str, nonce: u64) -> Value {
+    json!({
+        "kind": "sent",
+        "leg": leg,
+        "tx": hash,
+        "landed": ok,
+        "why": why,
+        "nonce": nonce,
+    })
+}
+
 /// Append one line. Opened and closed per line on purpose: a launch writes a
 /// few dozen lines over a minute, and a handle held open across that is a
 /// handle that loses them if the process ends badly.
