@@ -30,7 +30,6 @@ pub fn path_for(dir: &Path, block: u64, curve: Address) -> PathBuf {
 
 /// The launch itself, as everything known about it at the moment it opens.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn launch_line(
     l: &crate::launch::Launch,
     call: Option<&crate::launch::LaunchCall>,
