@@ -1,0 +1,59 @@
+# The same shadow as collect.toml, with the entry filters the journals chose.
+#
+# Run it beside a collecting run, on the same chain at the same time, and the
+# two `the whole run` lines answer the only question that matters: does the
+# filtering pay for the launches it throws away. Collecting alone measured
+# 1.05x on 985 launches; the same filters offline turned -2.0% a launch into
+# +10.9%, and this is that claim put where it can fail.
+#
+#   WS_URL=... HTTP_URL=... \
+#     cargo run --release -- --watch-launches --config filtered.toml
+#
+# Nothing is sent here either. There is still no wallet behind any of it.
+threshold_pct = 3
+
+[[pools]]
+name = "placeholder"
+version = "v3"
+address = "0x0000000000000000000000000000000000000001"
+
+[snipe]
+size_x100 = 100
+
+# The one entry filter that measured, and the surprise of the whole exercise.
+# On a night of 3473 launches the group with six or more exempt wallets carried
+# the entire profit of the flow - +70.7 stakes on 625 launches against +2.9 on
+# the 2180 with one - and it held across a split by deployer: 1.131x on one
+# half, 1.132x on the other, over 494 operators.
+min_exempt = 6
+
+# A creator's cut is charged on the way in and again on the way out, and it
+# predicts death: 11% of launches with none never saw an outside buyer, against
+# 40% of those above 300 bps.
+max_creator_tax_bps = 0
+
+# Bigger is worse, monotonically. The largest dev buys reach the highest peaks
+# and return the least - a launch pumped by its maker and sold into whoever
+# came. Dropping these from the bundles raised the total while taking fewer.
+max_dev_buy_x100 = 1500
+
+# An operator with a record of losses is passed over, once there is enough of
+# a record to be one. Behind 35 different deployer addresses on that night sat
+# one operator with nothing worth holding on any of them.
+operator_needs = 5
+
+# Not filters. Left open because they are not what separates.
+max_run_x100     = 1000000
+max_exempt       = 100000
+require_dev_buy  = false
+min_dev_buy_x100 = 0
+
+# The exit, unchanged from the measured defaults so the two runs differ in
+# exactly one thing.
+slippage_bps = 100
+max_tax_bps  = 19
+lead_ms      = 100
+trail_bps    = 500
+take_x100    = 200
+hold_blocks  = 588
+operators    = "operators.json"

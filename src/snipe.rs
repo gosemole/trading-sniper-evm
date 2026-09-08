@@ -106,6 +106,23 @@ pub struct Policy {
     /// How many of an operator's positions must have closed before their
     /// record is allowed to refuse a launch. Zero never refuses on it.
     pub operator_needs: usize,
+    /// The fewest exempt wallets worth following. Zero follows everything.
+    ///
+    /// The one entry filter that has measured, and the surprise of the whole
+    /// exercise: on a night of 3473 launches the group with six or more
+    /// carried the entire profit of the flow - +70.7 stakes on 625 launches,
+    /// against +2.9 on the 2180 with one - and it replicated across a split by
+    /// deployer, 1.131x against 1.132x on 494 operators.
+    pub min_exempt: usize,
+    /// The largest dev buy worth following, against the phantom reserve, in
+    /// hundredths of a percent.
+    ///
+    /// Bigger is worse, monotonically: the biggest dev buys reach the highest
+    /// peaks and return the least, which is the shape of a launch pumped by
+    /// its maker and sold into whoever came. Above 15% of the curve the
+    /// portfolio loses 27.3 stakes over 418 launches, and dropping them from
+    /// the bundles raises the total while taking fewer of them.
+    pub max_dev_buy_x100: u64,
     /// What to spend, in the pair token's own units.
     pub spend: U256,
     /// How much of the price to give away, in basis points. Must stay below
@@ -189,6 +206,21 @@ pub fn refuse_outright(facts: &Facts, p: &Policy) -> Option<String> {
         return Some(format!(
             "{} wallets exempt from the snipe tax; they buy before anyone else can",
             facts.exempt
+        ));
+    }
+    if facts.exempt < p.min_exempt {
+        return Some(format!(
+            "{} wallets exempt, under the {} a bundle is recognised by",
+            facts.exempt, p.min_exempt
+        ));
+    }
+    if facts.dev_buy_x100 > p.max_dev_buy_x100 {
+        return Some(format!(
+            "dev buy {}.{:02}% of the curve, over the {}.{:02}% a maker sells into",
+            facts.dev_buy_x100 / 100,
+            facts.dev_buy_x100 % 100,
+            p.max_dev_buy_x100 / 100,
+            p.max_dev_buy_x100 % 100
         ));
     }
     // Whether the maker put in their own money, and how much.
@@ -393,6 +425,8 @@ mod tests {
     fn policy() -> Policy {
         Policy {
             operator_needs: 0,
+            min_exempt: 0,
+            max_dev_buy_x100: u64::MAX,
             spend: U256::exp10(17), // 0.1
             slippage_bps: 100,
             max_tax_bps: 19,
@@ -646,6 +680,40 @@ mod tests {
         // Turned off entirely, the record cannot refuse anything.
         let off = Policy { operator_needs: 0, ..p };
         assert_eq!(refuse_outright(&with(Option::Some(poor)), &off), None);
+    }
+
+    /// The two filters the journals chose, and the one that is easy to get
+    /// backwards: `max_exempt` keeps a launch out for having too many, and
+    /// `min_exempt` keeps it out for having too few. They are opposite ends of
+    /// the same field and the profitable end is the crowded one.
+    #[test]
+    fn a_bundle_is_recognised_by_how_many_it_exempted_and_how_little_the_maker_spent() {
+        let p = Policy {
+            min_exempt: 6,
+            max_exempt: 100,
+            max_dev_buy_x100: 1500,
+            min_dev_buy_x100: 0,
+            require_dev_buy: false,
+            ..policy()
+        };
+        let with = |exempt, dev| Facts {
+            dev_buy_x100: dev,
+            ..facts(exempt, 0)
+        };
+
+        // What the measurement liked: a crowded exemption list and a maker who
+        // did not put much in.
+        assert_eq!(refuse_outright(&with(9, 600), &p), None);
+        assert_eq!(refuse_outright(&with(6, 1500), &p), None, "the bound is inclusive");
+
+        let why = refuse_outright(&with(1, 600), &p).expect("too few exempt");
+        assert!(why.contains("under the 6"), "{why}");
+        let why = refuse_outright(&with(9, 3860), &p).expect("dev buy too large");
+        assert!(why.contains("38.60%"), "{why}");
+
+        // And neither fires when it is not asked to.
+        let off = Policy { min_exempt: 0, max_dev_buy_x100: u64::MAX, ..p };
+        assert_eq!(refuse_outright(&with(1, 3860), &off), None);
     }
 
 }

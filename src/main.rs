@@ -1100,6 +1100,8 @@ async fn watch_launches_cmd(
         require_dev_buy: cfg.snipe.require_dev_buy,
         min_dev_buy_x100: cfg.snipe.min_dev_buy_x100,
         operator_needs: cfg.snipe.operator_needs,
+        min_exempt: cfg.snipe.min_exempt,
+        max_dev_buy_x100: cfg.snipe.max_dev_buy_x100,
     };
 
     // Who has launched before, and how it went. The only state this keeps

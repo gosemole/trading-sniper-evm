@@ -421,6 +421,14 @@ pub struct SnipeConfig {
     /// is what a fresh store amounts to anyway.
     #[serde(default = "default_operator_needs")]
     pub operator_needs: usize,
+    /// The fewest exempt wallets worth following. Zero follows everything,
+    /// which is what collecting wants; six is what the journals chose.
+    #[serde(default)]
+    pub min_exempt: usize,
+    /// The largest dev buy worth following, against the phantom reserve, in
+    /// hundredths of a percent. 1500 is fifteen percent.
+    #[serde(default = "default_max_dev_buy_x100")]
+    pub max_dev_buy_x100: u64,
     /// Where the operator history lives. It is the only thing this bot keeps
     /// between runs that cannot be rebuilt from the journals.
     #[serde(default = "default_operators_path")]
@@ -463,6 +471,11 @@ fn default_hold_blocks() -> u64 {
 fn default_operator_needs() -> usize {
     5
 }
+fn default_max_dev_buy_x100() -> u64 {
+    // No cap. A launch is not refused for a large dev buy unless somebody
+    // says so, because the field only means anything beside the others.
+    u64::MAX
+}
 fn default_operators_path() -> String {
     "operators.json".to_string()
 }
@@ -485,6 +498,8 @@ impl Default for SnipeConfig {
             take_x100: default_take_x100(),
             hold_blocks: default_hold_blocks(),
             operator_needs: default_operator_needs(),
+            min_exempt: 0,
+            max_dev_buy_x100: default_max_dev_buy_x100(),
             operators: default_operators_path(),
         }
     }
