@@ -1150,6 +1150,8 @@ async fn watch_launches_cmd(
     let mut all_wins: u64 = 0;
     let started = std::time::Instant::now();
     let mut heard_from_feed: u64 = 0;
+    let mut feed_wait_ms: u64 = 0;
+    let mut feed_wait_worst: u64 = 0;
     let mut feed_was_late: u64 = 0;
     let mut feed_told = std::time::Instant::now();
 
@@ -1278,6 +1280,12 @@ async fn watch_launches_cmd(
                         },
                         feed_heard = heard_from_feed,
                         feed_late = feed_was_late,
+                        // Ours, not theirs: decode to handled.
+                        feed_queued_ms = match heard_from_feed {
+                            0 => 0,
+                            n => feed_wait_ms / n,
+                        },
+                        feed_queued_worst_ms = feed_wait_worst,
                         operators = ops.len(),
                         "the last thirty seconds"
                     );
@@ -1303,6 +1311,8 @@ async fn watch_launches_cmd(
                     shadow_wins = 0;
                     heard_from_feed = 0;
                     feed_was_late = 0;
+                    feed_wait_ms = 0;
+                    feed_wait_worst = 0;
                 }
                 if ops_dirty && ops_saved.elapsed() >= std::time::Duration::from_secs(30) {
                     let gone = ops.forget_before(newest_block.saturating_sub(REMEMBER_BLOCKS));
@@ -1434,6 +1444,14 @@ async fn watch_launches_cmd(
                 // before the block that will carry it exists.
                 Some(launch::Heard::Incoming(i)) => {
                     heard_from_feed += 1;
+                    // How long this sighting sat between being decoded off the
+                    // feed and being looked at here. It shares one channel with
+                    // every trade on every followed curve, which is hundreds a
+                    // minute, so a feed that looks slow may only be queued
+                    // behind our own work.
+                    let waited = i.seen.elapsed().as_millis() as u64;
+                    feed_wait_ms += waited;
+                    feed_wait_worst = feed_wait_worst.max(waited);
                     if reported.contains(&i.tx) {
                         // The feed found it, and found it too late to be worth
                         // anything: the log for the same launch had already

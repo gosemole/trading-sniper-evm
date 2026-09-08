@@ -685,6 +685,7 @@ pub async fn watch_feed(
     // twice carried frames all night and recognised nothing in them, and
     // nothing said so.
     let mut seen = Funnel::default();
+    let mut last_seq: u64 = 0;
     let mut told = std::time::Instant::now();
     const TELL_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -709,17 +710,23 @@ pub async fn watch_feed(
             told = std::time::Instant::now();
             // At info, because a feed that recognises nothing is the failure
             // that has actually happened, twice, and it is invisible otherwise.
+            // Theirs, not ours: how far behind the chain's own head the relay
+            // is running. The headers arrive over a different socket and name
+            // the same blocks, so this is one number against another.
+            let head = seconds.read().ok().and_then(|s| s.keys().next_back().copied());
+            let behind = head.map(|h| h.saturating_sub(last_seq)).unwrap_or(0);
             if seen.decoded == 0 {
                 warn!(
                     frames = seen.frames, messages = seen.messages, l2 = seen.l2,
                     txs = seen.txs, undecodable = seen.undecodable,
-                    to_a_pad = seen.to_a_pad,
+                    to_a_pad = seen.to_a_pad, behind_blocks = behind,
                     "the feed has recognised no launches at all"
                 );
             } else {
                 info!(
                     frames = seen.frames, txs = seen.txs, to_a_pad = seen.to_a_pad,
-                    decoded = seen.decoded, "the feed is finding launches"
+                    decoded = seen.decoded, behind_blocks = behind,
+                    "the feed is finding launches"
                 );
             }
             seen = Funnel::default();
@@ -750,6 +757,7 @@ pub async fn watch_feed(
                     "feed starts here"
                 );
             }
+            last_seq = last_seq.max(m.sequence_number);
             let stamped = m.message.message.header.timestamp;
             if let Ok(mut s) = seconds.write() {
                 s.insert(m.sequence_number, stamped);
