@@ -200,10 +200,11 @@ pub fn refuse_outright(facts: &Facts, p: &Policy) -> Option<String> {
     // willing to buy at the price they set it at is a launch with no second
     // buyer either.
     if p.require_dev_buy && facts.via != "launchAndBuy" {
-        return Some(if facts.via.is_empty() {
-            "no calldata, so no telling whether the maker bought their own launch".to_string()
-        } else {
-            format!("made through {}: the maker bought none of it", facts.via)
+        return Some(match facts.via {
+            "" | "unknown entry point" => {
+                "no calldata, so no telling whether the maker bought their own launch".to_string()
+            }
+            via => format!("made through {via}: the maker bought none of it"),
         });
     }
     if facts.dev_buy_x100 < p.min_dev_buy_x100 {

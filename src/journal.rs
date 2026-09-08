@@ -63,6 +63,14 @@ pub fn launch_line(
         v["launch_config_id"] = json!(launch_config_id.to_string());
         v["graduation_threshold"] = json!(graduation_threshold.to_string());
     }
+    // A launch through an entry point this does not decode, followed on terms
+    // read off the curve. Marked, because what is missing about it - the
+    // exemption list and the maker's own buy - is exactly what the analysis
+    // leans on hardest.
+    if call.is_none() {
+        v["via"] = json!("unknown entry point");
+        v["decoded"] = json!(false);
+    }
     if let Some(at) = launched_at {
         v["launched_at"] = json!(at);
     }
@@ -85,6 +93,7 @@ pub fn launch_line(
         v["name"] = json!(c.name);
         v["symbol"] = json!(c.symbol);
         v["via"] = json!(c.via);
+        v["decoded"] = json!(true);
         v["creator_fee_recipient"] = json!(format!("{:?}", c.creator_fee_recipient));
         v["buyback_enabled"] = json!(c.buyback_enabled);
         // The wallets that pay no snipe tax at all. On these launches this is

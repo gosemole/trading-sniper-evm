@@ -231,6 +231,9 @@ pub struct Wanted {
     pub launched_at: Option<u64>,
     /// The pair token nothing knows about yet, if there is one.
     pub want_quote: Option<Address>,
+    /// The curve to read the launch's terms off, when the calldata that would
+    /// have carried them did not decode.
+    pub want_terms: Option<Address>,
 }
 
 /// A launch with everything the endpoint had to be asked for already in hand.
@@ -250,6 +253,10 @@ pub struct Resolved {
     pub launched_at: Option<u64>,
     /// The pair token that had to be looked up, and what it turned out to be.
     pub quote: Option<(Address, Quote, Option<PairEconomics>)>,
+    /// The creator tax and curve fee, read off the curve because the calldata
+    /// did not say. Present only for a launch through an entry point this does
+    /// not decode.
+    pub terms: Option<(u64, u64)>,
 }
 
 /// Boxed for the same reason as the rest of this enum: a trade is a couple of
@@ -1025,6 +1032,24 @@ pub async fn read_snipe_tax(http: &Provider<Http>, factory: Address) -> Result<S
     Ok(SnipeTax { start_bps, seconds })
 }
 
+/// The two terms a launch's calldata would have said, read off the curve.
+///
+/// A launch through an entry point this does not decode has no calldata worth
+/// anything: no name, no exemption list, and - the one that matters - no
+/// creator tax. Without that the opening curve cannot be built, so those
+/// launches were not merely undecided about, they were not followed at all,
+/// and nothing about them reached the journals.
+///
+/// The curve itself knows. One call, off the loop that decides, and a launch
+/// through a wrapper is followed like any other - marked as one, because what
+/// is still missing about it is real: who was exempted from the snipe tax, and
+/// whether the maker bought their own launch.
+pub async fn read_curve_terms(http: &Provider<Http>, curve: Address) -> Option<(u64, u64)> {
+    let creator_tax_bps = call_u64(http, curve, "creatorTaxBps()").await.ok()?;
+    let fee_bps = call_u64(http, curve, "feeBps()").await.ok()?;
+    Some((creator_tax_bps, fee_bps))
+}
+
 /// One entry of the factory's launch configuration table.
 ///
 /// A launch names its own by id, and the id is in its log. Everything a curve
@@ -1243,6 +1268,10 @@ pub struct Report<'a> {
     pub lead: Option<std::time::Duration>,
     /// Why this launch is not being followed, when it is not.
     pub refused: Option<&'a str>,
+    /// How it was made, when the calldata did not say and the curve was asked
+    /// instead. Marks the entry so a launch through a wrapper is not read as
+    /// an ordinary one with fields missing.
+    pub via: Option<&'a str>,
 }
 
 /// What a launch is quoted in, from whichever of its two accounts knows.
@@ -1550,8 +1579,13 @@ pub fn render(r: &Report) -> String {
     }
 
     out += &format!("\n  tx         {}", short_tx(&any.tx));
-    if let Some(c) = r.call {
-        out += &format!("   via {}", c.via);
+    match (r.call, r.via) {
+        (Some(c), _) => out += &format!("   via {}", c.via),
+        // Said out loud rather than left blank: this launch is followed and
+        // priced like any other, but nobody could read who was exempted from
+        // the snipe tax or whether the maker bought their own launch.
+        (None, Some(v)) => out += &format!("   via {v} (terms read off the curve)"),
+        (None, None) => {}
     }
     // Only when something unexpected said it. In the ordinary case these are
     // the two known contracts on every single entry, which is a line nobody
@@ -2688,4 +2722,35 @@ mod tests {
         pending.block_number = None;
         assert!(decode(&pending).is_err());
     }
+    /// A launch through an entry point this does not decode is followed like
+    /// any other now - its terms come off the curve rather than out of the
+    /// calldata - and the entry has to say so. Read as an ordinary launch with
+    /// blank fields it would look like one whose maker put in nothing and
+    /// exempted nobody, which is the opposite of not knowing.
+    #[test]
+    fn a_launch_through_an_unknown_entry_point_says_so() {
+        let created = launch_of(&log(
+            PONS_V2_FACTORY,
+            token_launched_topic(),
+            "0000000000000000000000000000000000000000",
+            0,
+            4_200_000_000_000_000_000,
+        ));
+        let out = render(&Report {
+            created: Some(&created),
+            via: Some("unknown entry point"),
+            ..Default::default()
+        });
+        assert!(out.contains("via unknown entry point"), "{out}");
+        assert!(out.contains("terms read off the curve"), "{out}");
+
+        // And an ordinary one still says how it was made, with no such note.
+        let plain = render(&Report {
+            created: Some(&created),
+            ..Default::default()
+        });
+        assert!(!plain.contains("unknown entry point"), "{plain}");
+        assert!(!plain.contains("terms read off the curve"), "{plain}");
+    }
+
 }

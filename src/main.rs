@@ -441,7 +441,10 @@ async fn quote_of(
 fn opening_curve(
     config: Option<&launch::LaunchConfig>,
     economics: Option<&launch::PairEconomics>,
-    call: Option<&launch::LaunchCall>,
+    // The creator's cut. Unknown means unknown: read as zero it would price
+    // every step better than it is, so a launch whose terms nobody could name
+    // is not priced at all.
+    creator_tax_bps: Option<u64>,
     // What the launch itself said it graduates at, which is the one number
     // here that is never in doubt: it is in the log.
     threshold: ethers::types::U256,
@@ -461,9 +464,7 @@ fn opening_curve(
         phantom,
         threshold,
         c.curve_fee_bps,
-        // Unknown means unknown: a creator tax read as zero would price every
-        // step better than it is.
-        call?.creator_tax_bps as u64,
+        creator_tax_bps?,
     )
     .ok()
 }
@@ -1089,10 +1090,17 @@ async fn watch_launches_cmd(
                     lead,
                     mut launched_at,
                     want_quote,
+                    want_terms,
                 } = w;
                 if call.is_none() {
                     call = launch_call(&http, launch.tx).await;
                 }
+                // Only when the calldata really did not decode, which is what
+                // `want_terms` was set for - a decoded call already says both.
+                let terms = match want_terms.filter(|_| call.is_none()) {
+                    Some(curve) => launch::read_curve_terms(&http, curve).await,
+                    None => None,
+                };
                 if launched_at.is_none() {
                     launched_at = block_second(&http, launch.block).await;
                 }
@@ -1107,6 +1115,7 @@ async fn watch_launches_cmd(
                         lead,
                         launched_at,
                         quote,
+                        terms,
                     })))
                     .await
                     .is_err()
@@ -1533,6 +1542,12 @@ async fn watch_launches_cmd(
                     });
                     let want_quote = launch::pair_of(&l, sighted.as_ref().map(|(_, c, _)| c))
                         .filter(|p| !quotes.contains_key(p) || !economics.contains_key(p));
+                    // A launch through an entry point this does not decode
+                    // still has a curve, and the curve knows its own terms.
+                    // Without them it was not followed at all.
+                    let want_terms = (sighted.is_none()
+                        && matches!(l.what, launch::What::Created { .. }))
+                    .then_some(l.curve);
                     if wanting
                         .send(launch::Wanted {
                             launch: *l,
@@ -1540,6 +1555,7 @@ async fn watch_launches_cmd(
                             lead: sighted.as_ref().map(|(seen, _, _)| seen.elapsed()),
                             launched_at: cached_at,
                             want_quote,
+                            want_terms,
                         })
                         .await
                         .is_err()
@@ -1553,7 +1569,11 @@ async fn watch_launches_cmd(
                 // and the `TokenLaunched` of the same transaction resolving
                 // out of order is a dev buy printed without its launch.
                 Some(launch::Heard::Ready(r)) => {
-                    let launch::Resolved { launch, call, lead, launched_at, quote } = *r;
+                    let launch::Resolved { launch, call, lead, launched_at, quote, terms } = *r;
+                    // Followed and priced like any other, and said so on the
+                    // entry: what is missing about it is the exemption list and
+                    // the maker's own buy, which is what the analysis leans on.
+                    let marked = call.is_none().then_some("unknown entry point");
                     let l = Box::new(launch);
                     if let Some((token, q, e)) = quote {
                         if let Some(e) = e {
@@ -1584,10 +1604,12 @@ async fn watch_launches_cmd(
                     }) {
                         let Held { launch: p, call, lead, launched_at, refused } =
                             pending.take().expect("just checked");
+                        let marked = call.is_none().then_some("unknown entry point");
                         let pair = launch::pair_of(&p, call.as_ref());
                         println!("{}", launch::render(&launch::Report {
                             created: Some(&p),
                             dev: Some(&l),
+                            via: marked,
                             launched_at,
                             quote: pair.and_then(|t| quotes.get(&t)),
                             call: call.as_ref(),
@@ -1601,6 +1623,7 @@ async fn watch_launches_cmd(
                     if let Some(Held { launch: p, call, lead, launched_at, refused }) =
                         pending.take()
                     {
+                        let marked = call.is_none().then_some("unknown entry point");
                         let pair = launch::pair_of(&p, call.as_ref());
                         println!("{}", launch::render(&launch::Report {
                             created: Some(&p),
@@ -1610,6 +1633,7 @@ async fn watch_launches_cmd(
                             lead,
                             launched_at,
                             refused: refused.as_deref(),
+                            via: marked,
                             ..Default::default()
                         }));
                     }
@@ -1633,10 +1657,16 @@ async fn watch_launches_cmd(
                             // before it has traded and they do not change, so a
                             // launch refused here is not watched, not journalled
                             // and not asked about again.
+                            // From the calldata when it decoded, and from the
+                            // curve itself when it did not.
+                            let creator_tax_bps = call
+                                .as_ref()
+                                .map(|c| c.creator_tax_bps as u64)
+                                .or(terms.map(|(t, _)| t));
                             if let Some(opening) = opening_curve(
                                 config.as_ref(),
                                 economics.get(&pair_token),
-                                call.as_ref(),
+                                creator_tax_bps,
                                 launch::threshold_of(&l).unwrap_or_default(),
                             ) {
                                 if followed.len() >= 64 {
@@ -1688,12 +1718,19 @@ async fn watch_launches_cmd(
                                         .get(&pair_token)
                                         .map(|q| q.decimals)
                                         .unwrap_or(18),
-                                    creator_tax_bps: call
-                                        .as_ref()
-                                        .map(|c| c.creator_tax_bps as u64)
-                                        .unwrap_or(0),
+                                    creator_tax_bps: creator_tax_bps.unwrap_or(0),
                                     exempt: exempt.len(),
-                                    via: call.as_ref().map(|c| c.via).unwrap_or(""),
+                                    // Marked, not hidden. A launch through an
+                                    // entry point this does not decode is
+                                    // followed like any other now, but what is
+                                    // missing about it is real: who was
+                                    // exempted from the snipe tax, and whether
+                                    // the maker bought their own launch.
+                                    via: match call.as_ref() {
+                                        Some(c) => c.via,
+                                        None if terms.is_some() => "unknown entry point",
+                                        None => "",
+                                    },
                                     // The maker's own money, from the calldata
                                     // and so known before the block exists.
                                     dev_buy_x100: snipe::dev_buy_x100(
@@ -1830,6 +1867,7 @@ async fn watch_launches_cmd(
                                 // so nothing is waited for.
                                 println!("{}", launch::render(&launch::Report {
                                     created: Some(&l),
+                                    via: marked,
                                     quote: quotes.get(&pair_token),
                                     call: call.as_ref(),
                                     tax,
@@ -1845,6 +1883,7 @@ async fn watch_launches_cmd(
                         launch::What::DevBuy { .. } => {
                             println!("{}", launch::render(&launch::Report {
                                 dev: Some(&l),
+                                via: marked,
                                 quote: launch::pair_of(&l, call.as_ref())
                                     .and_then(|t| quotes.get(&t)),
                                 call: call.as_ref(),
@@ -1862,9 +1901,11 @@ async fn watch_launches_cmd(
             _ = tokio::time::sleep_until(deadline), if pending.is_some() => {
                 let Held { launch: p, call, lead, launched_at, refused } =
                     pending.take().expect("just checked");
+                let marked = call.is_none().then_some("unknown entry point");
                 let pair = launch::pair_of(&p, call.as_ref());
                 println!("{}", launch::render(&launch::Report {
                     created: Some(&p),
+                    via: marked,
                     quote: pair.and_then(|t| quotes.get(&t)),
                     call: call.as_ref(),
                     tax,
