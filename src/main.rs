@@ -326,6 +326,10 @@ async fn fire(
     gas: ethers::types::U256,
     curve: ethers::types::Address,
     leg: launch::Leg,
+    // What decided this. A step and its tax on the way in, the rule that fired
+    // and which attempt this is on the way out. Not `why`, which below is what
+    // the CHAIN said - a line carrying both wants them named apart.
+    reason: String,
     // When the thing that caused this was seen. The gap between that and the
     // broadcast below is the only part of an exit's lateness that is ours -
     // everything after it belongs to the sequencer - and it was never measured,
@@ -339,7 +343,7 @@ async fn fire(
         match swap::send_nowait(&to, &wallet, &tx, nonce.into(), fees, gas).await {
             Ok(hash) => {
                 tracing::info!(
-                    ?leg, ?curve, ?hash, nonce,
+                    ?leg, ?curve, reason = %reason, ?hash, nonce,
                     ours_ms = decided.elapsed().as_millis() as u64,
                     "sent"
                 );
@@ -364,7 +368,8 @@ async fn fire(
         swap::pending_nonce(&http, owner).await.ok()
     };
     if !ok {
-        tracing::warn!(?leg, ?curve, ?hash, why = %why, "did not land");
+        // Both: what we were doing, and what the chain made of it.
+        tracing::warn!(?leg, ?curve, reason = %reason, ?hash, why = %why, "did not land");
     }
     let _ = out
         .send(launch::Heard::Landed(Box::new(launch::Settled {
@@ -1056,6 +1061,12 @@ async fn watch_launches_cmd(
         /// finally sold - and two of them writing `done` is a file that says
         /// the launch ended twice.
         finished: bool,
+        /// Which rule ordered the sale. Carried because the transaction is
+        /// signed somewhere else and often more than once, and "leg=Sell" with
+        /// no reason beside it cannot tell a target from a stop from a curve
+        /// that simply went quiet - which is the first thing to know when a
+        /// sale fills a third below its quote.
+        exit_why: &'static str,
         /// The block the exit fired on, plus the lag a sale actually takes.
         /// Without a wallet there is no sale to learn the outcome from, so the
         /// outcome is the price at this block instead of the price the rule
@@ -1228,15 +1239,26 @@ async fn watch_launches_cmd(
                 realized.1 += *quote_out;
                 tracing::info!(
                     curve = ?f.facts.curve,
-                    out = %launch::amount_of(*quote_out, f.quote_decimals),
+                    reason = f.exit_why,
                     r#in = %launch::amount_of(f.sent, f.quote_decimals),
+                    out = %launch::amount_of(*quote_out, f.quote_decimals),
                     symbol = %f.facts.quote_symbol,
+                    // The whole point in one figure: what came back per unit
+                    // that went out.
+                    x100 = %f
+                        .shadow
+                        .map(|h| format!("{}.{:02}x", h.x100(*quote_out) / 100, h.x100(*quote_out) % 100))
+                        .unwrap_or_else(|| "-".to_string()),
+                    tries = f.sell_tries,
                     "position closed on chain"
                 );
                 // The outcome, at last, and from the chain rather than from
                 // the model that ordered the sale. The rule fired on a price
                 // two or three blocks ago; this is the price it got.
-                close_shadow(f, *quote_out, "sold", block, tally, ops, ops_dirty);
+                // Filed under the rule that ordered it, not under the fact
+                // that it happened: a journal saying "sold" says nothing a
+                // reader could not already see.
+                close_shadow(f, *quote_out, f.exit_why, block, tally, ops, ops_dirty);
             }
             _ => {}
         }
@@ -1304,6 +1326,7 @@ async fn watch_launches_cmd(
             tracing::warn!(err = %format!("{e:#}"), "cannot write the exit");
         }
         f.leaving = true;
+        f.exit_why = why;
         // With money in it, the outcome is not this number. This is what the
         // model thought the position was worth when the rule fired; what the
         // position RETURNS is what the curve pays when the sale lands, two or
@@ -1478,6 +1501,10 @@ async fn watch_launches_cmd(
             t.gas,
             at,
             launch::Leg::Sell,
+            match f.sell_tries {
+                1 => f.exit_why.to_string(),
+                n => format!("{}, try {n}", f.exit_why),
+            },
             decided,
             tx.clone(),
         ));
@@ -2300,6 +2327,9 @@ async fn watch_launches_cmd(
                                                         t.gas,
                                                         *curve_addr,
                                                         launch::Leg::Buy,
+                                                        format!(
+                                                            "+{step}s at {tax_bps} bps"
+                                                        ),
                                                         // The tick this was
                                                         // decided on.
                                                         now,
@@ -3140,6 +3170,7 @@ async fn watch_launches_cmd(
                                         selling: false,
                                         leaving: false,
                                         finished: false,
+                                        exit_why: "",
                                         exit_at: None,
                                         lost: false,
                                         filled: None,
