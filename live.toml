@@ -61,21 +61,42 @@ max_run_x100        = 1000000
 max_exempt          = 100000
 require_dev_buy     = false
 
-# The exit, measured with one block between seeing a price and selling into it.
+# The exit, measured with TWO blocks between seeing a price and selling into
+# it, which is what the chain does: a sale broadcast at 22:42:49.279 was
+# included at 22:42:49.459.
 #
 # Two allowances, not one. On the way in, 1%: the price barely moves inside the
 # block being aimed at, and what guards the tax is the wrapper, exactly, not
-# this. On the way out, 3%: the stop fires BECAUSE the price gave back 5% of
-# its high, so the floor is set at the moment the price is moving fastest and
-# the sale lands a block later. The measurement behind every number in this
-# file priced the exit one block later and filled it with no floor at all - 3%
-# is the closest a real floor gets to that, and it stays under the 5% trail so
-# a fill never gives back more than the stop itself tolerates.
+# this. On the way out, 3%: the sale lands two blocks after the price it was
+# quoted at, and the measurement behind every number in this file filled the
+# exit with no floor at all - 3% is the closest a real floor gets to that.
+#
+# It is NOT tied to the trail below, though it once was. A floor that has to
+# stay under the stop cannot survive the stop being tightened, and tightening
+# it is what 210 launches ask for. A tighter floor is not free either: it
+# reverts on moves that would have filled, and each retry lands three blocks
+# later on a curve that can travel 30% in two.
 slippage_bps      = 100
 exit_slippage_bps = 300
 max_tax_bps  = 19
 lead_ms      = 100
-trail_bps    = 500
+
+# Three, not five, and the tightest the evidence supports rather than the
+# widest. A stop keeps less of itself the later the sale lands, and the sale
+# lands two blocks late - so the narrower band gives up less to those blocks.
+# Over 210 traded launches, with the take below in front of it:
+#
+#     2%  +18.5 stakes   47% win
+#     3%  +17.5           47%
+#     4%  +15.5           46%
+#     5%  +15.3           45%     <- what this was
+#
+# Monotone, which is what makes it a property rather than a spike. Not 2%,
+# because the one stake between it and 3% is inside the noise on 210 launches
+# and a 2% band can be broken by one small trade of somebody else's - while 3%
+# is also the best trail with no take at all, so it is the only width the
+# journals prefer twice.
+trail_bps    = 300
 take_x100    = 200
 hold_blocks  = 588
 operators    = "operators.json"

@@ -392,15 +392,19 @@ fn validate(cfg: &Config) -> anyhow::Result<()> {
         cfg.snipe.exit_slippage_bps < 10_000,
         "[snipe] exit_slippage_bps is the whole position"
     );
-    // The stop exists to cap the give-back at `trail_bps`. An exit allowed to
-    // be filled further below that than the stop itself tolerates gives back
-    // more than the rule was measured allowing, every time it fires.
-    if cfg.snipe.exit_slippage_bps >= cfg.snipe.trail_bps {
+    // Against a fixed width, not against the stop. That comparison was the
+    // wrong relation: the trail decides WHEN to sell and this decides the
+    // worst fill worth taking, and they answer to different things. Tying them
+    // together meant that measuring a tighter stop - which two hundred
+    // launches say is better - would have forced a tighter floor, and a
+    // tighter floor is not free: it reverts on moves that would have filled,
+    // and each retry lands three blocks later on a curve that can travel 30%
+    // in two. Wide enough to fill is the point; this only says when it has
+    // stopped bounding anything at all.
+    if cfg.snipe.exit_slippage_bps >= 1_000 {
         tracing::warn!(
             exit_slippage_bps = cfg.snipe.exit_slippage_bps,
-            trail_bps = cfg.snipe.trail_bps,
-            "[snipe] the exit may be filled further below the high than the stop tolerates, \
-             so a sale can give back more than the rule that ordered it"
+            "[snipe] an exit floor a tenth below the price bounds almost nothing"
         );
     }
     anyhow::ensure!(
@@ -463,14 +467,20 @@ mod tests {
         }
     }
 
-    /// Under the trail, or a sale gives back more than the rule that ordered
-    /// it was measured allowing - every time it fires.
+    /// Wide enough to fill, and not so wide it bounds nothing. The stop is
+    /// deliberately not in this: a floor tied to the trail could not survive
+    /// the trail being tightened, and tightening it is what the journals ask
+    /// for.
     #[test]
-    fn the_exit_allowance_stays_under_the_stop() {
+    fn the_exit_allowance_is_wide_enough_to_fill_and_narrow_enough_to_matter() {
         for (name, cfg) in shipped() {
             assert!(
-                cfg.snipe.exit_slippage_bps < cfg.snipe.trail_bps,
-                "{name}: a fill may give back more than the stop tolerates"
+                cfg.snipe.exit_slippage_bps >= 100,
+                "{name}: a floor this tight reverts on moves that would have filled"
+            );
+            assert!(
+                cfg.snipe.exit_slippage_bps < 1_000,
+                "{name}: a floor a tenth below the price bounds almost nothing"
             );
         }
     }

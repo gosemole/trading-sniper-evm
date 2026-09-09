@@ -7,27 +7,31 @@
 //!
 //! Three rules, in the order they are checked, and each of them earned its
 //! place on the journals rather than being reasoned into existence. Measured
-//! over the 296 launches of one night that the entry filters would have taken,
-//! entering a fixed fraction of each curve and allowing ONE block between
-//! seeing a price and selling into it:
+//! over the 210 launches of six thousand that the entry filters would have
+//! taken, entering a fixed fraction of each curve and allowing TWO blocks
+//! between seeing a price and selling into it:
 //!
-//! | rule                          | total over 296 launches |
-//! |-------------------------------|-------------------------|
-//! | trailing 5% + hard exit at 2x | +43.8 stakes            |
-//! | trailing 5% + hard exit at 1.5x | +34.1                 |
-//! | trailing 5% + hard exit at 3x | +33.3                   |
-//! | trailing 5%                   | +31.9                   |
-//! | trailing 3%                   | +26.8                   |
-//! | trailing 10%                  | +25.6                   |
+//! | rule                            | total over 210 launches | win |
+//! |---------------------------------|-------------------------|-----|
+//! | trailing 2% + hard exit at 2x   | +18.5 stakes            | 47% |
+//! | trailing 3% + hard exit at 2x   | +17.5                   | 47% |
+//! | trailing 4% + hard exit at 2x   | +15.5                   | 46% |
+//! | trailing 5% + hard exit at 2x   | +15.3                   | 45% |
+//! | trailing 3% + hard exit at 3x   | +11.7                   | 45% |
+//! | trailing 3%                     | +11.5                   | 45% |
+//! | trailing 5% + hard exit at 1.5x |  +4.6                   | 46% |
 //!
-//! **One block, not none.** Selling into the very trade that broke the stop is
-//! not a fast reaction, it is an impossible one: the trade IS the price move,
-//! and seeing it means the block holding it is already made. That distinction
-//! is worth most of the result - the same measurement at zero blocks reports
-//! +76.5 against +31.9 - and the whole of it sits in that first block. Two
-//! blocks costs +27.4, three costs +27.7, five costs +24.1. So the rules here
-//! are chosen against a delay that can actually be achieved, and nothing is
-//! gained by pretending it could be smaller.
+//! **Two blocks, not one and not none.** Selling into the very trade that
+//! broke the stop is not a fast reaction, it is an impossible one: the trade
+//! IS the price move, and seeing it means the block holding it is already
+//! made. And one block was a guess - trading live, a sale broadcast at
+//! 22:42:49.279 was included at 22:42:49.459, two blocks at this chain's rate,
+//! and a retry landed three blocks after the revert it replaced.
+//!
+//! That delay is most of the result: the same 210 launches report +47.8 stakes
+//! at zero blocks against +15.3 at two. Which is also why the band is narrow -
+//! a tighter stop keeps more of itself the later the sale lands, and the table
+//! above is monotone in exactly that direction.
 //!
 //! **The target is why the position closes at all on the launches that run.**
 //! Half of them touch 1.5x and a third touch 2x, so a hard exit at twice cost
@@ -108,8 +112,13 @@ pub struct Policy {
     /// The exit's own allowance and not the entry's - they are different
     /// questions. The stop fires BECAUSE the price gave back `trail_bps` of
     /// its high, so this floor is set at the moment the price is moving
-    /// fastest, and the sale lands a block later. Keep it under `trail_bps`,
-    /// or a fill gives back more than the rule that ordered it tolerates.
+    /// fastest, and the sale lands two blocks later.
+    ///
+    /// Not tied to `trail_bps`, though it was: a floor made to stay under the
+    /// stop cannot survive the stop being tightened, and tightening it is what
+    /// the journals ask for. Wide enough to fill is what this is for - a
+    /// tighter floor reverts on moves that would have filled, and each retry
+    /// lands three blocks later on a curve that can travel 30% in two.
     pub slippage_bps: u64,
 }
 
@@ -241,12 +250,12 @@ pub fn render(h: &Held, e: &Exit, decimals: u8, symbol: &str) -> String {
     )
 }
 
-/// The exit that the night's journals preferred, for a caller with nothing to
-/// say about it. Narrow stop, hard exit at twice cost, and a minute.
+/// The exit the journals preferred, for a caller with nothing to say about it.
+/// Narrow stop, hard exit at twice cost, and a minute.
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            trail_bps: 500,
+            trail_bps: 300,
             take_x100: 200,
             // Roughly a minute: this chain runs 9.8 blocks to the second, and
             // a curve nobody has traded in a minute is not about to start.
@@ -289,7 +298,7 @@ mod tests {
     #[test]
     fn the_default_policy_is_the_one_that_was_measured() {
         let p = Policy::default();
-        assert_eq!(p.trail_bps, 500);
+        assert_eq!(p.trail_bps, 300);
         assert_eq!(p.take_x100, 200);
         p.check().unwrap();
     }
