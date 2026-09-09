@@ -128,8 +128,8 @@ def totals(title, groups, rule):
     add up - a fixed fraction of each curve is the same bet in each currency.
     """
     print(f"\n  {title}")
-    print(f"    {'':<24}{'зап':>5}{'итого':>9}{'прибыль':>10}{'убыток':>9}"
-          f"{'лучший':>8}{'пик':>9}{'от пика':>8}{'top10':>7}")
+    print(f"    {'':<24}{'зап':>5}{'win':>5}{'итого':>9}{'на зап':>9}{'прибыль':>10}"
+          f"{'убыток':>9}{'лучший':>8}{'от пика':>8}{'top10':>7}")
     for name, sel in groups:
         g = [r for r in ROWS if sel(r)]
         if not g:
@@ -142,8 +142,13 @@ def totals(title, groups, rule):
         net = sum(out)
         pk = sum(peak)
         top10 = sum(win[:10]) / sum(win) * 100 if win else 0.0
-        print(f"    {name:<24}{len(g):>5}{net:>+9.1f}{sum(win):>+10.1f}{loss:>+9.1f}"
-              f"{max(out, default=0):>+8.1f}{pk:>+9.1f}"
+        # Both, because they answer different questions and a filter can move
+        # them opposite ways: taking fewer, better-looking launches raises the
+        # share that end above cost and can still lower the total, since what
+        # pays here is the few that run.
+        print(f"    {name:<24}{len(g):>5}{100*len(win)//len(g):>4}%{net:>+9.1f}"
+              f"{net/len(g):>+9.3f}{sum(win):>+10.1f}{loss:>+9.1f}"
+              f"{max(out, default=0):>+8.1f}"
               # Meaningless unless there was a peak to capture: a share of a
               # negative number reads as a percentage and is not one.
               f"{(100*net/pk if pk > 0 else 0):>7.0f}%{top10:>6.0f}%")
@@ -271,6 +276,22 @@ def main():
         ("бандл: 2 - 4", lambda r: 2 <= r["window_bundled"] <= 4),
         ("бандл: >= 5", lambda r: r["window_bundled"] >= 5)], rule)
 
+    # How far the price had already gone when we bought, and how much of the
+    # bundle was already in. Both are knowable at the moment of the decision
+    # and neither is used by any filter - and both speak to the same thing the
+    # live run kept meeting: a launch that has already been pumped is a launch
+    # whose bundle is sitting on a profit, and we are what they sell it to.
+    report("цена на входе, к открытию", [
+        ("ниже открытия", lambda r: r["run_at_entry"] < 1.0),
+        ("1.0 - 1.2x", lambda r: 1.0 <= r["run_at_entry"] < 1.2),
+        ("1.2 - 2x", lambda r: 1.2 <= r["run_at_entry"] < 2.0),
+        (">= 2x", lambda r: r["run_at_entry"] >= 2.0)], rule)
+    report("бандл, купивший ДО нашего входа", [
+        ("0", lambda r: r.get("bundled_before", 0) == 0),
+        ("1", lambda r: r.get("bundled_before", 0) == 1),
+        ("2 - 4", lambda r: 2 <= r.get("bundled_before", 0) <= 4),
+        (">= 5", lambda r: r.get("bundled_before", 0) >= 5)], rule)
+
     totals("портфель: одна единица в каждый запуск", [
         ("всё", lambda r: True),
         ("exempt = 1", lambda r: r["exempt"] <= 1),
@@ -303,7 +324,16 @@ def main():
         ("  + 1 платящий до входа", lambda r: _live(r) and r.get("taxed_before", 0) >= 1),
         ("  + 2 платящих до входа", lambda r: _live(r) and r.get("taxed_before", 0) >= 2),
         ("  + 3 платящих до входа", lambda r: _live(r) and r.get("taxed_before", 0) >= 3),
-        ("  и НИ одного платящего", lambda r: _live(r) and r.get("taxed_before", 0) == 0)],
+        ("  и НИ одного платящего", lambda r: _live(r) and r.get("taxed_before", 0) == 0),
+        # Fewer trades and a better one, if either of these separates: buying
+        # only what has not run yet, or only what the bundle has not finished
+        # loading into. Both cut the count, which is the point - the question
+        # is whether they cut the losses faster than the wins.
+        ("  + цена ниже 1.2x", lambda r: _live(r) and r["run_at_entry"] < 1.2),
+        ("  + цена ниже 1.05x", lambda r: _live(r) and r["run_at_entry"] < 1.05),
+        ("  + бандл вошёл <= 2", lambda r: _live(r) and r.get("bundled_before", 0) <= 2),
+        ("  + оба", lambda r: _live(r) and r["run_at_entry"] < 1.2
+         and r.get("bundled_before", 0) <= 2)],
         rule)
 
     # The live filter, against the delay it will actually run at and the
