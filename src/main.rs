@@ -326,6 +326,11 @@ async fn fire(
     gas: ethers::types::U256,
     curve: ethers::types::Address,
     leg: launch::Leg,
+    // When the thing that caused this was seen. The gap between that and the
+    // broadcast below is the only part of an exit's lateness that is ours -
+    // everything after it belongs to the sequencer - and it was never measured,
+    // so "we are slow" and "the chain is" could not be told apart.
+    decided: std::time::Instant,
     out: tokio::sync::mpsc::Sender<launch::Heard>,
 ) {
     let owner = ethers::signers::Signer::address(&wallet);
@@ -333,7 +338,11 @@ async fn fire(
     let (ok, pending, hash, why) =
         match swap::send_nowait(&to, &wallet, &tx, nonce.into(), fees, gas).await {
             Ok(hash) => {
-                tracing::info!(?leg, ?curve, ?hash, nonce, "sent");
+                tracing::info!(
+                    ?leg, ?curve, ?hash, nonce,
+                    ours_ms = decided.elapsed().as_millis() as u64,
+                    "sent"
+                );
                 let landed = swap::await_receipt(&http, hash, &tx.label).await;
                 let ok = landed.outcome == swap::Outcome::Confirmed;
                 cost = landed.cost;
@@ -1369,6 +1378,8 @@ async fn watch_launches_cmd(
         http: &ethers::providers::Provider<ethers::providers::Http>,
         tx: &tokio::sync::mpsc::Sender<launch::Heard>,
         base_fee: &std::sync::RwLock<ethers::types::U256>,
+        // When the trade that triggered this arrived, or the tick that did.
+        decided: std::time::Instant,
         second: u64,
         // The EXIT allowance. Recomputed here rather than carried from the
         // `Exit::Sell` that ordered this, because a retry is signed blocks
@@ -1467,6 +1478,7 @@ async fn watch_launches_cmd(
             t.gas,
             at,
             launch::Leg::Sell,
+            decided,
             tx.clone(),
         ));
     }
@@ -2001,6 +2013,7 @@ async fn watch_launches_cmd(
                             http,
                             &tx,
                             &base_fee,
+                            now,
                             chain_now,
                             exit_slippage_bps,
                         );
@@ -2287,6 +2300,9 @@ async fn watch_launches_cmd(
                                                         t.gas,
                                                         *curve_addr,
                                                         launch::Leg::Buy,
+                                                        // The tick this was
+                                                        // decided on.
+                                                        now,
                                                         tx.clone(),
                                                     ));
                                                 }
@@ -2350,6 +2366,7 @@ async fn watch_launches_cmd(
                     sightings.insert(i.tx, (i.seen, i.call, i.chain_time));
                 }
                 Some(launch::Heard::Trade(t)) => {
+                    let arrived = std::time::Instant::now();
                     let launch::TradeAt { curve: at, block, index, trade } = *t;
                     // A launch is followed for a minute and then let go. The
                     // sweep below only ran when the map filled up, so a quiet
@@ -2503,6 +2520,9 @@ async fn watch_launches_cmd(
                         http,
                         &tx,
                         &base_fee,
+                        // The moment this trade reached the loop. Everything
+                        // between here and the broadcast is ours to answer for.
+                        arrived,
                         chain_second(&second_anchor),
                         exit_slippage_bps,
                     );

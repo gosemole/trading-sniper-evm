@@ -944,21 +944,25 @@ pub async fn watch_curves(
         .await
         .context("subscribe to curve trades")?;
     info!("watching curve trades");
-    // Trades for curves not yet spoken for. Small and short-lived: this is a
-    // race of milliseconds, not a queue.
-    // Every curve on the chain lands here until its launch is recognised, and
-    // the launches worth catching are the ones whose whole opening bundle
-    // arrives in one block. Five hundred entries were a couple of seconds of
-    // chain traffic - the bundle was evicted before its own launch was read.
+    // Trades for curves not yet spoken for. Every curve on the chain lands
+    // here until its launch is recognised, and the launches worth catching are
+    // the ones whose whole opening bundle arrives in one block. Five hundred
+    // entries were a couple of seconds of chain traffic - the bundle was
+    // evicted before its own launch was read.
+    //
+    // Keyed by curve, and that is not tidiness. This was a flat queue of up to
+    // 8192 trades, and every log on the chain scanned all of them twice: once
+    // asking whether each entry's curve had become ours, once asking whether
+    // it had expired. That is sixteen thousand operations per log, on the one
+    // path that carries the trade an exit decision is made from. Now the scan
+    // is over the CURVES held - tens, not thousands - and the trades under
+    // each are touched only when that curve is claimed or times out.
     const HOLD_AT_MOST: usize = 8192;
     const HOLD_FOR: std::time::Duration = std::time::Duration::from_secs(5);
-    let mut held: std::collections::VecDeque<(
-        std::time::Instant,
-        Address,
-        u64,
-        u64,
-        crate::curve::Trade,
-    )> = std::collections::VecDeque::new();
+    type Pending = (std::time::Instant, u64, u64, crate::curve::Trade);
+    let mut held: std::collections::HashMap<Address, Vec<Pending>> =
+        std::collections::HashMap::new();
+    let mut held_count: usize = 0;
 
     while let Some(log) = stream.next().await {
         if log.removed.unwrap_or(false) {
@@ -987,34 +991,49 @@ pub async fn watch_curves(
         // on it can be forty blocks later. Until then the reserves stood at
         // the opening ones, and every decision made in those seconds was made
         // against a curve that no longer existed.
+        // Which held curves have since been claimed, and which have waited
+        // long enough. One pass over the CURVES, not over their trades.
         if !held.is_empty() {
-            let known: Vec<usize> = match followed.read() {
-                Ok(f) => held
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, c, _, _, _))| f.contains(c))
-                    .map(|(i, _)| i)
-                    .collect(),
-                Err(_) => Vec::new(),
+            let (claimed, stale): (Vec<Address>, Vec<Address>) = match followed.read() {
+                Ok(f) => {
+                    let mut claimed = Vec::new();
+                    let mut stale = Vec::new();
+                    for (curve, waiting) in held.iter() {
+                        if f.contains(curve) {
+                            claimed.push(*curve);
+                        } else if waiting.iter().all(|(at, ..)| at.elapsed() >= HOLD_FOR) {
+                            stale.push(*curve);
+                        }
+                    }
+                    (claimed, stale)
+                }
+                Err(_) => (Vec::new(), Vec::new()),
             };
-            for i in known.into_iter().rev() {
-                let Some((_, c, b, ix, t)) = held.remove(i) else {
-                    continue;
-                };
-                if out
-                    .send(Heard::Trade(Box::new(TradeAt {
-                        curve: c,
-                        block: b,
-                        index: ix,
-                        trade: t,
-                    })))
-                    .await
-                    .is_err()
-                {
-                    return Ok(());
+            for curve in stale {
+                if let Some(gone) = held.remove(&curve) {
+                    held_count -= gone.len();
                 }
             }
-            held.retain(|(at, _, _, _, _)| at.elapsed() < HOLD_FOR);
+            for curve in claimed {
+                let Some(waiting) = held.remove(&curve) else { continue };
+                held_count -= waiting.len();
+                // In the order it happened: the reserves only add up if the
+                // trades are applied the way the chain applied them.
+                for (_, b, ix, t) in waiting {
+                    if out
+                        .send(Heard::Trade(Box::new(TradeAt {
+                            curve,
+                            block: b,
+                            index: ix,
+                            trade: t,
+                        })))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         // A curve nobody asked for is dropped here rather than in the loop
@@ -1022,10 +1041,24 @@ pub async fn watch_curves(
         // firehose in front of the launch signals does not merely waste work,
         // it delays the thing being measured.
         if !followed.read().is_ok_and(|f| f.contains(&log.address)) {
-            if held.len() >= HOLD_AT_MOST {
-                held.pop_front();
+            // Full: drop whichever curve has waited longest. Dropping one
+            // trade out of the middle of a bundle would leave the rest
+            // unapplyable anyway - reserves only add up whole.
+            if held_count >= HOLD_AT_MOST {
+                if let Some(oldest) = held
+                    .iter()
+                    .min_by_key(|(_, w)| w.first().map(|(at, ..)| *at))
+                    .map(|(c, _)| *c)
+                {
+                    if let Some(gone) = held.remove(&oldest) {
+                        held_count -= gone.len();
+                    }
+                }
             }
-            held.push_back((std::time::Instant::now(), log.address, block, index, trade));
+            held.entry(log.address)
+                .or_default()
+                .push((std::time::Instant::now(), block, index, trade));
+            held_count += 1;
             continue;
         }
 
