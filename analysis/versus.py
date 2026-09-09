@@ -29,8 +29,11 @@ import sys
 
 from replay import units, sell
 
-# The exit as live.toml has it, and the lag the chain actually has.
-TRAIL_PCT = 5
+# The exit as live.toml has it, and the lag the chain actually has. These have
+# to be kept level with the config: a comparison run at a stop the bot is not
+# using answers a question nobody asked, and it answers it plausibly, which is
+# worse than failing.
+TRAIL_PCT = 3
 TAKE = 2.0
 LAG = 2
 
