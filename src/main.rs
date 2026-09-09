@@ -2282,6 +2282,18 @@ async fn watch_launches_cmd(
                     // not one - it is the absence of a wallet.
                     if !realized.0.is_zero() {
                         let (paid, back) = realized;
+                        // What is still in the market. Counted in `paid` the
+                        // moment the buy lands and in `back` only when the
+                        // sale does, so between the two the line reported an
+                        // open position as a total loss - 39 mETH down at one
+                        // tick and 24 at the next, with nothing having gone
+                        // wrong in between. Neither profit nor loss until it
+                        // closes, so it is taken out of the result and named.
+                        let open = followed
+                            .values()
+                            .filter(|f| f.holding())
+                            .fold(ethers::types::U256::zero(), |a, f| a + f.sent);
+                        let paid = paid.saturating_sub(open);
                         // Trading and gas as two numbers and then as one.
                         // Separately because they answer different questions -
                         // whether the rules work, and whether they work at
@@ -2294,6 +2306,7 @@ async fn watch_launches_cmd(
                         tracing::info!(
                             paid = %launch::amount_of(paid, 18),
                             back = %launch::amount_of(back, 18),
+                            open = %launch::amount_of(open, 18),
                             trading = %gross(back, paid),
                             gas = %launch::amount_of(gas_paid, 18),
                             net = %gross(back, paid + gas_paid),
