@@ -65,6 +65,20 @@ pub fn snipe(
 /// unless told otherwise: an exact figure a wei off what the wrapper holds
 /// reverts, and a revert on the way out keeps a position while the price it
 /// was leaving falls.
+/// Everything the wrapper holds of one curve's token, at any price.
+///
+/// The escape hatch, for a position a run left behind - killed mid-trade, or
+/// gone before its sale landed. `min_quote_out` is zero and the deadline is
+/// none, which is exactly what makes it an escape hatch and exactly why it is
+/// not something the bot may reach: a sale with no floor is a sale at whatever
+/// price is arranged for it. Reached only by a person who has decided that
+/// being out matters more than the price of being out.
+pub fn bail_out(wrapper: Address, curve: Address) -> PendingTx {
+    let mut tx = unwind(wrapper, curve, U256::zero(), U256::zero(), 0);
+    tx.label = format!("BAIL OUT {curve:?} at any price");
+    tx
+}
+
 pub fn unwind(
     wrapper: Address,
     curve: Address,
@@ -145,6 +159,32 @@ mod tests {
         assert_eq!(got[3], Token::Address(addr(1)), "recipient is the wrapper");
         assert_eq!(got[4], Token::Uint(U256::from(19u64)), "max tax bps");
         assert_eq!(got[5], Token::Uint(U256::from(1_788_888_888u64)), "not after");
+    }
+
+    /// The escape hatch asks for no floor and no deadline, and both of those
+    /// being zero is what makes it one. A test because a stray minimum here is
+    /// a position that stays stuck at the exact moment somebody is trying to
+    /// get it out.
+    #[test]
+    fn bailing_out_asks_for_the_whole_balance_at_any_price() {
+        let tx = bail_out(addr(1), addr(2));
+        assert_eq!(tx.to, addr(1));
+        assert_eq!(tx.value, U256::zero(), "an ERC-20 sale sends no value");
+        let got = ethers::abi::decode(
+            &[
+                ParamType::Address,
+                ParamType::Uint(256),
+                ParamType::Uint(256),
+                ParamType::Uint(256),
+            ],
+            &tx.data[4..],
+        )
+        .unwrap();
+        assert_eq!(got[0], Token::Address(addr(2)), "the curve");
+        assert_eq!(got[1], Token::Uint(U256::zero()), "zero means the whole balance");
+        assert_eq!(got[2], Token::Uint(U256::zero()), "no floor - this is the point");
+        assert_eq!(got[3], Token::Uint(U256::zero()), "no deadline");
+        assert_eq!(&tx.data[..4], crate::pool::selector(UNWIND).as_ref());
     }
 
     #[test]

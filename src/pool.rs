@@ -113,6 +113,21 @@ pub async fn call_address(provider: &Provider<Http>, to: Address, data: &Bytes) 
     Ok(Address::from_slice(&res[12..32]))
 }
 
+/// One `uint256` off a contract, for the calls that answer with a quantity.
+pub async fn call_u256(
+    provider: &Provider<Http>,
+    to: Address,
+    data: &Bytes,
+) -> Result<ethers::types::U256> {
+    let res: Bytes = crate::rpc::retrying("eth_call u256", || {
+        let tx = TransactionRequest::new().to(to).data(data.clone());
+        async move { provider.call(&tx.into(), None).await.context("eth_call u256") }
+    })
+    .await?;
+    anyhow::ensure!(res.len() >= 32, "short return for u256 call");
+    Ok(ethers::types::U256::from_big_endian(&res[..32]))
+}
+
 async fn call_u8(provider: &Provider<Http>, to: Address, data: &Bytes) -> Result<u8> {
     let res: Bytes = crate::rpc::retrying("eth_call u8", || {
         let tx = TransactionRequest::new().to(to).data(data.clone());

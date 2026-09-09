@@ -51,6 +51,9 @@ async fn main() -> anyhow::Result<()> {
     // the money.
     let execute = args.iter().any(|a| a == "--execute");
     let watch_launches = args.iter().any(|a| a == "--watch-launches");
+    // The escape hatch: sell whatever the wrapper is still holding, at any
+    // price. Typed by a person, never reached by the bot.
+    let bail_out = args.iter().any(|a| a == "--bail-out");
     // Every entry the console used to print is a record in the journal - the
     // entry is `launch`, a step is `decision`, a close is `exit` - so by
     // default the console says what no record can: how the whole run is
@@ -102,6 +105,17 @@ async fn main() -> anyhow::Result<()> {
     // at the first launch if the endpoint is not answering.
     chain_id(&http).await?;
 
+    if bail_out {
+        // Anything after the flag that parses as an address is a curve to
+        // check; none means "read the journals and check them all".
+        let named: Vec<ethers::types::Address> = args
+            .iter()
+            .filter(|a| !a.starts_with("--"))
+            .filter_map(|a| a.parse().ok())
+            .collect();
+        return bail_out_cmd(&http, &cfg, &named, execute).await;
+    }
+
     if watch_launches {
         return watch_launches_cmd(
             &http,
@@ -117,8 +131,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     anyhow::bail!(
-        "nothing to do: this is the launch sniper - see --watch-launches, and \
-         live.toml for what it needs"
+        "nothing to do: this is the launch sniper - see --watch-launches to run it, \
+         --bail-out to sell what a dead run left in the wrapper, and live.toml for \
+         what either needs"
     );
 }
 
@@ -670,6 +685,156 @@ impl Tally {
             n => format!("{}.{:02}x", x100 / n / 100, x100 / n % 100),
         }
     }
+}
+
+/// Sell everything the wrapper is holding, at any price.
+///
+/// The escape hatch this has needed since it started sending money. A run
+/// killed mid-trade leaves tokens in the wrapper, and nothing else knows they
+/// are there: the launch is gone from the followed set, the curve is not being
+/// watched, and the only record is a journal nobody reads at three in the
+/// morning. Until now the answer was `rescue(token, owner)` by hand, per curve,
+/// after finding out which curves to ask about.
+///
+/// Candidates come from the journals - one file per launch, named for its
+/// curve - or from the command line when the journals are elsewhere. For each,
+/// the wrapper's balance of that curve's token is read, and anything it holds
+/// is sold with **no floor and no deadline**.
+///
+/// No floor is the whole point and the whole danger: on a curve anyone is
+/// still trading, a sale with no minimum is a sale at whatever price somebody
+/// arranges around it. This exists for positions the bot can no longer reach,
+/// where being out is worth more than the price of being out, and it is why
+/// this is a command a person types rather than anything the bot may reach.
+async fn bail_out_cmd(
+    http: &ethers::providers::Provider<ethers::providers::Http>,
+    cfg: &config::Config,
+    named: &[ethers::types::Address],
+    sending: bool,
+) -> anyhow::Result<()> {
+    let addr = cfg
+        .snipe
+        .contract
+        .as_ref()
+        .context("[snipe] contract: there is no wrapper to sell out of")?;
+    let wrapper: ethers::types::Address = addr.parse().context("[snipe] contract")?;
+    let owner = pool::call_address(
+        http,
+        wrapper,
+        &ethers::types::Bytes::from(pool::selector("owner()").to_vec()),
+    )
+    .await
+    .context("reading the wrapper's owner")?;
+
+    // The journals name their curve in the filename, which is the only index
+    // of what this wallet has ever bought into that does not need the chain.
+    let mut curves: Vec<ethers::types::Address> = named.to_vec();
+    if curves.is_empty() {
+        let dir = std::path::PathBuf::from("launches");
+        let entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading {} for curves to check", dir.display()))?;
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_suffix(".jsonl") else { continue };
+            let Some((_, curve)) = rest.split_once('-') else { continue };
+            if let Ok(a) = curve.parse::<ethers::types::Address>() {
+                curves.push(a);
+            }
+        }
+        curves.sort_unstable();
+        curves.dedup();
+    }
+    anyhow::ensure!(!curves.is_empty(), "no curves to check: none named, and no journals");
+    tracing::info!(curves = curves.len(), ?wrapper, ?owner, "looking for anything left behind");
+
+    // What is actually held, before anything is signed. A list printed and
+    // then acted on beats a list discovered one transaction at a time.
+    let mut holding = Vec::new();
+    for curve in &curves {
+        let token = match pool::call_address(
+            http,
+            *curve,
+            &ethers::types::Bytes::from(pool::selector("token()").to_vec()),
+        )
+        .await
+        {
+            Ok(t) => t,
+            // A curve that will not answer is a curve that cannot be sold
+            // through either. Said and skipped, not fatal: one bad address
+            // must not stop the rest being recovered.
+            Err(e) => {
+                tracing::debug!(?curve, err = %format!("{e:#}"), "not a curve we can read");
+                continue;
+            }
+        };
+        let mut data = pool::selector("balanceOf(address)").to_vec();
+        data.extend(ethers::abi::encode(&[ethers::abi::Token::Address(wrapper)]));
+        let held = pool::call_u256(http, token, &ethers::types::Bytes::from(data))
+            .await
+            .unwrap_or_default();
+        if !held.is_zero() {
+            tracing::warn!(
+                ?curve, ?token, held = %launch::tokens_of(held),
+                "the wrapper is holding this"
+            );
+            holding.push(*curve);
+        }
+    }
+    if holding.is_empty() {
+        tracing::info!("nothing left behind; the wrapper holds no launched token");
+        return Ok(());
+    }
+    if !sending {
+        tracing::warn!(
+            positions = holding.len(),
+            "found, and NOTHING SENT - add --execute to sell them at any price"
+        );
+        return Ok(());
+    }
+
+    let chain = http.get_chainid().await.context("chain id")?.as_u64();
+    let wallet = swap::load_wallet(cfg, chain)?;
+    let me = ethers::signers::Signer::address(&wallet);
+    anyhow::ensure!(
+        owner == me,
+        "the wrapper at {wrapper:?} is owned by {owner:?}, not by this wallet ({me:?})"
+    );
+    let urls = if cfg.submit_urls.is_empty() {
+        vec![cfg.http_url.clone()]
+    } else {
+        cfg.submit_urls.clone()
+    };
+    let to = swap::Broadcaster::new(&urls)?;
+    let fees = swap::fee_params(http).await?;
+    let gas = ethers::types::U256::from(cfg.snipe.gas_limit);
+    let mut nonce = swap::pending_nonce(http, me).await?;
+
+    // One at a time, and each waited on. There is no window to hit here and
+    // no reason to race: a failure on one of these is a thing to read about
+    // before the next goes out.
+    for curve in holding {
+        let call = wrapper::bail_out(wrapper, curve);
+        match swap::send_nowait(&to, &wallet, &call, nonce.into(), fees, gas).await {
+            Ok(hash) => {
+                let landed = swap::await_receipt(http, hash, &call.label).await;
+                match landed.outcome {
+                    swap::Outcome::Confirmed => {
+                        tracing::info!(?curve, ?hash, "sold out of it");
+                        nonce += 1;
+                    }
+                    other => {
+                        tracing::error!(?curve, ?hash, outcome = ?other, "did not sell");
+                        nonce = swap::pending_nonce(http, me).await.unwrap_or(nonce + 1);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(?curve, err = %format!("{e:#}"), "could not send");
+                nonce = swap::pending_nonce(http, me).await.unwrap_or(nonce);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Watch launchpads and say what launched. Nothing else.

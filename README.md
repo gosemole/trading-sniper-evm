@@ -50,6 +50,26 @@ cargo build --release
 ./target/release/trading-sniper --watch-launches --config live.toml --execute
 ```
 
+If a run dies holding something, the wrapper keeps it and nothing else knows
+it is there. This finds it and sells it at any price:
+
+```bash
+# Says what the wrapper is holding, and sends nothing.
+./target/release/trading-sniper --bail-out --config live.toml
+
+# And sells all of it, with no price floor and no deadline.
+./target/release/trading-sniper --bail-out --config live.toml --execute
+
+# Or just these curves, when the journals are somewhere else.
+./target/release/trading-sniper --bail-out --config live.toml --execute 0xabc... 0xdef...
+```
+
+No floor is what makes it an escape hatch and what makes it dangerous: on a
+curve people are still trading, a sale with no minimum is a sale at whatever
+price is arranged around it. It is for positions the bot can no longer reach,
+where being out is worth more than the price of being out - which is why it is
+a command a person types and nothing the bot can reach on its own.
+
 `--verbose` puts every launch entry, decision and close back on the console.
 Without it the console reports the run as a whole every thirty seconds, and
 everything else lives in the journals.
