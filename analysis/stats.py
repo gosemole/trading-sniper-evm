@@ -354,11 +354,21 @@ def main():
             print(row)
         print(f"\n    {f'выход при задержке {args.lag}':<30}"
               f"{'итого':>9}{'на зап':>9}{'медиана':>10}{'win':>6}")
+        # Both halves of the exit, and every combination of them that matters -
+        # not the trail alone and the take on one trail. A tighter stop loses
+        # less to the lag (at two blocks 3% keeps 36% of what it makes at zero,
+        # 5% keeps 32%, 10% keeps 28%), so whether that survives having a take
+        # in front of it is the one question this table could not answer.
         for name, pct, take in (("трейлинг 5%", 5, None), ("трейлинг 3%", 3, None),
                                 ("трейлинг 10%", 10, None),
+                                ("трейлинг 2% + тейк 2x", 2, 2.0),
+                                ("трейлинг 3% + тейк 2x", 3, 2.0),
+                                ("трейлинг 4% + тейк 2x", 4, 2.0),
                                 ("трейлинг 5% + тейк 1.5x", 5, 1.5),
                                 ("трейлинг 5% + тейк 2x", 5, 2.0),
-                                ("трейлинг 5% + тейк 3x", 5, 3.0)):
+                                ("трейлинг 5% + тейк 3x", 5, 3.0),
+                                ("трейлинг 3% + тейк 1.5x", 3, 1.5),
+                                ("трейлинг 3% + тейк 3x", 3, 3.0)):
             o = [trail(pct, take=take, lag=args.lag)(r) - 1 for r in live]
             print(f"    {name:<30}{sum(o):>+9.1f}{sum(o)/len(o):>+9.3f}"
                   f"{st.median(o):>+10.3f}{100*sum(1 for x in o if x>0)/len(o):>5.0f}%")
