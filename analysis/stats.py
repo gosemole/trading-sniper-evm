@@ -206,12 +206,28 @@ def main():
                          "see trail())")
     ap.add_argument("--exit", default="live",
                     help="live | trail5 | trail10 | trail20 | hold10 | hold20 | hold30")
+    # A window, for the question a whole-file average cannot answer: whether a
+    # stretch the bot actually traded through looked like the rest of the file.
+    # An edge measured over a day says nothing about the two hours it was run
+    # in, and two hours is what a live sample is.
+    ap.add_argument("--from-block", type=int, default=0)
+    ap.add_argument("--to-block", type=int, default=0)
     args = ap.parse_args()
 
     global ROWS
     ROWS = [json.loads(l) for l in open(args.rows)]
+    if args.from_block or args.to_block:
+        lo = args.from_block or 0
+        hi = args.to_block or 10**18
+        before = len(ROWS)
+        ROWS = [r for r in ROWS if lo <= (r.get("block") or 0) <= hi]
+        print(f"  окно {lo}..{hi}: {len(ROWS)} запусков из {before}")
+        if not ROWS:
+            print("  в этом окне нет ни одного запуска")
+            return
     rules = {
-        "live": trail(5, take=2.0, lag=args.lag),
+        # The exit live.toml actually carries, so `--exit live` means it.
+        "live": trail(3, take=2.0, lag=args.lag),
         "trail5": trail(5, lag=args.lag),
         "trail10": trail(10, lag=args.lag),
         "trail20": trail(20, lag=args.lag),
