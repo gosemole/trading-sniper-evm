@@ -246,6 +246,17 @@ def replay(path, size_x100, enter_block):
     outsiders = sorted({row["who"].lower() for row, _, _ in trades
                         if row["kind"] == "buy" and row["who"].lower() not in exempt})
 
+    # The same two counts, but only from before the entry - which is the only
+    # half a decision can actually see. The window ones below run to offset 30
+    # and a buy is decided at 11 to 23, so a rule built on those would be a rule
+    # reading trades that had not happened yet.
+    taxed_before = len({row["who"].lower() for row, _, off in trades
+                        if row["kind"] == "buy" and off < enter_block
+                        and row["who"].lower() not in exempt})
+    bundled_before = sum(1 for row, _, off in trades
+                         if row["kind"] == "buy" and off < enter_block
+                         and row["who"].lower() in exempt)
+
     window_taxed = window_bundled = 0
     dev = 0
     for row, _, off in trades:
@@ -273,6 +284,8 @@ def replay(path, size_x100, enter_block):
         "declared_exempt": len(head.get("declared_exempt", [])),
         "dev_pct": 100 * dev / qr0,
         "window_taxed": window_taxed,
+        "taxed_before": taxed_before,
+        "bundled_before": bundled_before,
         "window_bundled": window_bundled,
         "run_at_entry": run_at_entry,
         "graduated": graduated,

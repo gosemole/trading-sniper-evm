@@ -149,6 +149,16 @@ def totals(title, groups, rule):
               f"{(100*net/pk if pk > 0 else 0):>7.0f}%{top10:>6.0f}%")
 
 
+def _live(r):
+    """What live.toml keeps, so a variant of it is one clause and not five."""
+    return (
+        r["exempt"] >= 6
+        and r["creator_tax_bps"] == 0
+        and 2 <= r["dev_pct"] <= 15
+        and r["pair"] == "ETH"
+    )
+
+
 def halves(rows, seed=7):
     """Split by deployer, so an operator never appears in both sides."""
     who = sorted({r["deployer"] for r in rows})
@@ -284,7 +294,17 @@ def main():
          lambda r: r["exempt"] >= 6
          and r["creator_tax_bps"] == 0
          and 2 <= r["dev_pct"] <= 15
-         and r["pair"] == "ETH")], rule)
+         and r["pair"] == "ETH"),
+        # The same, and somebody who is not in the bundle has already paid to
+        # get in. The whole pattern the live run kept hitting is a launch
+        # where the only buyer outside the bundle is us - which makes us the
+        # exit, and the bundle takes it. Counted only from BEFORE the entry,
+        # because that is the half a decision can see.
+        ("  + 1 платящий до входа", lambda r: _live(r) and r.get("taxed_before", 0) >= 1),
+        ("  + 2 платящих до входа", lambda r: _live(r) and r.get("taxed_before", 0) >= 2),
+        ("  + 3 платящих до входа", lambda r: _live(r) and r.get("taxed_before", 0) >= 3),
+        ("  и НИ одного платящего", lambda r: _live(r) and r.get("taxed_before", 0) == 0)],
+        rule)
 
     # The live filter, against the delay it will actually run at and the
     # widths it might run at. Two tables, because the answer to "is this worth
@@ -337,6 +357,30 @@ def main():
                 rest = drop[k:]
                 print(f"    без {k:>2} лучших: {sum(rest):+.1f} ставок "
                       f"на {len(rest)} запусках ({sum(rest)/len(rest):+.3f} на зап)")
+
+        # The two numbers that decide a size and a loss cap, and neither of
+        # which an average can give: how far down the worst stretch went, and
+        # how long it lasted. In order of launch, because a drawdown is a
+        # statement about a sequence.
+        seq = sorted(live, key=lambda r: r.get("block") or 0)
+        walk = [rule(r) - 1 for r in seq]
+        equity = peak = 0.0
+        drop = 0.0
+        run = worst_run = 0
+        run_cost = worst_run_cost = 0.0
+        for x in walk:
+            equity += x
+            peak = max(peak, equity)
+            drop = min(drop, equity - peak)
+            if x < 0:
+                run += 1
+                run_cost += x
+                if run > worst_run:
+                    worst_run, worst_run_cost = run, run_cost
+            else:
+                run, run_cost = 0, 0.0
+        print(f"\n    худшая просадка от пика   {drop:+.1f} ставок")
+        print(f"    подряд убыточных          {worst_run}, вместе {worst_run_cost:+.1f} ставок")
 
         # And in money, because a stake is a share of each curve and they
         # differ - the sum of multiples is not what a wallet would show.
