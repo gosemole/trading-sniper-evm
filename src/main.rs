@@ -2011,12 +2011,18 @@ async fn watch_launches_cmd(
                     "[snipe] max_spend is not set: nothing will stop this run losing the                      whole wallet"
                 );
             }
-            // A cap the wallet cannot reach is not a cap either.
-            if max_spend.is_some_and(|c| c >= balance) {
-                tracing::error!(
-                    balance = %units::format_units(balance, 18),
-                    cap = %units::format_units(max_spend.unwrap_or_default(), 18),
-                    "[snipe] max_spend is at or above the whole balance; the wallet runs out                      before the cap does"
+            // A cap the wallet cannot reach is worse than no cap: it reads as
+            // protection and is not there. Refused rather than warned about,
+            // because the run it lets through is the one that empties the
+            // wallet while the log says there is a limit. To run without one
+            // deliberately, leave max_spend empty - that is loud and honest.
+            if let Some(cap) = max_spend.filter(|c| *c >= balance) {
+                anyhow::bail!(
+                    "[snipe] max_spend of {} is at or above the balance of {} - the wallet \
+                     would run out before the cap fired, so it is not a limit. Lower it, \
+                     lower size_x100, or fund the wallet.",
+                    units::format_units(cap, 18),
+                    units::format_units(balance, 18)
                 );
             }
             let to = std::sync::Arc::new(swap::Broadcaster::new(&urls)?);

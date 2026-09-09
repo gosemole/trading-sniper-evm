@@ -97,22 +97,24 @@ operators    = "operators.json"
 #            stopped this run after three buys.
 #
 #            It stops BEFORE a buy that could break the cap, not after one
-#            that has - the worst a buy can do is lose all of it. So the
-#            effective threshold is `max_spend` minus one stake: at 40 mETH and
-#            a 16.8 mETH stake, buying stops once the run is down 23 mETH.
+#            that has - the worst a buy can do is lose all of it - so the
+#            effective threshold is `max_spend` minus one stake.
 #
-#            Forty because the wallet, not because the journals. The worst
-#            drawdown they show is 3.1 stakes, which at this size is 52 mETH -
-#            more than the balance this is being run with. A cap the wallet
-#            runs out before reaching is not a cap, so this one is set below
-#            the balance and will therefore fire during a bad patch the
-#            journals call normal. That is the trade being made: at this size
-#            and this balance, the run stops before the strategy has room to
-#            come back. Raising the balance is what widens it; raising the cap
-#            past the balance only removes the brake.
+#            Derived, not chosen. The journals' worst peak-to-trough over 210
+#            traded launches is 9.9 stakes, and the longest run of losers is
+#            fifteen. At 16.8 mETH a stake that drawdown is 166 mETH, so a cap
+#            that fires inside it stops the run in a bad patch the measurement
+#            calls ordinary - which is what 60 mETH did, halting at 2.6 stakes.
+#
+#            240 mETH stops buying at 223, or 13.3 stakes: a third above the
+#            worst the journals have shown, on the grounds that 210 launches
+#            have not seen the worst there is. The wallet must clear that plus
+#            an open position plus gas - about 256 mETH - or the balance runs
+#            out before the cap does and there is no brake at all. The bot
+#            refuses to start when it would.
 # gas_limit  not estimated per trade: an estimate is a round trip inside the
 #            window the whole thing is aimed at. Unused gas comes back; a limit
 #            reached is a trade lost.
 max_open  = 1
-max_spend = "0.06"
+max_spend = "0.24"
 gas_limit = 2000000
